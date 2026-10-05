@@ -526,8 +526,12 @@ pub struct Probe {
 /// Runs Q1 to Q4 on `h` without deciding.
 pub(super) fn probe(h: HANDLE) -> Probe {
     // Q1: FileRemoteProtocolInfo.
-    // SAFETY: zeroed plain-data struct of the size passed.
+    // SAFETY: zeroed plain-data struct of the size passed. Microsoft defines
+    // these first two fields as caller inputs: version 2 is Windows 8 or
+    // later, and StructureSize must describe the complete buffer.
     let mut rp: FILE_REMOTE_PROTOCOL_INFO = unsafe { core::mem::zeroed() };
+    rp.StructureVersion = 2;
+    rp.StructureSize = core::mem::size_of::<FILE_REMOTE_PROTOCOL_INFO>() as u16;
     // SAFETY: `h` is open; the buffer has the size passed.
     let ok = unsafe {
         GetFileInformationByHandleEx(
