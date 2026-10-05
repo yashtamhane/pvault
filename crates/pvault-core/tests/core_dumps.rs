@@ -1,6 +1,6 @@
 //! Core-dump disabling (spec Section 10.3). Runs in its own test process.
 
-use pvault_core::secrets::{CoreDumpProtection, disable_core_dumps};
+use pvault_core::platform::{CoreDumpProtection, disable_core_dumps};
 
 #[cfg(unix)]
 #[test]

@@ -1,7 +1,7 @@
 //! `pvault` command-line interface.
 
 use clap::Parser;
-use pvault_core::secrets::disable_core_dumps;
+use pvault_core::platform::disable_core_dumps;
 
 /// Offline encrypted file vault.
 #[derive(Debug, Parser)]

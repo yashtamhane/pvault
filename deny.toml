@@ -1,0 +1,40 @@
+# cargo-deny policy (approved in Milestone 1: advisories, bans, sources,
+# dependency licenses). Review every finding; never suppress one silently.
+
+[graph]
+all-features = false
+
+[advisories]
+# Every advisory in the RustSec database fails the check. Any future
+# exception must name the advisory ID and give a written reason.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# The licenses present in the dependency graph at Milestone 1. Adding a
+# license here is a reviewed decision. Compatibility with the project
+# license is open until that license is chosen (SI-04).
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0"]
+confidence-threshold = 0.93
+# By default the license check skips crates that are reachable only through
+# dev- or build-dependencies of workspace crates. Test, benchmark and build
+# tooling is checked too. Advisories, bans and sources already use the full
+# graph ([graph] exclude-dev defaults to false).
+include-dev = true
+include-build = true
+
+[licenses.private]
+# pvault's own crates are unpublished and have no license yet (SI-04), so
+# they are not checked here.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

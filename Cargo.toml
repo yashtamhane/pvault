@@ -5,6 +5,7 @@ members = ["crates/pvault-core", "crates/pvault-cli"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 authors = ["Yash Sandeep Tamhane"]
 repository = "https://github.com/yashtamhane/pvault"
 publish = false
@@ -19,9 +20,21 @@ zeroize = "1.8"
 subtle = "2.6"
 thiserror = "2"
 clap = { version = "4.5", features = ["derive"] }
+getrandom = "0.4.3"
+aes-gcm-siv = { version = "0.12.1", default-features = false, features = ["aes", "zeroize"] }
+# Direct dependency only to enable `zeroize` on the AES key schedule used by
+# aes-gcm-siv (approved in Milestone 1; same version aes-gcm-siv resolves).
+aes = { version = "0.9.3", default-features = false, features = ["zeroize"] }
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["zeroize"] }
+hkdf = "0.13.0"
+hmac = { version = "0.13.0", features = ["zeroize"] }
+sha2 = "0.11.0"
+argon2 = { version = "0.6.0", default-features = false, features = ["zeroize"] }
 assert_cmd = "2"
+criterion = "0.8.2"
+proptest = "1.11"
 
-# Approved by the project author for disabling core dumps (Section 10.3).
+# Platform FFI (spec Section 7.6a).
 libc = "0.2"
 windows-sys = { version = "0.61", features = [
     "Win32_System_Diagnostics_Debug",
@@ -35,3 +48,9 @@ missing_debug_implementations = "warn"
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
 dbg_macro = "deny"
+
+# Cryptographic dependencies are far too slow unoptimized for the known-answer
+# tests (Argon2id at 256 MiB, 10 MiB streams). This affects dependencies only;
+# pvault's own crates keep the normal debug profile.
+[profile.dev.package."*"]
+opt-level = 3
