@@ -606,12 +606,20 @@ None of these can be proven by process-crash tests (now stated in 2 and 8.5).
 
 **Readiness-audit additions (2026-10-05, for review):**
 - Windows SMB shares can report `NTFS`. The local-volume acceptance criterion (spec 8.5) requires four results on each held directory handle:
-  - Q1: `FileRemoteProtocolInfo` fails with `ERROR_INVALID_PARAMETER`;
+  - Q1: `FileRemoteProtocolInfo` fails with `ERROR_INVALID_PARAMETER` or
+    `ERROR_NOACCESS`; native Windows CI run 37390554153 observed
+    `ERROR_NOACCESS` (998) on the runner's local NTFS temp directory, and
+    Microsoft does not document one unique local-volume error;
   - Q2: `VOLUME_NAME_GUID` gives a `\\?\Volume{` path;
   - Q3: `GetDriveTypeW` is `DRIVE_FIXED` or `DRIVE_REMOVABLE`;
   - Q4: the volume name is exactly `NTFS` or `ReFS`, with a matching serial for `objects/`.
 
-  Every other result refuses, with no weaker retry. The Q1 error code and Q2's behavior on SMB are unverified until a native Milestone 3 probe; until then the criterion fails closed.
+  Every other result refuses, with no weaker retry. Native Windows CI run
+  37390554153 recorded Q1 `ERROR_NOACCESS` (998), a local volume-GUID path,
+  `DRIVE_FIXED`, and `NTFS` for the runner's local temp directory. Q2's SMB
+  behavior remains unverified: native probes still need local ReFS, a VHD, a
+  mapped SMB drive and an available UNC path. Until every query matches an
+  accepted result, the criterion fails closed.
 - `objects/` must be on the same mount and volume as the vault directory.
 - A durability-capability preflight runs before any side effect, so that a *predictable* "unsupported" is a refusal rather than a post-commit "durability unknown". Passing it never weakens post-commit handling: any failure after the header replacement call, whatever its error code, still follows the failure boundary ("outcome unknown" or "committed-visible, durability unknown").
 - **Decided N1 (2026-10-05), with the primitive name amended by the later handle-relative correction:** W1 retains its risk boundary and now names `NtSetInformationFile(FileRenameInformation)`, not path-based `MoveFileExW`. The Windows ordering assumptions WO-1 (journal first), WO-2 (key table before header) and WO-3 (deletions do not overtake the commit) are stated explicitly as unverified, and documentation says that a Windows power loss or OS crash during a commit can leave a vault unreadable, recoverable only from a backup (spec 2 and 8.5).

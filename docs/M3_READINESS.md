@@ -598,8 +598,10 @@ check-then-use path lookup.
   file systems are read-only"). **Exact criterion (2026-10-05; spec 8.5):**
   on each held directory handle, all four queries must give the accepting
   result, checked in order:
-  - Q1: `FileRemoteProtocolInfo` **fails** with `ERROR_INVALID_PARAMETER`;
-    success means remote, and any other error means unknown;
+  - Q1: `FileRemoteProtocolInfo` **fails** with `ERROR_INVALID_PARAMETER` or
+    `ERROR_NOACCESS`; native Windows CI run 37390554153 observed
+    `ERROR_NOACCESS` (998) on the runner's local NTFS temp directory; success
+    means remote, and any other error means unknown;
   - Q2: `GetFinalPathNameByHandleW(VOLUME_NAME_GUID)` returns a
     `\\?\Volume{` path;
   - Q3: `GetDriveTypeW` on that volume root is `DRIVE_FIXED` or
@@ -607,10 +609,11 @@ check-then-use path lookup.
   - Q4: `GetVolumeInformationByHandleW` names exactly `NTFS` or `ReFS`, and
     for `objects/` the serial number equals T's.
 
-  Every other result refuses, with no weaker retry. The Q1 error code and
-  Q2's SMB behavior are **unverified**: a native Milestone 3 probe (local
-  NTFS, a ReFS dev drive, a VHD, a mapped SMB drive, a UNC path, `subst`) must
-  record them. Until then the criterion fails closed. The `DRIVE_*`
+  Every other result refuses, with no weaker retry. Microsoft does not
+  document one unique Q1 error for a local handle. Q2's SMB behavior remains
+  unverified: native probes still need local ReFS, a VHD, a mapped SMB drive
+  and an available UNC path. Until every query matches an accepted result,
+  the criterion fails closed. The `DRIVE_*`
   constants need the not-yet-enabled `windows-sys` feature
   `Win32_System_WindowsProgramming` (a feature addition at implementation
   time, not a new crate).

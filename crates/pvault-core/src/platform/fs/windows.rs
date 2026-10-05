@@ -46,7 +46,7 @@ use windows_sys::Wdk::Storage::FileSystem::{
     FileRenameInformation, NtCreateFile, NtSetInformationFile,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_INVALID_PARAMETER, GetLastError, HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE,
+    ERROR_INVALID_PARAMETER, ERROR_NOACCESS, GetLastError, HANDLE, NTSTATUS, OBJ_CASE_INSENSITIVE,
     RtlNtStatusToDosError, STATUS_FILE_IS_A_DIRECTORY, STATUS_INVALID_INFO_CLASS,
     STATUS_INVALID_PARAMETER, STATUS_NOT_A_DIRECTORY, STATUS_NOT_SUPPORTED, UNICODE_STRING,
 };
@@ -526,12 +526,8 @@ pub struct Probe {
 /// Runs Q1 to Q4 on `h` without deciding.
 pub(super) fn probe(h: HANDLE) -> Probe {
     // Q1: FileRemoteProtocolInfo.
-    // SAFETY: zeroed plain-data struct of the size passed. Microsoft defines
-    // these first two fields as caller inputs: version 2 is Windows 8 or
-    // later, and StructureSize must describe the complete buffer.
+    // SAFETY: zeroed plain-data output buffer of the size passed.
     let mut rp: FILE_REMOTE_PROTOCOL_INFO = unsafe { core::mem::zeroed() };
-    rp.StructureVersion = 2;
-    rp.StructureSize = core::mem::size_of::<FILE_REMOTE_PROTOCOL_INFO>() as u16;
     // SAFETY: `h` is open; the buffer has the size passed.
     let ok = unsafe {
         GetFileInformationByHandleEx(
@@ -602,7 +598,11 @@ pub(super) fn decide(p: &Probe) -> io::Result<Volume> {
     let refuse = |what: &str| Err(io::Error::other(what.to_owned()));
     match p.q1 {
         Ok(()) => return refuse("remote volume"),
-        Err(code) if code != ERROR_INVALID_PARAMETER => {
+        // Microsoft does not document the local-volume error. Native Windows
+        // CI observes ERROR_NOACCESS on local NTFS; ERROR_INVALID_PARAMETER
+        // remains the older expected result. Q2 and Q3 must still prove a
+        // local volume GUID and a local drive type.
+        Err(code) if !matches!(code, ERROR_INVALID_PARAMETER | ERROR_NOACCESS) => {
             return refuse("remote-protocol query gave an unexpected error");
         }
         Err(_) => {}

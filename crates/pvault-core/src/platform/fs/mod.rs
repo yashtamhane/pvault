@@ -465,7 +465,9 @@ pub(crate) mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_decision_fails_closed() {
-        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_NOACCESS,
+        };
         use windows_sys::Win32::System::WindowsProgramming::{
             DRIVE_CDROM, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOTE, DRIVE_REMOVABLE,
         };
@@ -476,6 +478,11 @@ pub(crate) mod tests {
             q4: Ok(("NTFS".into(), 0x1234)),
         };
         assert_eq!(imp::decide(&good).unwrap().fs_type, "NTFS");
+        let native_local = WindowsProbe {
+            q1: Err(ERROR_NOACCESS),
+            ..good.clone()
+        };
+        assert_eq!(imp::decide(&native_local).unwrap().fs_type, "NTFS");
         let removable = WindowsProbe {
             q3: Some(DRIVE_REMOVABLE),
             ..good.clone()

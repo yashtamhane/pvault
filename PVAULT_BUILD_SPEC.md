@@ -1350,7 +1350,7 @@ filename, glob or generation number alone.
 
     | # | Query on the handle | Accepting result | Any other result |
     | --- | --- | --- | --- |
-    | Q1 | `GetFileInformationByHandleEx(h, FileRemoteProtocolInfo, …)` | The call **fails** with `ERROR_INVALID_PARAMETER`, meaning no remote protocol is attached | Success means **remote**: refuse. Any other error code means **unknown**: refuse |
+    | Q1 | `GetFileInformationByHandleEx(h, FileRemoteProtocolInfo, …)` | The call **fails** with `ERROR_INVALID_PARAMETER` or `ERROR_NOACCESS`. Native Windows CI run 37390554153 observed `ERROR_NOACCESS` (998) for the runner's local NTFS temp directory; Microsoft does not document one unique local-volume error | Success means **remote**: refuse. Any other error code means **unknown**: refuse |
     | Q2 | `GetFinalPathNameByHandleW(h, …, VOLUME_NAME_GUID)` | Succeeds, and the path begins `\\?\Volume{` (a local volume GUID path) | Failure, a truncated buffer, or any other prefix (for example `\\?\UNC\`): refuse |
     | Q3 | `GetDriveTypeW` on the volume root taken from Q2 (`\\?\Volume{…}\`) | `DRIVE_FIXED` or `DRIVE_REMOVABLE` | `DRIVE_REMOTE`, `DRIVE_CDROM`, `DRIVE_RAMDISK`, `DRIVE_UNKNOWN`, `DRIVE_NO_ROOT_DIR`: refuse |
     | Q4 | `GetVolumeInformationByHandleW(h, …)` | Succeeds; the file-system name is exactly `NTFS` or `ReFS`; and for `objects/`, the `VolumeSerialNumber` equals T's | Failure, any other name, or a serial mismatch: refuse |
@@ -1361,12 +1361,15 @@ filename, glob or generation number alone.
     - **Evidence status:** the documented contracts are that
       `FileRemoteProtocolInfo` describes the remote protocol of a remote
       file, `VOLUME_NAME_GUID` returns a volume GUID path, and
-      `GetDriveTypeW` classifies a root. The exact error code Q1 returns
-      for local files, and Q2's failure mode on SMB, are **not verified**
-      here.
-    - A native Milestone 3 probe must record them on local NTFS, a ReFS dev
-      drive, a mounted VHD, a mapped SMB drive, a UNC path and a `subst`
-      drive. Until the probe confirms them, the criterion fails closed.
+      `GetDriveTypeW` classifies a root. Microsoft does not document one
+      unique Q1 error for a local handle. Native Windows CI run 37390554153
+      observed `ERROR_NOACCESS` (998) on local NTFS; the older anticipated
+      `ERROR_INVALID_PARAMETER` remains accepted. Q2's failure mode on SMB
+      is not yet verified.
+    - The native Milestone 3 probe has recorded local NTFS. Remaining native
+      coverage is a ReFS dev drive, a mounted VHD, a mapped SMB drive, an
+      available UNC path and a `subst` drive. Until every query matches an
+      accepted result, the criterion fails closed.
     - All four functions, `FileRemoteProtocolInfo` and `VOLUME_NAME_GUID`
       are in the `windows-sys` feature `Win32_Storage_FileSystem`, which is
       already enabled. The `DRIVE_*` constants are in
