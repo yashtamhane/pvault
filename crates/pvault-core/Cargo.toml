@@ -1,0 +1,23 @@
+[package]
+name = "pvault-core"
+description = "Core library for pvault, an offline encrypted file vault."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+secrecy.workspace = true
+zeroize.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[lints]
+workspace = true

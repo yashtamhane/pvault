@@ -1,0 +1,22 @@
+[package]
+name = "pvault-cli"
+description = "Command-line interface for pvault, an offline encrypted file vault."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "pvault"
+path = "src/main.rs"
+
+[dependencies]
+pvault-core.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+
+[lints]
+workspace = true

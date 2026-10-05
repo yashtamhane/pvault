@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = ["crates/pvault-core", "crates/pvault-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Yash Sandeep Tamhane"]
+repository = "https://github.com/yashtamhane/pvault"
+publish = false
+# License: open decision (spec Section 16, item 5).
+
+[workspace.dependencies]
+pvault-core = { path = "crates/pvault-core" }
+
+# Approved crates (spec Section 7.6).
+secrecy = "0.10"
+zeroize = "1.8"
+subtle = "2.6"
+thiserror = "2"
+clap = { version = "4.5", features = ["derive"] }
+assert_cmd = "2"
+
+# Approved by the project author for disabling core dumps (Section 10.3).
+libc = "0.2"
+windows-sys = { version = "0.61", features = [
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_ErrorReporting",
+] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+dbg_macro = "deny"

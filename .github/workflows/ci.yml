@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUSTDOCFLAGS: -D warnings
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  test:
+    name: clippy + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  # TPM emulator for bound-mode development (spec Section 9.1). Until
+  # Milestone 5 this only proves the emulator starts and answers commands.
+  swtpm:
+    name: swtpm smoke test
+    runs-on: ubuntu-latest
+    env:
+      TPM2TOOLS_TCTI: swtpm:host=127.0.0.1,port=2321
+    steps:
+      - name: Install swtpm and TSS libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends swtpm swtpm-tools tpm2-tools libtss2-dev
+          swtpm --version
+      - name: Start swtpm
+        run: |
+          mkdir -p "$RUNNER_TEMP/swtpm"
+          swtpm socket --tpm2 \
+            --tpmstate dir="$RUNNER_TEMP/swtpm" \
+            --server type=tcp,port=2321 \
+            --ctrl type=tcp,port=2322 \
+            --flags not-need-init,startup-clear \
+            --log file="$RUNNER_TEMP/swtpm.log" \
+            --daemon
+      - name: Query the emulated TPM
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if tpm2_getrandom --hex 16; then
+              echo
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/swtpm.log"
+          exit 1

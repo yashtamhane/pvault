@@ -1,0 +1,15 @@
+/target/
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts/
+
+# Never commit real vault data or partial exports (spec Section 0, rule 10).
+vault.hdr
+vault.hdr.tmp
+vault.journal
+vault.lock
+keytable.*.pv
+*.pvpartial
+pvault-flush.tmp
+
+.DS_Store
