@@ -3,8 +3,9 @@
 # OpenSSL 4.0.3 29 Sep 2026
 # pvault spec 7.3 and SI-51. Word list: assets/eff_large_wordlist.txt (SHA-256 addd35536511597a02fa0a9ff1e5284677b8883b83e986e43f15a3db996b903e).
 # sampling: u16 big-endian values; reject >= 62208, else index = value mod 7776.
-# words: NFKC, trim, collapse Unicode White_Space runs to U+0020, per-character
-# lowercase. custom: NFC only; refused classes per SI-51.
+# words (H_w_v1, D2): refuse unassigned (Cn, except noncharacters), NFKC, full
+# default case folding (str.casefold), collapse White_Space runs to U+0020, trim.
+# custom: refuse unassigned, then NFC only; refused classes per SI-51.
 # Python unicodedata 16.0.0. Inputs use characters whose
 # properties are stable across recent Unicode versions.
 
@@ -29,32 +30,55 @@ bytes_used = 34
 kind = words
 name = plain
 input = 616261637573207a6f6e6520796f2d796f
+result = ok
 output = 616261637573207a6f6e6520796f2d796f
 
 kind = words
 name = case-and-space
 input = 202041626163757309095a4f4e4520e3808020efbd99efbd8f2defbd99efbd8f200a
+result = ok
 output = 616261637573207a6f6e6520796f2d796f
 
 kind = words
 name = nbsp-and-nel
 input = 542d5348495254c2a066656c742d746970c28564726f702d646f776e
+result = ok
 output = 742d73686972742066656c742d7469702064726f702d646f776e
 
 kind = words
 name = compatibility-ligature
 input = efac81766520e285a3
+result = ok
 output = 66697665206976
 
 kind = words
 name = non-ascii-lowercase
 input = c4b05354414e42554c20cea3ce9fcea6ce99ce9120c38954c389
+result = ok
 output = 69cc877374616e62756c20cf83cebfcf86ceb9ceb120c3a974c3a9
 
 kind = words
 name = decomposed
 input = 43616665cc81
+result = ok
 output = 636166c3a9
+
+kind = words
+name = full-case-folding
+input = 53747261c39f652053545241535345
+result = ok
+output = 737472617373652073747261737365
+
+kind = words
+name = cherokee-folds-to-uppercase
+input = eaadb0eaadb120e18ea0
+result = ok
+output = e18ea0e18ea120e18ea0
+
+kind = words
+name = unassigned-refused
+input = 61626163757320cdb8
+result = Unassigned
 
 kind = custom
 name = ascii-kept-exactly
@@ -130,3 +154,15 @@ kind = custom
 name = plane-noncharacter-refused
 input = 616263f09fbfbe
 result = Noncharacter
+
+kind = custom
+name = unassigned-refused
+input = 616263cdb8646566
+result = Unassigned
+
+kind = custom
+name = private-use-accepted
+input = 616263ee8080f3b08080
+result = ok
+output = 616263ee8080f3b08080
+nfc_changed = false

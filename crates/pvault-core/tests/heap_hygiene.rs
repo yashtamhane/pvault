@@ -12,13 +12,19 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
 use pvault_core::crypto::{random, wrap};
+use pvault_core::header::{Header, MAX_HEADER_LEN};
+use pvault_core::journal::{MAX_JOURNAL_LEN, Record};
+use pvault_core::keytable::{EntryKind, KeyTable, NewEntry};
 use pvault_core::passphrase::{self, WordCount};
+use pvault_core::secrets::SecretBytes;
 use pvault_core::shamir;
+use zeroize::Zeroizing;
 
 struct Counting;
 
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static UNWIPED_FREES: AtomicUsize = AtomicUsize::new(0);
+static LARGEST: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
@@ -34,6 +40,7 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if armed() {
             ALLOCATIONS.fetch_add(1, SeqCst);
+            LARGEST.fetch_max(layout.size(), SeqCst);
         }
         // SAFETY: forwarded with the caller's valid layout.
         unsafe { System.alloc(layout) }
@@ -60,6 +67,7 @@ static GLOBAL: Counting = Counting;
 fn measure<T>(f: impl FnOnce() -> T) -> (usize, usize) {
     ALLOCATIONS.store(0, SeqCst);
     UNWIPED_FREES.store(0, SeqCst);
+    LARGEST.store(0, SeqCst);
     ARMED.with(|a| a.set(true));
     let out = f();
     drop(out);
@@ -157,4 +165,108 @@ fn secret_code_paths_allocate_only_their_outputs_and_free_only_wiped_blocks() {
     let duress = passphrase::generate(WordCount::DURESS).unwrap();
     let (allocs, unwiped) = measure(|| passphrase::duress_collides(&typed, &duress));
     assert_eq!((allocs, unwiped), (2, 0), "duress_collides");
+
+    // H_w_v1 (D2): full case folding expands (ß -> ss) inside the fixed
+    // three-character buffer, so the counts are unchanged. A code point
+    // unassigned in Unicode 17.0.0 is refused before any allocation.
+    for (input, expected) in [
+        ("STRASSE stra\u{df}e \u{1e9e}".to_string(), 2),
+        ("\u{13a0}\u{ab70} \u{fb03}".to_string(), 2),
+        ("abacus \u{378}".to_string(), 0),
+    ] {
+        let raw = input.as_bytes().to_vec();
+        let (allocs, unwiped) = measure(|| {
+            assert_eq!(passphrase::handle_words(&raw).is_ok(), expected == 2);
+        });
+        assert_eq!(
+            (allocs, unwiped),
+            (expected, 0),
+            "handle_words v1 {input:?}"
+        );
+    }
+    let raw = "pass\u{378}word".as_bytes().to_vec();
+    let (allocs, unwiped) = measure(|| assert!(passphrase::handle_custom(&raw).is_err()));
+    assert_eq!((allocs, unwiped), (0, 0), "handle_custom unassigned");
+
+    keytable_and_parsers();
+}
+
+fn entry(path: &str, file: Option<u8>) -> NewEntry {
+    NewEntry {
+        kind: if file.is_some() {
+            EntryKind::File
+        } else {
+            EntryKind::Dir
+        },
+        path: Zeroizing::new(path.to_owned()),
+        file_id: [file.unwrap_or(0); 16],
+        size: 10,
+        created_at: 1,
+        modified_at: 2,
+        keys: file.map(|b| {
+            (
+                SecretBytes::take_from(&mut [b; 32]).unwrap(),
+                SecretBytes::take_from(&mut [!b; 32]).unwrap(),
+            )
+        }),
+    }
+}
+
+/// D3 bounded decoding: pass 1 allocates nothing, pass 2 exactly three
+/// exact-size arenas, every freed block wiped. Oversized or malformed
+/// header and journal inputs are refused before any allocation.
+fn keytable_and_parsers() {
+    let table = KeyTable::from_entries(vec![
+        entry("docs", None),
+        entry("docs/a.txt", Some(1)),
+        entry("docs/b.txt", Some(2)),
+        entry("z", Some(3)),
+    ])
+    .unwrap();
+    let plain = table.encode().unwrap();
+    drop(table);
+    let path_bytes = "docsdocs/a.txtdocs/b.txtz".len();
+    let (allocs, unwiped) = measure(|| KeyTable::decode(plain.expose_secret()).unwrap());
+    assert_eq!((allocs, unwiped), (3, 0), "key-table decode");
+    let largest = LARGEST.load(SeqCst);
+    // Descriptors (at most 128 bytes each), keys (64 per file), paths.
+    let arenas = [4 * 128, 3 * 64, path_bytes];
+    assert!(largest <= arenas.into_iter().max().unwrap(), "{largest}");
+
+    // A structural failure (pass 1) allocates nothing.
+    let mut bad = plain.expose_secret().to_vec();
+    let at = bad.windows(4).position(|w| w == b"docs").unwrap();
+    bad[at] = b'/';
+    let (allocs, unwiped) = measure(|| assert!(KeyTable::decode(&bad).is_err()));
+    assert_eq!((allocs, unwiped), (0, 0), "key-table pass-1 refusal");
+
+    // A missing parent (pass 2): the arenas are allocated, then wiped.
+    let orphan = KeyTable::from_entries(vec![entry("docs", None), entry("docs/a.txt", Some(1))])
+        .unwrap()
+        .encode()
+        .unwrap();
+    let mut bytes = orphan.expose_secret().to_vec();
+    let at = bytes.windows(4).position(|w| w == b"docs").unwrap();
+    bytes[at..at + 4].copy_from_slice(b"dacs");
+    let (allocs, unwiped) = measure(|| assert!(KeyTable::decode(&bytes).is_err()));
+    assert_eq!((allocs, unwiped), (3, 0), "key-table pass-2 refusal");
+
+    // Header and journal: an over-cap input is refused before any
+    // allocation; so is a byte-string head that claims 4 GiB.
+    let big = vec![0xa4u8; MAX_HEADER_LEN + 1];
+    let (allocs, _) = measure(|| assert!(Header::parse(&big).is_err()));
+    assert_eq!(allocs, 0, "oversized header");
+    let big = vec![0xa4u8; MAX_JOURNAL_LEN + 1];
+    let (allocs, _) = measure(|| assert!(Record::parse(&big).is_err()));
+    assert_eq!(allocs, 0, "oversized journal");
+    let mut claim = vec![0xa4, 0x64];
+    claim.extend_from_slice(b"core");
+    claim.extend_from_slice(&[0x5a, 0xff, 0xff, 0xff, 0xff]);
+    let (allocs, _) = measure(|| assert!(Header::parse(&claim).is_err()));
+    assert_eq!(allocs, 0, "header length claim");
+    let mut claim = vec![0xb8, 0x20, 0x62];
+    claim.extend_from_slice(b"op");
+    claim.extend_from_slice(&[0x7a, 0xff, 0xff, 0xff, 0xff]);
+    let (allocs, _) = measure(|| assert!(Record::parse(&claim).is_err()));
+    assert_eq!(allocs, 0, "journal length claim");
 }

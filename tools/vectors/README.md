@@ -15,7 +15,10 @@ value comes from a published source or from an independent implementation:
 | `pvault_shamir.txt` | Spec 7.4: secret, coefficients and shares at x = 1, 2, 3, from the same Python field code. Every pair is re-interpolated at x = 0 before writing. |
 | `xchacha20_draft.txt` | Parsed from draft-irtf-cfrg-xchacha-03, Appendix A.3.2.1 (SHA-256 pinned), and re-verified with a Python HChaCha20 plus `cryptography` ChaCha20 (OpenSSL). |
 | `pvault_wrap.txt` | Spec 7.5: the same Python HChaCha20 (checked against the draft's Section 2.2.1 vector) plus OpenSSL ChaCha20, cross-checked against `PyNaCl` XChaCha20-Poly1305 (libsodium) at block counter 1. |
-| `pvault_passphrase.txt` | Spec 7.3 / SI-51: rejection sampling over the EFF list read from `assets/` (SHA-256 pinned); H_w and H_c with Python's `unicodedata` (Unicode 16.0), an explicit `White_Space` table and per-character `str.lower`. Inputs avoid characters whose properties changed in Unicode 17.0, which the Rust side uses. |
+| `pvault_passphrase.txt` | Spec 7.3 / SI-51 / D2: rejection sampling over the EFF list read from `assets/` (SHA-256 pinned); `H_w_v1` (unassigned refusal, NFKC, `str.casefold` full case folding, an explicit `White_Space` table) and H_c (unassigned refusal, NFC) with Python's `unicodedata` (Unicode 16.0). Inputs avoid characters whose properties changed in Unicode 17.0, which the Rust side uses. |
+| `pvault_header.txt` | Spec 4.1, 4.2, 4.4: an independent Python deterministic-CBOR encoder (RFC 8949 §4.2.1, written from the spec, not from pvault's code); SHA-512 and HMAC-SHA-512 with `hashlib` and `hmac`. |
+| `pvault_journal.txt` | Spec 8.1: every transition phase, a portable `convert` and two `init` records, with the same encoder and `hmac`. |
+| `pvault_tokens.txt` | Spec 8.1 TPM-identity tokens, scopes 1, 2, 3 and 5: HKDF-SHA-512 (`cryptography`/OpenSSL) and XChaCha20-Poly1305 (`PyNaCl`/libsodium) over the exact AAD. |
 
 ## Environment used for the checked-in candidate files
 
@@ -45,8 +48,12 @@ python3 -m venv /tmp/pvault-vectors
 ```
 
 The generated repository files in `crates/pvault-core/testdata/` are checked-in
-files. The Milestone 1 files were committed in `bd04bb4`; the Milestone 2
-files are uncommitted candidates. Rerunning the script must reproduce every
-file exactly, apart from the provenance header if package versions change.
-Verified on 2026-10-04: the eight Milestone 1 files were reproduced
-byte-identically by the extended script.
+files. The Milestone 1 files were committed in `bd04bb4` and the Milestone 2
+files in `a099bb6`. The Milestone 3 changes (`pvault_passphrase.txt` for
+`H_w_v1`, and the three format files) are uncommitted candidates. Rerunning
+the script must reproduce every file exactly, apart from the provenance
+header if package versions change. Verified on 2026-10-04: the eight
+Milestone 1 files were reproduced byte-identically by the extended script.
+Verified on 2026-10-05: with the Milestone 3 additions, every file other than
+`pvault_passphrase.txt` (changed for `H_w_v1`) and the three new format files
+is reproduced byte-identically, and a second run reproduces all of them.

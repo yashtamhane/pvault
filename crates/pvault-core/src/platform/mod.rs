@@ -5,6 +5,8 @@
 
 use crate::errors::Error;
 
+pub mod fs;
+pub mod memory;
 pub mod terminal;
 
 /// Hardening for the estimator child process (SI-51), applied before it

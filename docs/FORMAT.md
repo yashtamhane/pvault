@@ -1,9 +1,12 @@
-# pvault formats (Milestones 1 and 2)
+# pvault formats (Milestones 1 to 3)
 
 Byte-level formats, written as the milestones that define them are built.
 Milestone 1 covers the key derivations of spec Section 5.1 and the chunked
 stream of Section 7.7. Milestone 2 adds Shamir sharing (7.4), wraps (7.5) and
-passphrase generation and handling (7.3, SI-51). All known-answer values below come from
+passphrase generation and handling (7.3, SI-51). Milestone 3 adds the
+deterministic-CBOR profile (4.4), the header (4.1, 4.2), the key-table file
+(7.8), the journal and TPM-identity tokens (8.1), and the on-disk rules for
+artifacts, locks and commits (8.1 to 8.5). All known-answer values below come from
 `crates/pvault-core/testdata/`, which `tools/vectors/gen_vectors.py` produces
 with independent implementations and published sources. pvault never
 generates its own expected results.
@@ -206,27 +209,37 @@ serve ether ouch`, using 30 bytes. Two more vectors (10 and 16 words) are in
 
 | | H_w (generated words: main and duress) | H_c (custom main) |
 | --- | --- | --- |
-| Steps | NFKC; trim; each run of `White_Space` → one U+0020; per-character full lowercase | NFC only |
+| Steps | `H_w_v1` (D2): refuse code points unassigned in Unicode 17.0.0 (`Cn`); NFKC; full default case folding (`CaseFolding.txt` C + F); each run of `White_Space` → one U+0020; trim | refuse code points unassigned in pvault's Unicode version (private use allowed); NFC only |
 | Output limit | 1,024 bytes | 1 to 256 bytes |
-| Refused | empty result | empty result; C0 and C1 controls and DEL; U+2028, U+2029; bidirectional controls U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069; U+FEFF; noncharacters |
+| Refused | empty result; unassigned code points | empty result; unassigned code points; C0 and C1 controls and DEL; U+2028, U+2029; bidirectional controls U+061C, U+200E, U+200F, U+202A–U+202E, U+2066–U+2069; U+FEFF; noncharacters |
 | Warned (kept) | — | leading or trailing whitespace; U+200C, U+200D, U+2060, U+00AD |
 | Then | word-list check (first unknown word reported) | estimator, at creation only |
 
-Examples from `testdata/pvault_passphrase.txt` (19 handling vectors, computed
-with Python's `unicodedata`, Unicode 16.0):
+Examples from `testdata/pvault_passphrase.txt` (21 handling vectors, computed
+with Python's `unicodedata` 16.0 and `str.casefold`; the inputs use only
+characters whose properties did not change in Unicode 17.0):
 
 | Input | Handling | Result |
 | --- | --- | --- |
 | `␠␠Abacus⇥⇥ZONE␠U+3000␠ｙｏ-ｙｏ␠↵` | H_w | `abacus zone yo-yo` |
 | `ﬁve Ⅳ` | H_w | `five iv` |
+| `Straße STRASSE` | H_w | `strasse strasse` (full case folding) |
+| `abacus` + U+0378 | H_w | refused: unassigned |
 | `cafe` + U+0301 | H_c | `café` (NFC changed the input, so the notice is shown) |
 | `ﬁ Ａ Ⅳ` | H_c | unchanged (NFC keeps compatibility characters) |
 | `abc` + U+202E + `def` | H_c | refused: bidirectional control |
 
-Normalization runs the UAX #15 algorithm over the per-character primitives of
-`unicode-normalization` 0.1.25 (Unicode 17.0) in one fixed, wiped buffer. Its
-results are tested to be identical to that crate's own NFC and NFKC
-iterators.
+Normalization runs the UAX #15 algorithm in one fixed, wiped buffer:
+
+- **H_c (NFC)** uses the per-character primitives of `unicode-normalization`
+  0.1.25 (Unicode 17.0). Refusing unassigned code points keeps NFC stable
+  across later Unicode versions (Unicode normalization stability policy).
+- **`H_w_v1`** uses frozen tables generated from the Unicode 17.0.0 UCD by
+  `tools/unicode/gen_ucd17.py` (inputs SHA-256 pinned; output
+  `crates/pvault-core/src/ucd17/tables.rs`, SHA-256 `68163f3d…45a5`). They
+  never change with a dependency update. Tests check them against the
+  official `NormalizationTest.txt` for 17.0.0 (every NFKC column, and NFC for
+  the NFC columns) and, for every code point, against `unicode-normalization`.
 
 **Collision rule.** A duress passphrase collides with the main passphrase when
 `H_w(main input)` equals the duress words. It is checked at duress setup and
@@ -254,6 +267,189 @@ reply   = u8(version = 1) || u16_be(round(log10(guesses) × 100))
   (refused), medium 14.00 to 17.99 (needs `ACCEPT MEDIUM PASSPHRASE`), strong
   18.00 and above.
 
+## Deterministic CBOR (spec 4.4)
+
+pvault's own fixed-schema codec (`cbor.rs`; D3). RFC 8949 §4.2.1 core
+deterministic encoding:
+
+- items: unsigned integers, byte strings, text strings (UTF-8), arrays, maps,
+  `false`, `true`; nothing else;
+- shortest heads, definite lengths, exactly one top-level item, nesting depth
+  at most 4;
+- map keys are text, sorted by their encoded bytes (shortest first, then
+  bytewise), unique, all known; optional fields are absent, never `null`.
+
+The decoder borrows from its input and never allocates. Every structure is
+re-encoded from its parsed fields where it matters: a journal is accepted only
+if re-encoding reproduces it byte for byte.
+
+## Header, `vault.hdr` (spec 4.1 to 4.3)
+
+At most 64 KiB. A map of four keys, in encoded order
+`core, slots, core_mac, slots_mac`.
+
+| Map | Keys in canonical order |
+| --- | --- |
+| `CoreFields` | `mode, salt, magic, version, argon2_m, argon2_p, argon2_t, setup_id, vault_id, created_at, generation, card_set_id, tpm_cleanup, keytable_gen, keytable_digest, passphrase_kind` |
+| Bound slots | `s1_x, s2_x, s1_ct, s1_nonce, s2_nonce, tpm_id_ct, duress_tag?, tpm_nv_name, tpm_id_nonce, tpm_nv_index, tpm_id_template, tpm_policy_nonce` |
+| Portable slots | `slot_ct, duress_tag?, slot_nonce` |
+| `TpmCleanupEntry` | `tpm_id_ct, tpm_index, policy_nonce, tpm_id_nonce, name_prewrite?, name_postwrite, tpm_id_template` |
+
+```text
+core_digest = SHA-512("pvault/v1/core" || core bytes)
+core_mac    = HMAC-SHA-512(K_mac, "pvault/v1/core-mac"  || core bytes)
+slots_mac   = HMAC-SHA-512(K_mac, "pvault/v1/slots-mac" || core_digest || slots bytes)
+```
+
+- `magic` = `"PVLT"`, `version` = 1, `keytable_gen` = `generation`;
+  `passphrase_kind` is `"words"` or `"custom"` (D1).
+- `tpm_cleanup` holds at most 32 entries, strictly ascending by
+  `(tpm_index as u32_be, name_postwrite, policy_nonce, tpm_id_template,
+  tpm_id_nonce, tpm_id_ct)`; a 33rd is refused ("TPM cleanup capacity is
+  full; resolve a recorded index on its original TPM."), never evicted.
+- Every failure is `Unlock failed.`, except the 4.3 Argon2 policy and
+  resource messages, which depend only on public header values.
+
+Vectors: `testdata/pvault_header.txt` (bound; bound with duress and two
+cleanup entries; portable). The bound vector's `core_digest` begins
+`3fbd9a90a1fe8324`.
+
+## Key table, `keytable.<generation>.pv` (spec 7.8; D3, D7, N5)
+
+A 7.7 stream (`PVKT`, `stream_id` = `vault_id`, `context` = generation) whose
+plaintext is a CBOR array of at most 65,536 entries, sorted by path bytes:
+
+```text
+file: { kind: "file", path, size, fk_aes(32), file_id(16), fk_chacha(32), created_at, modified_at }
+dir:  { kind: "dir",  path, created_at, modified_at }
+```
+
+Canonical entry key order: `kind, path, size, fk_aes, file_id, fk_chacha,
+created_at, modified_at`.
+
+**Reading** (in this order): file length ≤ the 64 MiB-plaintext maximum;
+streaming SHA-512 equals `core.keytable_digest`; `plain_size` ≤ 64 MiB and the
+whole working set is available (4.3 resource check); decrypt into one locked
+buffer while hashing the file again (a file swapped between the passes is
+refused); decode in two passes:
+
+1. validate structure, sorting, uniqueness and every decode-time path rule
+   while borrowing, with no allocation; count entries `N`, files `F` and path
+   bytes `P`; require `N ≤ 65,536` and
+   `decoded_charge = 4096 + 128·N + 64·F + P ≤ 128 MiB`;
+2. allocate exactly three arenas, fallibly: descriptors, a zeroizing path
+   arena and a best-effort locked key arena; fill them; require every parent
+   to be a `dir` entry.
+
+Decode-time path rules (D7): 1–4,096 bytes, components 1–255 bytes, no empty,
+`.` or `..` components, no leading or trailing `/`, no control characters,
+no Windows-reserved names or characters. NFC form and case-fold collisions are
+checked on input only (Milestone 4). Every failure is the payload-free
+"The key table is damaged."
+
+## Journal, `vault.journal` (spec 8.1 to 8.3)
+
+At most 16 KiB; exactly the fields the record's `op`, `phase` and mode
+require. Canonical key order of the union of all keys:
+
+```text
+op, mac, mode, salt, phase, mac_new, mac_old, new_gen, old_gen, argon2_m,
+argon2_p, argon2_t, setup_id, vault_id, target_mode, tracking_gen,
+new_tpm_index, header_file_id, header_id_kind, keytable_digest,
+new_core_digest, new_tpm_id_ct_i, new_tpm_id_ct_o, old_core_digest,
+passphrase_kind, keytable_file_id, keytable_id_kind, new_policy_nonce,
+track_kt_file_id, track_kt_id_kind, cleanup_tpm_id_ct, new_name_prewrite,
+target_kt_file_id, target_kt_id_kind, track_hdr_file_id, track_hdr_id_kind,
+new_name_postwrite, new_tpm_id_nonce_i, new_tpm_id_nonce_o,
+new_tpm_id_template, old_keytable_digest, cleanup_tpm_id_nonce,
+tracking_core_digest, cleanup_tpm_id_template, old_slots_authenticated
+```
+
+```text
+MAC = HMAC-SHA-512(key, "pvault/v1/journal" || encoding without mac / mac_old / mac_new)
+```
+
+| `op` | Phases | Key |
+| --- | --- | --- |
+| `init` | `prepared` → `keytable_created` → `keytable_written` → `committing` | `init_journal_key = HKDF-SHA-512(master_pw, info = "pvault/v1/init-journal")` |
+| `recover`, `convert` | `prepared` → `target_created` → `committing` (`mac_old` + `mac_new`) | `journal_key(old_bundle)`; `committing` also `journal_key(new_bundle)` |
+| `recover`, `convert` | `tracking_created` → `rollback_tracking` (remote rollback; `tracking_gen = old_gen + 2`) | `journal_key(old_bundle)` |
+
+- `new_gen` = `old_gen + 1`. File identities are `"unix"` (20 bytes:
+  `u64_be(st_ino) || i64_be(birth_sec) || u32_be(birth_nsec)`) or
+  `"windows"` (32 bytes: `u64_be(VolumeSerialNumber) || FileId[16] ||
+  u64_be(CreationTime)`).
+- Restart classifies the header only by exact core digest under the side's
+  `K_mac`: old (`old_core_digest`), new (`new_core_digest`, `committing`
+  only) or tracking (`tracking_core_digest`, `rollback_tracking` only).
+  Anything else is indeterminate and deletes nothing.
+- The tracking core is the old core with `generation` = `keytable_gen` =
+  `tracking_gen`, the SHA-512 of `keytable.<tracking_gen>.pv`, and the
+  journaled scope-5 cleanup entry. A tracking key table re-encrypted after
+  `rollback_tracking` (fresh nonces, same file) has another digest, so the
+  restart refuses it.
+
+Vectors: `testdata/pvault_journal.txt` (all five transition phases, a
+portable `convert`, bound and portable `init`).
+
+## TPM-identity tokens (spec 8.1; D6)
+
+```text
+key = HKDF-SHA-512(base_key, info = label, L = 32)
+AAD = "pvault/v1/tpm-id-token\0" || u8(scope) || vault_id[16] || u8(template = 1)
+      || u32_be(tpm_index) || u8(name_prewrite present) || name_prewrite[34]?
+      || name_postwrite[34] || policy_nonce[32]
+ct  = XChaCha20-Poly1305(key, nonce[24], AAD, ek_digest[32])      -> 48 bytes
+```
+
+| Scope | Label | Base key |
+| ---: | --- | --- |
+| 1 | `pvault/v1/tpm-id/slots` | `K_mac` |
+| 2 | `pvault/v1/tpm-id/init` | `init_journal_key` |
+| 3 | `pvault/v1/tpm-id/new-index/old-side` | `journal_key(old_bundle)` |
+| 4 | reserved (N4) | none |
+| 5 | `pvault/v1/tpm-id/cleanup` | `K_mac` |
+
+Vectors: `testdata/pvault_tokens.txt` (one per scope).
+
+## Vault directory, locks and commits (spec 8.1 to 8.5)
+
+| Name | Role |
+| --- | --- |
+| `vault.gate`, `vault.lock` | Zero-length lock files, owner-only, never deleted (G + L protocol, D4) |
+| `vault.hdr`, `vault.hdr.tmp` | Header and its temp |
+| `vault.journal`, `vault.journal.tmp` | Journal and its temp |
+| `keytable.<n>.pv`, `keytable.<n>.pv.tmp` | Key tables and temps |
+
+- **Locks.** Exclusive: try G, try L exclusive, release G. Downgrade: retry G
+  for up to 2 s, unlock L, lock L shared, release G. `status`: L shared only.
+  Every attempt is non-blocking; busy means "The vault is in use by another
+  pvault process." A lock file is opened at most once per process.
+- **Artifacts.** Created empty, exclusively and without following symlinks;
+  identity captured from the open handle and journaled before any byte is
+  written. Restart deletes or resumes a file only if a no-follow reopen gives
+  a regular file with the journaled identity. Anything else at a protocol
+  name blocks and is reported.
+- **Journal writes.** `vault.journal.tmp` → flush → replace → directory flush.
+  A leftover temp is promoted only under the 8.2/8.3 rules; otherwise it is
+  residue and blocks every later journal rewrite.
+- **Header commit.** Write and flush the temp; re-read `vault.hdr` and abort
+  if its generation changed (F58); replace; flush the directory. On Windows
+  the replacement is handle-relative through `NtSetInformationFile`; W1 is
+  an explicit unverified durability assumption. The source handle requests
+  `FILE_WRITE_THROUGH` under Microsoft's NTFS metadata-flush documentation,
+  but this is not a `MoveFileExW` equivalence claim or verified ReFS/power-loss
+  safety. A reported replacement failure is
+  re-read and classified: neither exact old nor exact new bytes reports "The
+  header replacement outcome could not be determined. Run fsck before making
+  further changes." A generation mismatch before replacement reports "The
+  vault changed during this operation. The header was not committed." A failed
+  flush after the replacement is "The new header is visible, but commit
+  durability could not be confirmed; run fsck."
+- **Supported file systems** (8.5): Linux ext4, XFS, Btrfs (mountinfo by
+  mount ID); macOS APFS, HFS+ (`f_fstypename`); Windows NTFS, ReFS on a local
+  volume (Q1–Q4). Everything else is read-only for pvault.
+
 ## Published vectors used by the tests
 
 | File | Source | Records |
@@ -265,6 +461,7 @@ reply   = u8(version = 1) || u16_be(round(log10(guesses) × 100))
 | `rfc4231_hmac_sha512.txt` | RFC 4231 Section 4, Test Cases 1–4, 6, 7 | 6 |
 | `rfc9106_argon2id.txt` | RFC 9106 Section 5.3 | 1 |
 | `xchacha20_draft.txt` | draft-irtf-cfrg-xchacha-03 Appendix A.3.2.1 (XChaCha20, counter 0) | 1 |
+| `unicode/NormalizationTest-17.0.0.txt` | Unicode 17.0.0 UCD, unchanged (SHA-256 `5019ffd5…87db`) | 19,000+ lines |
 
 The Wycheproof vectors are at commit `3fa63dd0344abb611f1fb1d77e119938603ea230`.
 Licensing and changes are listed in `THIRD_PARTY_NOTICES.md`.

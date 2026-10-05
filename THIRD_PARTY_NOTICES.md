@@ -74,3 +74,52 @@ release artifacts is planned for Milestone 13.
 - **Open question:** the Legal Provisions grant a BSD-style license for "Code
   Components". Whether short test-vector excerpts are covered, or need a
   different basis, has not been confirmed and is flagged for review (SI-04).
+
+## Unicode Character Database 17.0.0
+
+- **Files:**
+  - `crates/pvault-core/src/ucd17/tables.rs`: tables generated from
+    `UnicodeData.txt`, `DerivedNormalizationProps.txt`,
+    `CompositionExclusions.txt`, `CaseFolding.txt` and `PropList.txt`
+    (assigned code points, canonical combining classes, decompositions,
+    compositions, case folding and `White_Space`). Compiled into the pvault
+    library and binary.
+  - `crates/pvault-core/testdata/unicode/NormalizationTest-17.0.0.txt`:
+    `NormalizationTest.txt`, unchanged, used only by tests.
+- **Source:** <https://www.unicode.org/Public/17.0.0/ucd/UCD.zip>. Every input
+  file's SHA-256 is pinned in `tools/unicode/gen_ucd17.py` and listed in
+  `tools/unicode/MANIFEST.txt`.
+- **Copyright:** Copyright © 1991-2026 Unicode, Inc.
+- **License:** Unicode License V3. A copy is in
+  [`third_party/unicode/LICENSE`](third_party/unicode/LICENSE); it must
+  accompany every copy of the data files and of the generated tables, including
+  release artifacts (release notices are planned for Milestone 13).
+- **Changes:** `tables.rs` is a derived, reformatted subset produced by
+  `tools/unicode/gen_ucd17.py`; it states its origin and license in its first
+  lines. `NormalizationTest.txt` is byte-identical to the archive's copy.
+
+## libfuzzer-sys 0.4.13 (fuzz tooling only)
+
+- **Use:** direct dependency of the excluded `fuzz/` crate only. It is not in
+  the product workspace or product `Cargo.lock`, and is not linked into a
+  pvault release artifact.
+- **Source and provenance:** crates.io package `libfuzzer-sys` 0.4.13,
+  checksum `a9fd2f41a1cba099f79a0b6b6c35656cf7c03351a7bae8ff0f28f25270f929d2`;
+  upstream <https://github.com/rust-fuzz/libfuzzer>, git revision
+  `719e4efb9b8857ebaa782ae59376c8cbb78fed0f` recorded by the package.
+- **Declared license:** `(MIT OR Apache-2.0) AND NCSA`. The package includes
+  `LICENSE-MIT` and `LICENSE-APACHE`; its README says every file in
+  `libfuzzer/` is NCSA and all other files are MIT or Apache-2.0.
+- **Bundled-source audit:** all 55 C/C++/header/definition files in the
+  packaged `libfuzzer/` tree that carry SPDX identifiers say
+  `Apache-2.0 WITH LLVM-exception`, rather than NCSA. This discrepancy is
+  recorded rather than silently choosing one description; both the manifest
+  license and the per-file notices must be preserved by anyone redistributing
+  the fuzz runtime. The LLVM license is at
+  <https://llvm.org/LICENSE.txt>.
+- **Dependency and policy scope:** the direct runtime brings `arbitrary`; its
+  build script brings `cc` (and `cc`'s build graph). `fuzz/Cargo.lock` pins the
+  complete graph. `fuzz/deny.toml` grants NCSA and
+  `Apache-2.0 WITH LLVM-exception` only to `libfuzzer-sys@0.4.13`; the product
+  allowlist is unchanged. Advisories, bans, sources and licenses are checked
+  against the fuzz lockfile separately.

@@ -566,8 +566,21 @@ def sampling_record(words, count, stream):
     ]
 
 
+def is_unassigned(c):
+    """General_Category Cn, except noncharacters (refused by their own rule)."""
+    cp = ord(c)
+    nonchar = 0xFDD0 <= cp <= 0xFDEF or (cp & 0xFFFE) == 0xFFFE
+    return unicodedata.category(c) == "Cn" and not nonchar
+
+
 def handle_words(text):
+    """H_w_v1: refuse unassigned, NFKC, full case folding, frozen White_Space
+    collapse and trim. Python's str.casefold() is full default case folding
+    (statuses C and F). Returns None when refused."""
+    if any(is_unassigned(c) for c in text):
+        return None
     text = unicodedata.normalize("NFKC", text)
+    text = text.casefold()
     parts, current = [], []
     for c in text:
         if ord(c) in WHITE_SPACE:
@@ -578,16 +591,15 @@ def handle_words(text):
             current.append(c)
     if current:
         parts.append("".join(current))
-    return "".join(c.lower() for c in " ".join(parts))
+    return " ".join(parts)
 
 
 def words_record(name, text):
-    return [
-        ("kind", "words"),
-        ("name", name),
-        ("input", text.encode("utf-8").hex()),
-        ("output", handle_words(text).encode("utf-8").hex()),
-    ]
+    record = [("kind", "words"), ("name", name), ("input", text.encode("utf-8").hex())]
+    handled = handle_words(text)
+    if handled is None:
+        return record + [("result", "Unassigned")]
+    return record + [("result", "ok"), ("output", handled.encode("utf-8").hex())]
 
 
 def refused_class(cp):
@@ -606,6 +618,8 @@ def refused_class(cp):
 
 def custom_record(name, text):
     record = [("kind", "custom"), ("name", name), ("input", text.encode("utf-8").hex())]
+    if any(is_unassigned(c) for c in text):
+        return record + [("result", "Unassigned")]
     handled = unicodedata.normalize("NFC", text)
     refused = next((refused_class(ord(c)) for c in handled if refused_class(ord(c))), None)
     if refused:
@@ -615,6 +629,285 @@ def custom_record(name, text):
         ("output", handled.encode("utf-8").hex()),
         ("nfc_changed", "true" if handled != text else "false"),
     ]
+
+
+
+# ---------------------------------------------------------------------------
+# Formats (spec 4.1, 4.2, 4.4, 8.1): an independent deterministic-CBOR
+# encoder, header MACs, journal MACs and TPM-identity tokens
+# ---------------------------------------------------------------------------
+
+
+def cbor_head(major, n):
+    if n < 24:
+        return bytes([major << 5 | n])
+    for limit, extra, fmt in ((0xFF, 24, ">B"), (0xFFFF, 25, ">H"), (0xFFFFFFFF, 26, ">I")):
+        if n <= limit:
+            return bytes([major << 5 | extra]) + struct.pack(fmt, n)
+    return bytes([major << 5 | 27]) + struct.pack(">Q", n)
+
+
+def cbor(value):
+    """RFC 8949 section 4.2.1 core deterministic encoding of the 4.4 subset."""
+    if value is False:
+        return b"\xf4"
+    if value is True:
+        return b"\xf5"
+    if isinstance(value, int):
+        assert 0 <= value < 1 << 64
+        return cbor_head(0, value)
+    if isinstance(value, bytes):
+        return cbor_head(2, len(value)) + value
+    if isinstance(value, str):
+        raw = value.encode("utf-8")
+        return cbor_head(3, len(raw)) + raw
+    if isinstance(value, list):
+        return cbor_head(4, len(value)) + b"".join(cbor(v) for v in value)
+    if isinstance(value, dict):
+        items = sorted((cbor(k), cbor(v)) for k, v in value.items())
+        keys = [k for k, _ in items]
+        assert len(set(keys)) == len(keys)
+        return cbor_head(5, len(items)) + b"".join(k + v for k, v in items)
+    raise TypeError(type(value))
+
+
+def sha512(*parts):
+    return hashlib.sha512(b"".join(parts)).digest()
+
+
+def hmac512(key, *parts):
+    return hmac.new(key, b"".join(parts), hashlib.sha512).digest()
+
+
+def name34(b):
+    return b"\x00\x0b" + bytes([b]) * 32
+
+
+def tpm_id_token(scope, base_key, vault_id, index, pre, post, policy_nonce, digest, nonce):
+    labels = {
+        1: b"pvault/v1/tpm-id/slots",
+        2: b"pvault/v1/tpm-id/init",
+        3: b"pvault/v1/tpm-id/new-index/old-side",
+        5: b"pvault/v1/tpm-id/cleanup",
+    }
+    key = hkdf_sha512(base_key, labels[scope])
+    aad = (
+        b"pvault/v1/tpm-id-token\x00"
+        + bytes([scope])
+        + vault_id
+        + bytes([1])
+        + struct.pack(">I", index)
+        + (bytes([1]) + pre if pre is not None else bytes([0]))
+        + post
+        + policy_nonce
+    )
+    ct = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(digest, aad, nonce, key)
+    assert len(ct) == 48
+    assert sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(ct, aad, nonce, key) == digest
+    return ct
+
+
+def token_record(name, scope, base_key, vault_id, index, pre, post, policy_nonce, digest, nonce):
+    ct = tpm_id_token(scope, base_key, vault_id, index, pre, post, policy_nonce, digest, nonce)
+    rec = [("name", name), ("scope", str(scope)), ("base_key", base_key.hex()),
+           ("vault_id", vault_id.hex()), ("tpm_index", str(index))]
+    if pre is not None:
+        rec.append(("name_prewrite", pre.hex()))
+    rec += [("name_postwrite", post.hex()), ("policy_nonce", policy_nonce.hex()),
+            ("ek_digest", digest.hex()), ("nonce", nonce.hex()), ("ct", ct.hex())]
+    return rec
+
+
+def cleanup_entry(index, pre, post, policy_nonce, nonce, ct):
+    entry = {
+        "tpm_index": index,
+        "name_postwrite": post,
+        "policy_nonce": policy_nonce,
+        "tpm_id_template": 1,
+        "tpm_id_nonce": nonce,
+        "tpm_id_ct": ct,
+    }
+    if pre is not None:
+        entry["name_prewrite"] = pre
+    return entry
+
+
+def header_record(name, core, slots, k_mac):
+    core_bytes, slots_bytes = cbor(core), cbor(slots)
+    digest = sha512(b"pvault/v1/core", core_bytes)
+    core_mac = hmac512(k_mac, b"pvault/v1/core-mac", core_bytes)
+    slots_mac = hmac512(k_mac, b"pvault/v1/slots-mac", digest, slots_bytes)
+    # The header map holds the already-encoded core and slots maps.
+    entries = sorted([
+        (cbor("core"), core_bytes),
+        (cbor("slots"), slots_bytes),
+        (cbor("core_mac"), cbor(core_mac)),
+        (cbor("slots_mac"), cbor(slots_mac)),
+    ])
+    header = cbor_head(5, 4) + b"".join(k + v for k, v in entries)
+    return [("name", name), ("k_mac", k_mac.hex()), ("core", core_bytes.hex()),
+            ("slots", slots_bytes.hex()), ("core_digest", digest.hex()), ("header", header.hex())]
+
+
+def journal_record(name, fields, key, new_key=None):
+    body = cbor(fields)
+    rec = dict(fields)
+    if new_key is None:
+        rec["mac"] = hmac512(key, b"pvault/v1/journal", body)
+    else:
+        rec["mac_old"] = hmac512(key, b"pvault/v1/journal", body)
+        rec["mac_new"] = hmac512(new_key, b"pvault/v1/journal", body)
+    out = [("name", name), ("key_old", key.hex())]
+    if new_key is not None:
+        out.append(("key_new", new_key.hex()))
+    out.append(("record", cbor(rec).hex()))
+    return out
+
+
+def format_records():
+    vault_id = stream_bytes(b"pvault formats vault_id", 16)
+    k_mac = stream_bytes(b"pvault formats k_mac", 32)
+    k_init = stream_bytes(b"pvault formats init key", 32)
+    j_old = stream_bytes(b"pvault formats journal old", 32)
+    j_new = stream_bytes(b"pvault formats journal new", 32)
+    ek = stream_bytes(b"pvault formats ek digest", 32)
+    pn = stream_bytes(b"pvault formats policy nonce", 32)
+    index = 0x01804000
+
+    tokens = [
+        token_record("slots", 1, k_mac, vault_id, 0x01800010, None, name34(0x21), pn, ek,
+                     stream_bytes(b"pvault formats nonce 1", 24)),
+        token_record("init", 2, k_init, vault_id, index, name34(0x31), name34(0x32), pn, ek,
+                     stream_bytes(b"pvault formats nonce 2", 24)),
+        token_record("new-index-old-side", 3, j_old, vault_id, index, name34(0x31), name34(0x32), pn, ek,
+                     stream_bytes(b"pvault formats nonce 3", 24)),
+        token_record("cleanup", 5, k_mac, vault_id, index, name34(0x31), name34(0x32), pn, ek,
+                     stream_bytes(b"pvault formats nonce 5", 24)),
+    ]
+    tok = {dict(t)["name"]: bytes.fromhex(dict(t)["ct"]) for t in tokens}
+
+    def core(mode, kind, cleanup):
+        return {
+            "magic": "PVLT",
+            "version": 1,
+            "vault_id": vault_id,
+            "mode": mode,
+            "argon2_m": 262144,
+            "argon2_t": 3,
+            "argon2_p": 4,
+            "salt": stream_bytes(b"pvault formats salt", 32),
+            "generation": 9,
+            "created_at": 1790000000,
+            "keytable_gen": 9,
+            "keytable_digest": stream_bytes(b"pvault formats keytable", 64),
+            "card_set_id": stream_bytes(b"pvault formats card set", 8),
+            "setup_id": stream_bytes(b"pvault formats setup", 16),
+            "tpm_cleanup": cleanup,
+            "passphrase_kind": kind,
+        }
+
+    bound_slots = {
+        "s1_x": 1,
+        "s1_nonce": stream_bytes(b"pvault formats s1 nonce", 24),
+        "s1_ct": stream_bytes(b"pvault formats s1 ct", 96),
+        "s2_x": 2,
+        "s2_nonce": stream_bytes(b"pvault formats s2 nonce", 24),
+        "tpm_nv_index": 0x01800010,
+        "tpm_nv_name": name34(0x21),
+        "tpm_policy_nonce": pn,
+        "tpm_id_template": 1,
+        "tpm_id_nonce": stream_bytes(b"pvault formats nonce 1", 24),
+        "tpm_id_ct": tok["slots"],
+    }
+    duress_slots = dict(bound_slots, duress_tag=stream_bytes(b"pvault formats duress", 64))
+    portable_slots = {
+        "slot_nonce": stream_bytes(b"pvault formats slot nonce", 24),
+        "slot_ct": stream_bytes(b"pvault formats slot ct", 96),
+    }
+    # Two cleanup entries, sorted by (tpm_index, name_postwrite, ...).
+    cleanup = [
+        cleanup_entry(index, name34(0x31), name34(0x32), pn, stream_bytes(b"pvault formats nonce 5", 24), tok["cleanup"]),
+        cleanup_entry(index + 1, None, name34(0x41), pn, stream_bytes(b"pvault formats nonce 6", 24), tok["cleanup"]),
+    ]
+    headers = [
+        header_record("bound", core("bound", "words", []), bound_slots, k_mac),
+        header_record("bound-duress-cleanup", core("bound", "custom", cleanup), duress_slots, k_mac),
+        header_record("portable", core("portable", "custom", []), portable_slots, k_mac),
+    ]
+
+    old_core = bytes.fromhex(dict(headers[0])["core_digest"])
+    idx_o = {
+        "new_tpm_index": index,
+        "new_name_prewrite": name34(0x31),
+        "new_name_postwrite": name34(0x32),
+        "new_policy_nonce": pn,
+        "new_tpm_id_template": 1,
+        "new_tpm_id_nonce_o": stream_bytes(b"pvault formats nonce 3", 24),
+        "new_tpm_id_ct_o": tok["new-index-old-side"],
+    }
+    unix_id = stream_bytes(b"pvault formats unix id", 20)
+    win_id = stream_bytes(b"pvault formats windows id", 32)
+    prepared = dict(
+        idx_o,
+        vault_id=vault_id, op="recover", phase="prepared", old_gen=9, new_gen=10,
+        target_mode="bound", old_core_digest=old_core,
+        old_keytable_digest=stream_bytes(b"pvault formats keytable", 64),
+    )
+    target_created = dict(prepared, phase="target_created", target_kt_id_kind="unix", target_kt_file_id=unix_id)
+    committing = dict(
+        target_created, phase="committing",
+        new_core_digest=stream_bytes(b"pvault formats new core", 64),
+        header_id_kind="unix", header_file_id=stream_bytes(b"pvault formats header id", 20),
+        old_slots_authenticated=True,
+    )
+    tracking_created = {k: v for k, v in committing.items() if k not in ("new_core_digest", "old_slots_authenticated")}
+    tracking_created.update(
+        phase="tracking_created", tracking_gen=11,
+        cleanup_tpm_id_template=1,
+        cleanup_tpm_id_nonce=stream_bytes(b"pvault formats nonce 5", 24),
+        cleanup_tpm_id_ct=tok["cleanup"],
+        track_kt_id_kind="unix", track_kt_file_id=stream_bytes(b"pvault formats track kt", 20),
+    )
+    rollback_tracking = dict(
+        tracking_created, phase="rollback_tracking",
+        tracking_core_digest=stream_bytes(b"pvault formats tracking core", 64),
+        track_hdr_id_kind="windows", track_hdr_file_id=win_id,
+    )
+    convert_portable = {
+        "vault_id": vault_id, "op": "convert", "phase": "prepared", "old_gen": 9, "new_gen": 10,
+        "target_mode": "portable", "old_core_digest": old_core,
+        "old_keytable_digest": stream_bytes(b"pvault formats keytable", 64),
+    }
+    init_bound = {
+        "vault_id": vault_id, "op": "init", "phase": "committing",
+        "setup_id": stream_bytes(b"pvault formats setup", 16), "mode": "bound",
+        "salt": stream_bytes(b"pvault formats salt", 32),
+        "argon2_m": 262144, "argon2_t": 3, "argon2_p": 4, "passphrase_kind": "words",
+        "new_tpm_index": index, "new_name_prewrite": name34(0x31), "new_name_postwrite": name34(0x32),
+        "new_policy_nonce": pn, "new_tpm_id_template": 1,
+        "new_tpm_id_nonce_i": stream_bytes(b"pvault formats nonce 2", 24), "new_tpm_id_ct_i": tok["init"],
+        "keytable_id_kind": "windows", "keytable_file_id": win_id,
+        "keytable_digest": stream_bytes(b"pvault formats keytable", 64),
+        "new_core_digest": stream_bytes(b"pvault formats new core", 64),
+        "header_id_kind": "unix", "header_file_id": unix_id,
+    }
+    init_portable = {
+        "vault_id": vault_id, "op": "init", "phase": "prepared",
+        "setup_id": stream_bytes(b"pvault formats setup", 16), "mode": "portable",
+        "salt": stream_bytes(b"pvault formats salt", 32),
+        "argon2_m": 262144, "argon2_t": 3, "argon2_p": 4, "passphrase_kind": "custom",
+    }
+    journals = [
+        journal_record("recover-prepared", prepared, j_old),
+        journal_record("recover-target-created", target_created, j_old),
+        journal_record("recover-committing", committing, j_old, j_new),
+        journal_record("recover-tracking-created", tracking_created, j_old),
+        journal_record("recover-rollback-tracking", rollback_tracking, j_old),
+        journal_record("convert-portable-prepared", convert_portable, j_old),
+        journal_record("init-bound-committing", init_bound, k_init),
+        journal_record("init-portable-prepared", init_portable, k_init),
+    ]
+    return tokens, headers, journals
 
 
 def main():
@@ -785,8 +1078,9 @@ def main():
         [
             f"pvault spec 7.3 and SI-51. Word list: assets/eff_large_wordlist.txt (SHA-256 {WORDLIST_SHA256}).",
             "sampling: u16 big-endian values; reject >= 62208, else index = value mod 7776.",
-            "words: NFKC, trim, collapse Unicode White_Space runs to U+0020, per-character",
-            "lowercase. custom: NFC only; refused classes per SI-51.",
+            "words (H_w_v1, D2): refuse unassigned (Cn, except noncharacters), NFKC, full",
+            "default case folding (str.casefold), collapse White_Space runs to U+0020, trim.",
+            "custom: refuse unassigned, then NFC only; refused classes per SI-51.",
             f"Python unicodedata {unicodedata.unidata_version}. Inputs use characters whose",
             "properties are stable across recent Unicode versions.",
         ],
@@ -800,6 +1094,9 @@ def main():
             words_record("compatibility-ligature", "\ufb01ve \u2163"),
             words_record("non-ascii-lowercase", "\u0130STANBUL \u03a3\u039f\u03a6\u0399\u0391 \u00c9T\u00c9"),
             words_record("decomposed", "Cafe\u0301"),
+            words_record("full-case-folding", "Stra\u00dfe STRASSE"),
+            words_record("cherokee-folds-to-uppercase", "\uab70\uab71 \u13a0"),
+            words_record("unassigned-refused", "abacus \u0378"),
             custom_record("ascii-kept-exactly", "  Mixed Case  and   spaces "),
             custom_record("already-nfc", "caf\u00e9 \u00e9t\u00e9"),
             custom_record("decomposed-composes", "cafe\u0301"),
@@ -813,7 +1110,33 @@ def main():
             custom_record("bom-refused", "\ufeffabc"),
             custom_record("noncharacter-refused", "abc\ufdd0"),
             custom_record("plane-noncharacter-refused", "abc\U0001fffe"),
+            custom_record("unassigned-refused", "abc\u0378def"),
+            custom_record("private-use-accepted", "abc\ue000\U000f0000"),
         ],
+    )
+
+    tokens, headers, journals = format_records()
+    common = [
+        "Deterministic CBOR: an independent Python encoder of the 4.4 subset (RFC 8949",
+        "section 4.2.1; keys sorted by encoded bytes). Digests and MACs: Python hashlib, hmac.",
+    ]
+    write_records(
+        args.out / "pvault_tokens.txt",
+        common[:1] + [
+            "TPM-identity tokens (spec 8.1): HKDF-SHA-512 (cryptography/OpenSSL) and",
+            "XChaCha20-Poly1305 (PyNaCl/libsodium) over the exact AAD.",
+        ],
+        tokens,
+    )
+    write_records(
+        args.out / "pvault_header.txt",
+        common + ["spec 4.1 and 4.2: core, slots, core_digest, core_mac, slots_mac."],
+        headers,
+    )
+    write_records(
+        args.out / "pvault_journal.txt",
+        common + ["spec 8.1: records with mac, or mac_old and mac_new over identical content."],
+        journals,
     )
 
 

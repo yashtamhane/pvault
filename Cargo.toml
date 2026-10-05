@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/pvault-core", "crates/pvault-cli"]
+# cargo-fuzz targets build with nightly only (spec 12).
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -45,10 +47,18 @@ proptest = "1.11"
 # Platform FFI (spec Section 7.6a).
 libc = "0.2"
 windows-sys = { version = "0.61", features = [
+    # Handle-relative file operations (NtCreateFile, NtSetInformationFile;
+    # spec 7.6a, 8.1; M3-F2).
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_WindowsProgramming",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_ErrorReporting",
 ] }

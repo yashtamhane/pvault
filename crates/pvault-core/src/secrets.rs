@@ -10,7 +10,9 @@
 //!   `PartialEq` nor `Serialize`;
 //! - compare only in constant time, through [`subtle::ConstantTimeEq`].
 //!
-//! Memory locking (Section 10.2) is added in Milestone 7.
+//! [`LockedBuf`] adds best-effort memory locking (Section 10.2) for the
+//! key-table buffers (Milestone 3). Strict mode and its reporting arrive in
+//! Milestone 7.
 
 use core::fmt;
 
@@ -145,6 +147,21 @@ impl SecretBuf {
         }
     }
 
+    /// Creates an all-zero secret of `len` bytes, failing instead of aborting
+    /// when memory is short. For lengths that come from (authenticated) file
+    /// data (D3).
+    pub fn try_zeroed(len: usize) -> Result<Self, Error> {
+        let mut v = Vec::new();
+        v.try_reserve_exact(len)
+            .map_err(|_| Error::MemoryResource {
+                needed_mib: (len as u64).div_ceil(1 << 20),
+            })?;
+        v.resize(len, 0);
+        Ok(Self {
+            inner: SecretBox::new(v.into_boxed_slice()),
+        })
+    }
+
     /// Copies `src` into a new secret of the same length, then wipes `src`.
     pub fn take_from(src: &mut [u8]) -> Self {
         let mut secret = Self::zeroed(src.len());
@@ -190,6 +207,53 @@ impl Zeroize for SecretBuf {
 impl ZeroizeOnDrop for SecretBuf {}
 
 impl fmt::Debug for SecretBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(REDACTED)
+    }
+}
+
+/// A [`SecretBuf`] whose pages are locked into RAM, best effort (10.2). On
+/// drop it is wiped first, then unlocked, then freed.
+pub struct LockedBuf {
+    buf: SecretBuf,
+    locked: bool,
+}
+
+impl LockedBuf {
+    /// Allocates `len` zeroed bytes fallibly and tries to lock them.
+    pub fn try_zeroed(len: usize) -> Result<Self, Error> {
+        let buf = SecretBuf::try_zeroed(len)?;
+        let locked = crate::platform::memory::lock_region(buf.expose_secret().as_ptr(), len);
+        Ok(Self { buf, locked })
+    }
+
+    /// Whether the lock succeeded.
+    pub fn is_locked(&self) -> bool {
+        self.locked
+    }
+
+    /// Borrows the bytes.
+    pub fn expose_secret(&self) -> &[u8] {
+        self.buf.expose_secret()
+    }
+
+    /// Mutably borrows the bytes.
+    pub fn expose_secret_mut(&mut self) -> &mut [u8] {
+        self.buf.expose_secret_mut()
+    }
+}
+
+impl Drop for LockedBuf {
+    fn drop(&mut self) {
+        self.buf.zeroize();
+        if self.locked {
+            let s = self.buf.expose_secret();
+            crate::platform::memory::unlock_region(s.as_ptr(), s.len());
+        }
+    }
+}
+
+impl fmt::Debug for LockedBuf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(REDACTED)
     }

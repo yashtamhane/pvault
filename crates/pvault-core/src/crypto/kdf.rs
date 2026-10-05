@@ -149,6 +149,18 @@ pub fn journal_key(k_mac: &SecretBytes<KEY_LEN>) -> Result<SecretBytes<KEY_LEN>,
     hkdf32(k_mac.expose_secret(), b"pvault/v1/journal")
 }
 
+/// Derives `init_journal_key` from `master_pw` (spec 8.3; D6): the same
+/// single Argon2id result that keys the future vault.
+pub fn init_journal_key(master_pw: &SecretBytes<KEY_LEN>) -> Result<SecretBytes<KEY_LEN>, Error> {
+    hkdf32(master_pw.expose_secret(), b"pvault/v1/init-journal")
+}
+
+/// HKDF-SHA-512 with no salt and `L = 32`, for keys whose `info` is defined
+/// elsewhere (for example the TPM-identity token scopes, spec 8.1).
+pub fn hkdf_key(ikm: &SecretBytes<KEY_LEN>, info: &[u8]) -> Result<SecretBytes<KEY_LEN>, Error> {
+    hkdf32(ikm.expose_secret(), info)
+}
+
 fn hkdf32(ikm: &[u8], info: &[u8]) -> Result<SecretBytes<KEY_LEN>, Error> {
     let mut out = SecretBytes::<KEY_LEN>::zeroed();
     hkdf_sha512(None, ikm, info, out.expose_secret_mut())?;

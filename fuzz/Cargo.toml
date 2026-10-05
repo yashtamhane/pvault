@@ -1,0 +1,45 @@
+# Fuzz targets (spec 12): cargo-fuzz, nightly toolchain only, excluded from
+# the workspace. Milestone 3 adds the parsers that exist so far; `card_parse`
+# follows with cards in Milestone 4.
+[package]
+name = "pvault-fuzz"
+version = "0.0.0"
+edition = "2024"
+authors = ["Yash Sandeep Tamhane"]
+license = "GPL-3.0-only"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "=0.4.13"
+pvault-core = { path = "../crates/pvault-core" }
+
+[[bin]]
+name = "header_parse"
+path = "fuzz_targets/header_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_parse"
+path = "fuzz_targets/journal_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "keytable_parse"
+path = "fuzz_targets/keytable_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stream_parse"
+path = "fuzz_targets/stream_parse.rs"
+test = false
+doc = false
+bench = false

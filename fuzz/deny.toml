@@ -1,0 +1,39 @@
+# cargo-deny policy for the separately locked, nightly-only fuzz crate.
+# Keep exceptions here so fuzz-only licenses never enter the product graph's
+# allowlist in ../deny.toml.
+
+[graph]
+all-features = false
+
+[advisories]
+yanked = "deny"
+ignore = []
+
+[licenses]
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0"]
+exceptions = [
+    { allow = ["GPL-3.0-only"], crate = "pvault-core" },
+    { allow = ["GPL-3.0-only"], crate = "pvault-fuzz" },
+    # Approved only for fuzz tooling at exactly 0.4.13. The crate manifest
+    # declares `(MIT OR Apache-2.0) AND NCSA`; its bundled LLVM source files
+    # carry `Apache-2.0 WITH LLVM-exception` headers. The latter is recorded
+    # here even though cargo-deny can inspect only the manifest expression.
+    { allow = ["NCSA", "Apache-2.0 WITH LLVM-exception"], crate = "libfuzzer-sys@0.4.13" },
+]
+confidence-threshold = 0.93
+include-dev = true
+include-build = true
+
+[licenses.private]
+ignore = false
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -41,17 +41,17 @@ issue.
 | SI-03 | Windows core dumps | Accepted | Best effort on Windows, no registry changes; Linux debugger impact documented | 10.3, 14 | core-dump tests | M7 (docs) |
 | SI-04 | License and notices | Accepted (license, wordlist) + Pending (release notices) | **`GPL-3.0-only`**, Copyright 2026 Yash Sandeep Tamhane; official GPL v3 text in `LICENSE`; `COPYRIGHT` notice; manifests set `license = "GPL-3.0-only"`; dependency compatibility assessed; `cargo-deny` approved. **EFF wordlist: decided** (EFF's CC BY 4.0 grant, embedded unmodified, attribution; applied in M2). Still pending: `cargo-about` for release notices (M13) and the RFC/IETF-excerpt question | 14, 16 | `cargo-deny` licenses; wordlist SHA-256 test | M13 |
 | SI-05 | MSRV and toolchain pinning | Accepted | `rust-version = 1.89`; native 1.89 build-and-test CI jobs on 3 OSes gate each milestone; release toolchain pinned by M13 | 12, 13 | MSRV CI jobs | M1 |
-| SI-06 | Section 16 decisions | Open (author) | Name `pvault` decided; passphrase length decided through SI-51 (main 10–16, default 12; duress fixed at 12); wizard default and PCR still recommended only | 16 | n/a | M3 / M5 |
-| SI-07 | CBOR implementation | Pending (evidence) | Three options compared; secret and path handling designed (decode, storage, zeroization, errors) | 4.4, 7.6, 7.8, 10.1 | F14, F71, F73, fuzz | M3 |
+| SI-06 | Section 16 decisions | Open (author) | Name and passphrase lengths decided; **PCR P1 decided** (nonce-policy only in v1; PCR requires a future reviewed format revision); wizard default remains open | 9.1, 16 | n/a | M14 (wizard only) |
+| SI-07 | CBOR implementation | Accepted (option 2, M3) | Three options compared; secret and path handling designed (decode, storage, zeroization, errors) | 4.4, 7.6, 7.8, 10.1 | F14, F71, F73, fuzz | M3 |
 | SI-08 | Shamir implementation | Accepted (option 1); implemented in M2 | `vsss-rs = "=6.0.1"` through its public polynomial API with pvault-owned, wiped storage; no allocation inside `vsss-rs`; independent vectors | 7.4, 7.6 | F5, F6, F62 | M2 |
 | SI-09 | QR input | Accepted | `png` with bounded limits; SVG output; camera deferred | 7.4a, 7.4c, 7.6 | F47, F61 | M4 |
 | SI-10 | Card files | Accepted + Pending (design) | Explicit destination, owner-only, recorded identity, identity-checked cleanup, remnants documented (accepted); active-operation lifetime lock and cleaner rules (pending) | 7.4b | F78 | M4 |
 | SI-11 | Secure file creation | Accepted + Pending (design) | FFI primitives, refuse when unsupported (accepted); `--force` exchange design and its real guarantees (pending; refused until approved) | 7.6a, 7.9 | F50, F51, proposed F90 | M4 |
-| SI-12 | Durability primitives | Pending (evidence) | Primary-doc evidence and a per-platform proposal | 4.3, 8.5 | F25, F26 (process crash only) | M3 |
+| SI-12 | Durability primitives | Accepted (M3; W1, N1) | Windows **W1 selected**: writable NTFS/ReFS under the explicit undocumented assumption, with no verified power-loss claim; remaining platform table still awaits approval | 4.3, 8.5 | F25, F26 (process crash only) | M3 |
 | SI-13 | FAT/exFAT and crash safety | Accepted (modified) | Mutations refused outside an allowlist; read-only otherwise; no redundant headers | 1, 2, 8.5 | F74 | M3 |
-| SI-14 | Lock protocol | Pending (design) | Gate lock + mount lock; no PID markers; no atomic conversion assumed | 4, 8.4 | F56a, F56b, F72 | M3 |
+| SI-14 | Lock protocol | Accepted (G + L, M3) + Pending (mount, upgrade: SI-45) | Gate lock + mount lock; no PID markers; no atomic conversion assumed | 4, 8.4 | F56a, F56b, F72 | M3 |
 | SI-15 | Memory locking | Accepted (modified) | Best effort, visible, optional strict mode; Argon2 memory wiped, not locked | 10.2 | F77 | M3 / M7 |
-| SI-16 | Argon2 memory limits | Accepted (modified) | Hard caps; total-RAM policy; available-memory resource check; specific messages; never lowered | 4.3, 5.8 | F13, F76 | M3 |
+| SI-16 | Argon2 memory limits | Accepted (modified; D8 definitions, M3) | Hard caps; total-RAM policy; available-memory resource check; specific messages; never lowered | 4.3, 5.8 | F13, F76 | M3 |
 | SI-17 | Fuzz toolchain | Accepted | Nightly for `fuzz/` only; Linux CI smoke job | 12 | fuzz targets | M3 |
 | SI-18 | TPM dependencies | Pending (design) | Exact pin and feature gating proposed | 7.6, 9.1 | M5 tests | M5 |
 | SI-19 | Non-TTY secret input | Accepted (modified) | Explicit `--secrets-stdin`; never argv or environment | 10.6 | F79 | M4 |
@@ -65,19 +65,19 @@ issue.
 | SI-27 | Passphrase normalization | Accepted | Space-separated words, hyphens kept, input-only hint | 7.3 | F75 | M2 |
 | SI-28 | Generation semantics | Accepted | Transaction counter; Revoke excluded; `keytable_gen == generation` | 3, 7.8, 9.7 | F18, F58 | M3 |
 | SI-29 | Header resilience | Pending (design) | Backups documented (accepted); S2 + S3 path proposed | 6.1, 14 | proposed F86 | M6 |
-| SI-30 | Vault paths | Accepted | Unique normalized paths; directory entries; `--replace` | 7.8 | F64, F73 | M3 |
+| SI-30 | Vault paths | Accepted (decode/input split, M3) | Unique normalized paths; directory entries; `--replace` | 7.8 | F64, F73 | M3 (decode rules) / M4 (input rules, case folding) |
 | SI-31 | `convert` | Accepted | Protocol drafted (6.9); confirm before M6 | 6.9 | F32, F68, F82 | M6 |
 | SI-32 | Duress setup | Accepted | Protocol drafted (6.10); confirm before M5 | 6.10 | F46, F57, F59, F81 | M5 |
 | SI-33 | Duress scope and ordering | Accepted | Command table; duress check before the journal check | 5.7 | F63 | M4 |
 | SI-34 | Portable single-card check | Accepted (modified) | Two-card verification kept and documented; no commitments | 7.4a | F63 | — |
-| SI-35 | Recovery details, handles, overflow | Pending (design) | Allocation and collision protocol; overflow refusal | 3, 6.3, 8.1 | proposed F87, F88 | M3 / M5 |
-| SI-36 | Cross-machine and TPM-less recovery | Accepted + Pending (design) | Recovery to portable and the same-TPM rule applied; identity mechanism pending, including an authenticated check on the duress path (TPM identity bound into the duress tag) | 6.5, 6.8, 9.2b, 9.6 | F25, F80, F83 | M3 (format) / M6 |
+| SI-35 | Recovery details, handles, overflow | Accepted (core digests, tracking, cleanup list, M3) + Pending (handle allocation, overflow: M5) | Allocation/collision protocol; explicit old/new/tracking core digests; authenticated 32-entry cleanup tracking; overflow refusal | 3, 6.3, 8.1 | proposed F87, F88 | M3 / M5 |
+| SI-36 | Cross-machine and TPM-less recovery | Accepted (tokens, H-2 template, duress formula, M3; TPM runtime M5) | Portable recovery and same-TPM rule applied; replace non-rekeyable identity MACs with exact encrypted, scoped TPM-identity tokens; PCR P1 selected | 6.5, 6.8, 8.1, 9.1, 9.2b, 9.6 | F25, F80, F83 | M3 (format) / M6 |
 | SI-37 | Object keys not rotated | Accepted (modified) | Documented; `--rekey-files` deferred | 6.11 | n/a | — |
-| SI-38 | Safe `init` | Pending (design) | Both modes journaled; directory rule; authenticated leftovers | 8.3 | F26, F59, F60 | M3 / M4 |
+| SI-38 | Safe `init` | Accepted (M3; `init` built in M4) | Four authenticated phases; file-identity ownership; exact confirmation/block rules for unowned residue | 8.1, 8.3 | F26, F59, F60, F69 | M3 / M4 |
 | SI-39 | Journal schemas | Accepted | Exact schemas in 8.1; Revoke/Erase at M8 | 8.1 | F27, F71 | M3 |
-| SI-40 | Leftover files | Pending (design) | Authenticated-ownership rules; add/rm reordering | 4, 8.2, 8.3 | F25, F26, proposed F89 | M3 |
+| SI-40 | Leftover files | Accepted (transition artifacts, M3) + Pending (live-vault add/rm, fsck rules: M4/M6) | Authenticated-ownership rules; add/rm reordering | 4, 8.2, 8.3 | F25, F26, proposed F89 | M3 |
 | SI-41 | Message table | Accepted (modified) | Table in 5.8; parse failures stay generic | 5.6, 5.8 | F7, F13, F14 | M3 |
-| SI-42 | Owner authorization and duress | Accepted + Pending (design) | `tpm-harden` removed; availability rule; checks C1 to C3 prepared, plus C4 if SI-36 (a) is adopted | 9.3 | F75, F81 | M5 |
+| SI-42 | Owner authorization and duress | Accepted + Pending (design) | `tpm-harden` removed; availability rule; checks C1 to C3 prepared, plus C4 if the SI-36 encrypted identity token is adopted | 9.3 | F75, F81 | M5 |
 | SI-43 | Erase confirmation | Accepted (modified) | Basename + vault-ID prefix; no unrelated deletion | 9.5 | F84 | M9 |
 | SI-44 | K2 | Pending (design) | Constraints applied; details at the M8 review | 9.10 | F43, F49 | M8 |
 | SI-45 | Mount | Pending (design) | Write model proposed; crates and CI to review | 13 (M11) | F56b | M11 |
@@ -86,7 +86,7 @@ issue.
 | SI-48 | Failpoints | Accepted | Test-only feature; excluded from release builds | 11 | F85 | M3 |
 | SI-49 | Guarantee table | Accepted | Two rows added; crash-safety statement added | 2 | docs | M7 |
 | SI-50 | Minor items | Accepted | Itemized below | various | F17, F70 | as noted |
-| SI-51 | Passphrase options | Accepted (final design, with clarifications) + Pending (metadata schemas) | Main: generated (10–16, default 12) or custom (NFC-only, refuse and warn lists, `zxcvbn` 3.1.1 at creation only, in a child process, "Estimated" provisional bands, fail closed on creation). Duress: generated only, fixed at 12 words. Bounded terminal input replaces `rpassword` (7.6a extended). Unlock: 1 Argon2id run, or 2 for a custom main with duress; verification-only skips the duress-only run. Header and journal schemas pending | 2, 4.1, 5, 6, 7.3, 7.6, 7.6a, 8.1, 9.6, 10, 16 | F75, new | M2 (done) / M3 |
+| SI-51 | Passphrase options | Accepted (final design and schemas, M3) | Main: generated (10–16, default 12) or custom (NFC-only, refuse and warn lists, `zxcvbn` 3.1.1 at creation only, in a child process, "Estimated" provisional bands, fail closed on creation). Duress: generated only, fixed at 12 words. Bounded terminal input replaces `rpassword` (7.6a extended). Unlock: 1 Argon2id run, or 2 for a custom main with duress (1 when generated-word handling refuses the input, N3); verification-only skips the duress-only run. Header and journal schemas pending | 2, 4.1, 5, 6, 7.3, 7.6, 7.6a, 8.1, 9.6, 10, 16 | F75, new | M2 (done) / M3 |
 
 ---
 
@@ -229,11 +229,14 @@ Basis: the FSF's published license list (<https://www.gnu.org/licenses/license-l
 
 - **Decided:** keep the name `pvault`.
 - **Decided through SI-51 (2026-10-04):** generated main passphrases are 10–16 words, default 12; duress passphrases are fixed at 12 words for now.
+- **Decided (P1, 2026-10-05):** v1 is nonce-policy only. PCR binding
+  changes the NV policy, expected Names, cleanup reconstruction,
+  TPM-identity-token AAD and duress tag, so it requires a future reviewed
+  format revision. It is not a Milestone 5 runtime-only addition to v1.
 - **Recommendations awaiting confirmation:**
-  - **Passphrase length:** 12 words (~155 bits) in both modes. Under A2 (Grover's algorithm), 12 words leave ~2^77.5 Argon2id evaluations versus ~2^64.6 for 10. Portable mode relies on the passphrase alone. The cost is two more words to type.
   - **Wizard default:** bound on Linux, when a usable TPM 2.0 is present and bound duress or indices can work. Portable on platforms without bound support.
-  - **PCR binding:** opt-in, because firmware updates would otherwise force recovery unexpectedly.
-- **Affected:** 7.3 (the default length) before Milestone 2; the wizard default (Milestone 14) before Milestone 3, per Section 16; PCR before Milestone 5.
+- **Affected:** the wizard default (Milestone 14) remains the only open SI-06
+  author choice. The P1 format selection affects Milestones 3 and 5.
 
 ### SI-07 CBOR implementation — Pending (evidence)
 
@@ -292,7 +295,7 @@ Basis: the FSF's published license list (<https://www.gnu.org/licenses/license-l
   - approve a case-folding crate;
   - vendor a generated table at a pinned Unicode version (a Unicode license notice is then required);
   - redefine collisions as "equal after NFC and `to_lowercase`".
-  This is an SI-30 decision, before Milestone 3.
+  This is an SI-30 decision, **before Milestone 4** (the first input-time check, `add`), provided the decode/input split is approved; otherwise it is needed before Milestone 3.
 
 *In-memory storage of the key table:*
 - `Vec<Entry>` is reserved at exactly the CBOR array length (bounded by 64 MiB divided by the minimum entry size) before decoding, so it never reallocates.
@@ -320,6 +323,8 @@ Basis: the FSF's published license list (<https://www.gnu.org/licenses/license-l
 **Recommendation:** option 1 for every structure, including the key table, with the restrictions above. Fall back to option 2 **for the key table only** if the allocation tests show any secret byte passing through a growable buffer.
 
 **Approval needed:** option 1 with the fallback trigger, or option 2.
+
+**Revised recommendation (2026-10-05, for review; `docs/M3_READINESS.md` D3):** option 2, a fixed-schema in-house codec for every structure. It adds a two-pass key-table decode (pass 1 validates and sizes without allocating), exact-capacity arenas, a 65,536-entry cap (**decided N5**: a v1 product limit counting files and directories; an over-limit operation is refused before any write and leaves the vault unchanged; spec 7.8, proposed F92) and an architecture-independent decoded-size charge. The Milestone 2 normalization finding (M2-F1) is the main reason for revising the earlier option-1 recommendation. Nothing is approved.
 
 **Affected:** Milestone 3 (header, journal, key table), the `keytable_parse` fuzz target, F14 and F71.
 
@@ -532,8 +537,18 @@ Basis: the FSF's published license list (<https://www.gnu.org/licenses/license-l
 - **Linux `rename(2)`:** atomic replacement is stated for **concurrent observers** ("no point at which another process … will find it missing"), not for crashes.
 - **Linux `fsync(2)`:** flushes the disk cache when the file system supports it ("older kernels and lesser used filesystems do not know how to flush disk caches"). It needs a separate `fsync` on the directory for the directory entry.
 - **Linux `RENAME_NOREPLACE`:** requires file-system support (ext4 since 3.15; many others since 4.9).
-- **Windows `MoveFileExW`:** `MOVEFILE_WRITE_THROUGH` "guarantees that a move performed as a copy and delete operation is flushed to disk". No crash-atomicity statement for same-volume renames was found.
+- **Windows `MoveFileExW`:** `MOVEFILE_WRITE_THROUGH` "guarantees that a move performed as a copy and delete operation is flushed to disk". No crash-atomicity statement for same-volume renames was found, and this does not specify `NtSetInformationFile(FileRenameInformation)`.
 - **Windows `FlushFileBuffers`:** flushes a file. Flushing a volume requires administrative privileges.
+- **Windows `NtCreateFile` / `NtSetInformationFile`:** `RootDirectory` plus a
+  one-component `ObjectName` provides the required handle-relative open, and
+  `FileRenameInformation.RootDirectory` makes the destination relative to the
+  held directory handle. `FILE_OPEN_REPARSE_POINT` opens a reparse point
+  itself. The Win32 write-through documentation says an NTFS write-through
+  request flushes metadata changes, including a rename resulting from the
+  request. The `NtCreateFile` flag definition itself speaks only of requested
+  write operations. Neither source establishes ReFS behavior, old-or-new
+  crash atomicity, power-loss safety or equivalence to
+  `MoveFileExW(MOVEFILE_WRITE_THROUGH)`.
 - **Rust `std::fs::rename` (1.89):** on Windows it uses `MoveFileExW` or `SetFileInformationByHandle`, so the flags are not under our control. Use explicit calls.
 
 **Proposed primitives:**
@@ -542,16 +557,70 @@ Basis: the FSF's published license list (<https://www.gnu.org/licenses/license-l
 | --- | --- | --- | --- | --- |
 | Linux (ext4, XFS, Btrfs) | `fsync` | `renameat` / `renameat2` | `fsync(dirfd)` | Crash consistency as provided by these journaling file systems with flush support |
 | macOS (APFS, HFS+) | `fcntl(F_FULLFSYNC)` | `renameat` | `F_FULLFSYNC` on the directory fd (to verify) | `rename(2)`'s documented crash guarantee |
-| Windows (NTFS, ReFS) | `FlushFileBuffers` | `MoveFileExW(REPLACE_EXISTING \| WRITE_THROUGH)` via `windows-sys` | none available without admin | **Not documented** by Microsoft; an assumption, stated as such |
+| Windows (NTFS, ReFS) | `FILE_WRITE_THROUGH` for data writes plus `FlushFileBuffers` | handle-relative `NtSetInformationFile(FileRenameInformation)` after a no-follow `NtCreateFile` open | none available without admin | **Not documented** as crash- or power-loss durable by Microsoft; W1 is an explicit assumption |
+
+**Detection correction:** Linux must resolve the open directory's mount ID and
+parse `/proc/self/mountinfo` by locating the first token exactly equal to `-`
+after the six fixed fields. The filesystem type is the token immediately after
+that separator; optional fields make a fixed field number incorrect. Accept
+only exact `ext4`, `xfs` or `btrfs`. Never infer ext4 from `statfs` magic
+`0xEF53`, which is shared with ext2/ext3. Query/parse ambiguity fails closed.
+
+**Replacement failure boundary:** failure before replacement is an ordinary
+pre-commit abort. A replacement-call error has unknown outcome and requires
+reopening/authenticating the header against the journal's exact expected-core
+digests. Once replacement succeeds, a required directory/full-flush failure is
+“committed-visible, durability unknown”: retain the committing journal and all
+old/new dependencies, report the distinct durability error, and let restart
+authenticate the header and retry the flush before cleanup. It must never be
+reported or handled as a pre-commit abort. A failed flush after journal unlink
+likewise permits a harmless stale authenticated journal on restart.
+
+**Author selection W1 (2026-10-05), reconciled with the required
+handle-relative implementation:** NTFS and ReFS remain writable under the
+following explicit product assumption. The primitive name is amended from the
+earlier `MoveFileExW` draft because path-based replacement is not permitted:
+
+> After the temp-file flush, successful same-volume handle-relative
+> `NtSetInformationFile(FileRenameInformation)` replacement leaves either the
+> authenticated old header or the authenticated new header after process, OS
+> or power failure.
+
+This is not a Microsoft-documented guarantee and is not a claim of verified
+power-loss safety. `FILE_WRITE_THROUGH` is requested on the verified source
+handle under the documented NTFS metadata-flush behavior, but is not claimed
+to establish ReFS behavior, atomic old-or-new survival, or equivalence with
+`MoveFileExW(MOVEFILE_WRITE_THROUGH)`. Native kill-at-each-step tests establish process-crash
+behavior only on tested systems; VM power-cut testing is additional
+configuration evidence and cannot turn the assumption into a platform
+guarantee. The read-only-Windows and redundant-header alternatives are not
+selected.
 
 **Remaining uncertainty:**
-- Windows crash atomicity of rename-replace is an undocumented assumption.
+- Windows crash atomicity of rename-replace remains an undocumented, now
+  explicit assumption.
 - Whether directory `F_FULLFSYNC` is meaningful on APFS.
 - Device firmware that ignores flushes.
 
 None of these can be proven by process-crash tests (now stated in 2 and 8.5).
 
-**Approval needed:** the primitive table and the Windows assumption wording.
+**Readiness-audit additions (2026-10-05, for review):**
+- Windows SMB shares can report `NTFS`. The local-volume acceptance criterion (spec 8.5) requires four results on each held directory handle:
+  - Q1: `FileRemoteProtocolInfo` fails with `ERROR_INVALID_PARAMETER`;
+  - Q2: `VOLUME_NAME_GUID` gives a `\\?\Volume{` path;
+  - Q3: `GetDriveTypeW` is `DRIVE_FIXED` or `DRIVE_REMOVABLE`;
+  - Q4: the volume name is exactly `NTFS` or `ReFS`, with a matching serial for `objects/`.
+
+  Every other result refuses, with no weaker retry. The Q1 error code and Q2's behavior on SMB are unverified until a native Milestone 3 probe; until then the criterion fails closed.
+- `objects/` must be on the same mount and volume as the vault directory.
+- A durability-capability preflight runs before any side effect, so that a *predictable* "unsupported" is a refusal rather than a post-commit "durability unknown". Passing it never weakens post-commit handling: any failure after the header replacement call, whatever its error code, still follows the failure boundary ("outcome unknown" or "committed-visible, durability unknown").
+- **Decided N1 (2026-10-05), with the primitive name amended by the later handle-relative correction:** W1 retains its risk boundary and now names `NtSetInformationFile(FileRenameInformation)`, not path-based `MoveFileExW`. The Windows ordering assumptions WO-1 (journal first), WO-2 (key table before header) and WO-3 (deletions do not overtake the commit) are stated explicitly as unverified, and documentation says that a Windows power loss or OS crash during a commit can leave a vault unreadable, recoverable only from a backup (spec 2 and 8.5).
+
+See `docs/M3_READINESS.md` D5.
+
+**Approval needed:** the remaining primitive table and allowlist details. W1
+itself and its limitation wording are selected; that does not approve the
+other SI-12 recommendations.
 
 **Affected:** Milestone 3; F25, F26, F44, F45, F54, F67.
 
@@ -649,6 +718,12 @@ None of these can be proven by process-crash tests (now stated in 2 and 8.5).
   - The 64 MiB margin is provisional.
   - "Available memory" means different things per platform (`MemAvailable`, Mach VM statistics, `ullAvailPhys`); the definitions will be fixed in Milestone 3.
 - **Affected:** Milestone 3; F13, F76.
+- **Proposed definitions (2026-10-05, for review; `docs/M3_READINESS.md` D8):**
+  - Linux `MemAvailable`;
+  - Windows `ullAvailPhys`;
+  - macOS `sysconf(_SC_PAGESIZE) × (free_count + inactive_count)` from `host_statistics64(HOST_VM_INFO64)`.
+
+  A query failure refuses before allocation. (`libc` has no `host_page_size`, and its `mach_host_self` is deprecated; it is used under a scoped allow, with no new crate.)
 
 ### SI-17 Fuzz toolchain — Accepted
 
@@ -874,13 +949,63 @@ None of these can be proven by process-crash tests (now stated in 2 and 8.5).
 **Keeping track of indices that cannot be resolved here (added in 7.1 for F25).** Under the same-TPM rule, `fsck` on another machine, or on a TPM whose identity cannot be established, must not delete a journaled index. The vault-side resolution must still finish, so that the vault is usable. Options:
 - **(a) Keep the journal.** The vault stays blocked until `fsck` runs on the original TPM. That is a severe loss of availability; rejected.
 - **(b) A per-user local record.** It is machine-local and lost when the vault moves; rejected.
-- **(c) Recommended: an authenticated `pending_tpm_cleanup` list in the core.**
-  - Entries hold the handle, both Names, the policy nonce and the keyed TPM identity (SI-36).
+- **(c) Recommended: an authenticated `tpm_cleanup` list in the core.**
+  - Entries hold the handle, permitted Names, policy nonce and the scope-5
+    encrypted TPM-identity token (SI-36).
   - `fsck` resolves the vault side, then moves the unresolved index into this list as part of its commit (`core_mac`, generation + 1), and deletes the journal.
   - Any later `fsck` with an unlock on a matching TPM deletes the index under 9.2b, and the entry is removed in the next commit.
   - `status` lists pending entries.
 
   This is a core format change, so it must be decided before Milestone 3. With (c), F25 holds as "no index left untracked".
+
+**Core-state journal binding added for review (2026-10-05).** Every transition
+journal authenticates the precise core states it permits, using the existing
+header digest definition:
+
+`SHA-512("pvault/v1/core" || canonical_cbor(CoreFields))`.
+
+Each value is a CBOR `bytes(64)` covered by the journal MAC. `prepared` has
+`old_core_digest`; `committing` has `old_core_digest` and `new_core_digest`;
+`rollback_tracking` has `old_core_digest` and `tracking_core_digest`. The
+single-MAC encoding omits `mac`; the dual-MAC encoding omits both `mac_old` and
+`mac_new`. Generation, mode and filenames never classify a restart side.
+Restart requires the applicable journal MAC, the candidate core's `core_mac`,
+and a constant-time match between the recomputed actual core digest and the
+corresponding journal field.
+
+Crash order is strict: durable `prepared` precedes every target side effect;
+durable dual-MAC `committing` follows all new-core dependencies and precedes
+header replacement; durable `rollback_tracking` follows construction of the
+complete tracking core and precedes its header replacement. A post-replacement
+directory-flush failure retains the journal and all dependencies for restart;
+it is not a pre-commit abort.
+
+Rollback tracking keeps the exact authenticated old `SlotFields` but changes
+`CoreFields`. It therefore recomputes both
+`core_mac = HMAC-SHA-512(K_mac_old, "pvault/v1/core-mac" ||
+canonical_cbor(TrackingCoreFields))` and
+`slots_mac = HMAC-SHA-512(K_mac_old, "pvault/v1/slots-mac" ||
+tracking_core_digest || canonical_cbor(OldSlotFields))`. This is allowed only
+after the old slots MAC verifies. If it does not and the target index cannot
+be resolved on the present TPM, retain the journal and block; never re-MAC
+provisional slot data.
+
+The proposed cleanup list is capped at 32 entries. An operation that may add a
+record must reserve capacity before writing its journal, defining an index or
+creating its target key table. At 32 distinct unresolved records it refuses;
+it never evicts or overwrites an entry and never creates an untracked index.
+
+**Readiness-audit completion (2026-10-05, for review):**
+- The remote-rollback path gains a `tracking_created` phase that journals the tracking key-table temp identity before any bytes.
+- Its `old_gen + 2` generation step is recorded as a glossary exception.
+- Transition journals gain `old_keytable_digest` and the `target_created` phase (see SI-40).
+- **Header-temp resolution (2026-10-05):** `tracking_created` retains a replaced `committing` record's `header_*` identity. Before the tracking header temp is created, an existing `vault.hdr.tmp` is unlinked only if its identity matches, and the retained identity stays until the directory flush succeeds. A mismatch, missing identity or non-regular file blocks reuse of the name (owner confirmation only). See spec 8.1.
+- **Transition journal-temp promotion (2026-10-05):** the permitted transitions are prepared → target_created or tracking_created; target_created → committing or tracking_created; committing → tracking_created (old side only); tracking_created → rollback_tracking.
+  - Single-MAC phases verify under the old journal key; `committing` verifies under `mac_old` or `mac_new`.
+  - Immutable fields and retained identities are preserved byte-for-byte.
+  - Invalid temps are unowned residue that block further rewrites until owner confirmation.
+  - Spec 8.2 holds the rules and a crash table for committing → tracking_created → rollback_tracking.
+  - Tracking artifacts are **resumed in place** through their identity (truncate and rewrite), never recreated under a new identity.
 
 **Approval needed:** the protocol.
 
@@ -892,36 +1017,69 @@ None of these can be proven by process-crash tests (now stated in 2 and 8.5).
   - `recover --to-portable` (6.8), with no TPM needed.
   - The same-TPM deletion rule (9.2b step 3): never delete merely because handle, Name and policy match.
   - Remote old-index limitations documented.
-- **Proposed mechanism (pending):**
-  - **(a) Recommended:** `tpm_id = SHA-256(EK public area)`, from the TCG default ECC P-256 EK template, created transiently in the endorsement hierarchy.
-    - It is stored in the bound slots and in the journal `IDX` and old-index fields, and recomputed before any undefine.
-    - A mismatch, or an inability to compute it (endorsement authorization set, `ehEnable` clear), means no deletion, and the index is reported.
-  - **(b) Not recommended:** proof by authorized read with the old `tpm_auth`. It works only when the passphrase is present, costs a DA count against a decoy, and cannot cover an index that was never written.
-- **Revised proposal (7.1), including an authenticated check on the duress path:**
-  1. **Measurement.** `ek_digest = SHA-256(marshal(TPMT_PUBLIC))` of the TPM's endorsement key, created transiently from a **fixed** TCG EK Credential Profile template (ECC NIST P-256 preferred) with `CreatePrimary(TPM_RH_ENDORSEMENT)`, then flushed.
-     - It is an unauthenticated public query: it carries no authorization and has no DA effect (5.7).
-     - It requires the endorsement hierarchy to be enabled and endorsement authorization to be empty.
-     - `ek_digest` is **never stored, logged or displayed in plaintext.**
-  2. **Normal paths** (an unlock with the bundle, recovery, `fsck`):
-     - The bound slots gain `tpm_id_mac = HMAC-SHA-512(K_mac, "pvault/v1/tpm-id" ‖ vault_id ‖ ek_digest)` (64 bytes, also covered by `slots_mac`).
-     - Before any undefine (9.2b), the current `ek_digest` is measured and the MAC recomputed and compared in constant time.
-     - A mismatch, or a failed measurement, means no deletion, and the index is reported.
-  3. **Journals:** `IDX` and the old-index fields carry `tpm_id_mac` values keyed under the same key that authenticates the record (`journal_key` or `init_journal_key`). Dual-MAC records carry both the old-key and the new-key variant. The `pending_tpm_cleanup` entries of SI-35 (c) carry the `K_mac` variant.
-  4. **Duress path (no bundle).** The bound tag also binds the identity:
+- **Proposed replacement (pending): encrypted, rekeyable identity tokens.** The
+  earlier keyed-MAC proposal is rejected as a recommendation: away from the old
+  TPM, a MAC under `K_mac_old` cannot be transformed into a new-bundle cleanup
+  value or survive another rotation. The exact proposal is in
+  `docs/M3_READINESS.md` D6 and is summarized here so the decision record and
+  governing schema cannot drift:
+  1. `tpm_id_template = 1` means TCG EK Credential Profile 2.5 R2 template H-2,
+     ECC NIST P-256 storage EK, with the exact public template enumerated in D6.
+     `ek_digest = SHA-256(MU-marshal(returned TPMT_PUBLIC))`, including the
+     populated unique point and excluding the outer `TPM2B_PUBLIC.size`.
+     Unknown template enums are parse failures.
+  2. A token encrypts the exact 32-byte digest with XChaCha20-Poly1305, fresh
+     24-byte nonce, 48-byte ciphertext-and-tag. Its 32-byte key is
+     `HKDF-SHA-512(base_key, salt=empty, info=label, L=32)`. Exact scopes are:
 
-     `duress_tag = HMAC-SHA-512(duress_key, "pvault/v1/duress-tag" ‖ vault_id ‖ "bound" ‖ u32_be(tpm_nv_index) ‖ tpm_nv_name ‖ tpm_policy_nonce ‖ ek_digest)`
+     | Scope | Label | Base key |
+     | ---: | --- | --- |
+     | 1 | `pvault/v1/tpm-id/slots` | current `K_mac` |
+     | 2 | `pvault/v1/tpm-id/init` | `init_journal_key` |
+     | 3 | `pvault/v1/tpm-id/new-index/old-side` | `journal_key(old_bundle)` |
+     | 4 | reserved; never used in v1 (decision N4) | none |
+     | 5 | `pvault/v1/tpm-id/cleanup` | current `K_mac` |
 
-     - Before the duress check (5.7, step 6), a bound unlock whose slots contain a tag measures `ek_digest`. It does this on **every** such unlock, so the duress and non-duress paths take the same steps.
-     - A match authenticates, in one constant-time comparison, three things: the duress passphrase, the slots' TPM fields, **and** that this is the TPM the tag was made on. Then come C1 to C4 (SI-42), the 9.2b Name and public-area check, and the undefine.
-     - **On another TPM:** the tag does not match, and the passphrase continues as a wrong one. The Name check there normally fails, so `NV_Read` is never called. Result: `Unlock failed.`, with nothing deleted.
-     - **If the measurement is impossible** (C4 fails): no match is possible, so the behavior is the same as on another TPM. `status` reports duress as unavailable.
-  5. **Privacy.** No plaintext identifier is stored. Testing a candidate EK offline needs the bundle (`K_mac`) or the duress passphrase, which is Argon2-gated.
-- **Remaining uncertainty:**
-  - **Fixed template choice.** Some TPMs may lack ECC P-256. The template must be fixed when the index is created (an RSA-2048 fallback takes seconds), and the choice would need a public slots field `tpm_id_template`: a minor leak of TPM capability.
-  - **Latency:** an EK `CreatePrimary` on every bound unlock that has a tag. To be measured in Milestone 5, with the timing documented in Milestone 9.
-  - **Formula change:** this changes the 9.6 tag formula and the slots and journal formats, so it must be decided before Milestone 3.
-  - An EK can change after `TPM2_ChangeEPS`. All owner indices are lost then anyway.
-- **Approval needed:** the revised mechanism, including binding the identity into the duress tag.
+     The exact AAD is `ASCII("pvault/v1/tpm-id-token\0") || u8(scope) ||
+     vault_id[16] || u8(tpm_id_template) || u32_be(tpm_index) ||
+     u8(name_prewrite_present) || optional name_prewrite[34] ||
+     name_postwrite[34] || policy_nonce[32]`. Presence is exactly 0 or 1.
+  3. Flattened schema fields are exact: bound slots use `tpm_id_template`,
+     `tpm_id_nonce`, `tpm_id_ct`; init `IDX` uses
+     `new_tpm_id_template`, `new_tpm_id_nonce_i`, `new_tpm_id_ct_i`;
+     transition `IDX` uses `new_tpm_id_nonce_o`, `new_tpm_id_ct_o`. The
+     `committing` record carries no old-index fields (decision N4): an
+     authenticated bound old index is tracked only by the scope-5 cleanup
+     entry pre-staged in the new core. All templates equal 1; nonce and
+     ciphertext lengths are 24 and 48 bytes. Conditional fields are absent,
+     never `null`.
+  4. `CoreFields.tpm_cleanup` is a required array, empty when unused and capped
+     at 32. Each map has `tpm_index`, optional `name_prewrite`,
+     `name_postwrite`, `policy_nonce`, `tpm_id_template`, `tpm_id_nonce`, and
+     `tpm_id_ct`, with the exact types and sorting rule in D6. Bundle rotation
+     decrypts every authenticated old cleanup token and re-encrypts it under
+     the new `K_mac` scope 5 with a fresh nonce before creating new files.
+     Failure aborts before side effects. Capacity is reserved before an
+     operation can create an index; overflow refuses without eviction.
+  5. Decrypt only after the containing slots/core/journal MAC verifies. An AAD,
+     scope or AEAD failure is corruption and never authorizes deletion. Before
+     actual deletion, measure the live TPM, compare the decrypted digest in
+     constant time, and then perform all 9.2b Name/public-area checks. Rewraps
+     use fresh nonces and immediately zeroize plaintext digests.
+  6. The bound duress tag continues to bind the live `ek_digest` directly, as
+     specified in 9.6. The token lets remote recovery verify an old re-entered
+     duress passphrase after authenticating and opening the old token.
+- **Author-selected PCR direction:** P1, nonce-policy only in v1. PCR binding
+  requires a future reviewed format revision; it is not pending as a v1
+  runtime branch.
+- **Remaining uncertainty:** capability/latency evidence for the fixed H-2
+  template and the still-pending adoption of this token format. An EPS change
+  invalidates the identity along with the owner indices.
+- **Readiness-audit findings (2026-10-05):**
+  - Because the token is required in bound slots and `IDX`, a TPM whose H-2 EK cannot be measured cannot receive a bound index at all. C4 therefore gates bound creation, not only duress. **Decided N2 (2026-10-05):** bound `init`, recovery and `convert` measure the identity before any write. On failure they refuse and explicitly offer portable mode (`recover --to-portable` for recovery), leaving the vault unchanged (spec 9.3; proposed F91).
+  - **Decided N4 (2026-10-05):** the committing record's old-index fields and scope-4 token are removed. This was decided after verifying that every restart path that may act on the old index authenticates and opens the staged scope-5 entry without the old TPM. The new side, and every later `fsck` or rotation, has `K_mac_new`; on the old side the old index is still live; an indeterminate header deletes nothing. Scope 4 is reserved.
+- **Approval needed:** the encrypted-token mechanism, exact H-2 template and
+  duress integration. P1 itself is already selected.
 - **Affected:** Milestone 3 (format), Milestones 5, 6 and 9; F25, F80, F83, F38, F81.
 
 ### SI-37 Object keys not rotated — Accepted (modified)
@@ -934,47 +1092,99 @@ None of these can be proven by process-crash tests (now stated in 2 and 8.5).
 *Re-evaluated "Decision: No". The author moved it to design.*
 
 **Proposal:**
-1. **Target directory T:**
-   - It must not exist (pvault creates it, mode `0700`) or must be an empty directory, opened without following symlinks.
+1. **Target directory T** (bootstrap and preflight order: spec 8.3, "Init bootstrap and preflight order"; only T and its two lock files may be created before the completed preflight, and `init` never creates `objects/`):
+   - It must not exist (pvault creates it, mode `0700`, after the parent's file system passes 8.5) or must be an empty directory, opened without following symlinks.
    - Zero-length regular lock files left by an earlier pvault attempt count as empty.
    - Anything else → refuse ("directory not empty").
-2. **Both modes write an init journal before creating anything else.** In v6 only bound mode did.
-   - **Fields:** the 8.1 init fields with `salt` (the future `core.salt`) instead of a separate `journal_salt`, plus the Argon2 parameters and `IDX` when bound.
-   - **Key:** `init_journal_key = HKDF-SHA-512(master_pw, info "pvault/v1/init-journal", L = 32)`, from the **same** single Argon2id run.
-   - **Rewrite after the key table:** after `keytable.1.pv` is renamed into place, the journal is rewritten with the file's SHA-512 digest, keeping the same index fields.
-3. **Order:**
-   1. Journal.
-   2. Bound only: define the index, write S2, and confirm both Names.
-   3. `keytable.1.pv` (tmp → flush → rename), then the journal digest update.
-   4. Cards, outside T, tracked in `cards.cbor`.
-   5. Delivery verification.
-   6. Optional duress (6.10).
-   7. Header: the commit point.
-   8. Delete the journal.
-4. **Re-run when T has a journal and no header:**
-   1. Ask for that setup's passphrase and validate the journal's parameters against the caps.
-   2. Verify the MAC, and match `vault_id` and `setup_id`.
-   3. Delete exactly these protocol-defined items:
-      - the journaled index (9.2b, including the same-TPM rule);
-      - `keytable.1.pv`, only if its digest matches the journal;
-      - the transient `keytable.1.pv.tmp`, `vault.hdr.tmp` and `vault.journal.tmp`, as regular files opened without following symlinks inside T.
-   4. If T holds anything else (apart from lock files), refuse and report, because T no longer looks as `init` left it.
-   5. Delete the journal and start over with a new `vault_id` and `setup_id`.
+2. **Both modes write an init journal before any other vault artifact.** The
+   common fields are the exact 8.1 schema. The key is
+   `HKDF-SHA-512(master_pw, salt=empty,
+   info="pvault/v1/init-journal", L=32)` from the same one Argon2id result.
+   Bound init carries the complete index context and scope-2 encrypted identity
+   token. Every phase retains immutable fields byte-for-byte and is re-MACed.
+3. **Four exact phases and crash order:**
+   1. `prepared`, directory-flushed before an index definition or artifact.
+   2. Securely create empty `keytable.1.pv.tmp`; record its authenticated
+      platform file identity in durable `keytable_created` **before** writing
+      bytes. Continue through the same handle, flush, rename, directory-flush,
+      then write `keytable_written` with `keytable_digest` and the exact
+      `new_core_digest`.
+   3. After card/type-back/duress work, securely create empty `vault.hdr.tmp`;
+      record its authenticated identity in durable `committing` before writing
+      bytes. Its header must contain the core matching `new_core_digest`.
+   4. Flush, rename and perform the platform post-replacement flush. Remove the
+      journal only after the core, slots and journal MACs and `new_core_digest`
+      verify and the post-replacement flush succeeds. `header_file_id` owns only
+      `vault.hdr.tmp` residue; a mismatch on the committed header is reported,
+      not blocking (corrected 2026-10-05; spec 8.3). A post-replacement flush
+      failure retains the journal and artifacts for restart; it is not
+      reported as a normal pre-commit abort.
+4. **Identity, not filename, proves file ownership.** Unix identity is
+   `u64_be(st_ino) || i64_be(birth_sec) || u32_be(birth_nsec)` (20 bytes),
+   checked on the same `st_dev` as the held directory at restart. Windows
+   identity is `u64_be(FILE_ID_INFO.VolumeSerialNumber) ||
+   FILE_ID_128.Identifier || u64_be(FILE_BASIC_INFO.CreationTime)`
+   (32 bytes). (Revised by the readiness audit; the draft's
+   `st_dev || st_ino` was unstable across reboots and open to inode reuse.)
+   Capture it from the open, securely created regular file. Restart reopens
+   relative to T without following symlinks and rechecks type and identity
+   immediately before unlink. Thus an authenticated `keytable_created`
+   identity owns the matching file even if it is complete and the crash
+   preceded the digest journal update.
+5. **Interrupted journal rewrites:** `vault.journal.tmp` is never owned by its
+   name. After the canonical journal authenticates, promote a temp only if it
+   independently authenticates with the same init key, has identical immutable
+   fields and is the same phase or its one permitted successor. Incomplete,
+   invalid, divergent or skipped-phase temps are unauthenticated residue.
+6. **Owner-confirmed residue:** after authenticating the canonical journal,
+   pvault may offer only otherwise-unauthenticated regular files at the exact
+   protocol locations `keytable.1.pv.tmp`, `keytable.1.pv`, `vault.hdr.tmp`,
+   and `vault.journal.tmp`. Display relative name, platform identity and byte
+   length. Deletion requires `DELETE INIT LEFTOVERS
+   <first-8-hex-of-setup_id>`, followed by a no-follow reopen that matches the
+   displayed type, identity and length. The name only defines the offer set;
+   it never authorizes deletion. Decline, non-interactive use, missing/wrong
+   passphrase, changed/unverifiable identity or length, or an inability to
+   perform the reopen leaves the canonical journal and init blocked. Symlinks,
+   directories, special files and other names are never offered or deleted;
+   the owner must handle them manually. Lock files remain; external cards use
+   `cards.cbor`.
+7. **Bound restart:** resolve the journaled index first. On a matching TPM,
+   verify the token and both permitted Names and then clean files. If the
+   original TPM is unavailable, retain the journal and every artifact and
+   leave init blocked; there is no authenticated old core in which to track a
+   remote init index. No filename-only cleanup is allowed.
+8. **Create-before-identity window:** a temp created before the identity phase
+   becomes durable is not automatically owned, nor is a final key table with a
+   `prepared` journal. It requires the exact confirmation above or leaves init
+   blocked. A malformed/unauthenticated journal authorizes no deletion. If the
+   canonical journal is absent, a `vault.journal.tmp` or other init-looking
+   artifact has no authenticated ownership root: it is not promoted or offered
+   for automatic cleanup, and init remains blocked until manual owner removal.
 
-   Without the passphrase, it only reports.
-5. **Re-run when T has a header:** the v6 post-commit rules are unchanged.
+The full restart state table is normative in spec 8.3 and mirrored in
+`docs/M3_READINESS.md` D6.
 
-**Remaining uncertainty:**
-- A partial `.tmp` file cannot be content-authenticated. Deleting it relies on the authenticated journal plus its exact protocol name plus the T-content restriction, which is still a name-based component. The alternative is report-and-confirm for `.tmp` files.
+**Remaining uncertainty:** the platform file-identity limits recorded in spec 8.1 (identity cannot be verified after a move or restore; that case is confirmation or block, never deletion). Author approval of the whole safe-init protocol is still required.
 
-**Approval needed:** the protocol, and the `.tmp` choice.
+**Readiness-audit revisions (2026-10-05, for review):**
+- **File identity is revised** to Unix `st_ino || birth time` (20 bytes), compared on the same `st_dev` as the held directory, and Windows volume serial `|| FileId || CreationTime` (32 bytes). The draft's `st_dev || st_ino` changes across reboots for btrfs subvolumes and removable media, and is open to inode reuse.
+- **Per-platform support and refusal rules** (spec 8.1) are decided at run time: Linux `statx` mask with `STATX_INO` and `STATX_BTIME`; macOS a non-zero `st_birthtimespec`; Windows `FileIdInfo` and `FileBasicInfo`. Unsupported means a preflight refusal; a failure at creation stops before any byte; a failure or mismatch at restart deletes nothing.
+- **The identity is not universally unique.** HFS+ has one-second creation dates; macOS and Windows let writers set creation times; ReFS ID reuse is undocumented. It prevents deletion by name and accidental confusion, not attacks by local writers to the vault directory, which 8.4 already puts out of scope.
+- **The committed header** is accepted by digest and MACs; `header_file_id` only owns `vault.hdr.tmp` residue.
+- **The same identity handoff applies to transition artifacts** (SI-40).
+
+**Approval needed:** the four-phase protocol, identity encoding, confirmation
+phrase and block cases. These are recommendations, not approvals.
 
 **Affected:** Milestones 3 (journal schema) and 4; F26, F59, F60, F69.
 
 ### SI-39 Journal schemas — Accepted
 
 *Re-evaluated "Decision: No".* Accepted, with the exact schemas in 8.1. Two parts remain open:
-- the init-schema changes of SI-38 and the TPM-identity field of SI-36;
+- the proposed init phases/identity fields of SI-38, the explicit expected-core
+  digests and `rollback_tracking` state of SI-35, and the encrypted
+  TPM-identity-token fields of SI-36;
 - the Revoke and Erase schemas, deferred to the Milestone 8 review.
 
 **Affected:** Milestone 3; F27, F71.
@@ -999,6 +1209,12 @@ None of these can be proven by process-crash tests (now stated in 2 and 8.5).
 **Proposed test:** F89, crash injection at each step of the reordered `add` and `rm`, checking that every leftover is either authenticated and deleted or reported.
 
 **Remaining uncertainty:** the confirmed deletion of unauthenticated files is an owner decision on a listed set. That is acceptable under "no deletion by pattern alone", but it needs the author's agreement.
+
+**Schema impact found by the readiness audit (2026-10-05).** The transition part of this issue cannot wait for Milestone 4 or 6:
+- Abandoned transition artifacts were "authenticated" by nothing. `keytable.<new_gen>.pv` is under the new bundle, which an old-side restart does not have, and the earlier rule deleted it by name.
+- The proposal (spec 8.1, `docs/M3_READINESS.md` D6 audit item 1) journals the identities `target_kt_*`, `header_*`, `track_kt_*` and `track_hdr_*` before any bytes are written, and adds `old_keytable_digest`, so that `keytable.<old_gen>.pv` is deleted only on a content match.
+- These are journal **fields**, so they must be decided before Milestone 3.
+- `add` and `rm` stay schema-free only if ownership remains AEAD-based (object IDs listed in an authenticated key table). Identity handoff for objects would add an `add` journal record.
 
 **Approval needed:** the rules and the reordering.
 
@@ -1145,11 +1361,12 @@ None of these can be proven by process-crash tests (now stated in 2 and 8.5).
 - **Policy ratings** for generated passphrases: Medium for 10–11 words, Strong for 12–16. These are policy ratings, not guarantees. The effect of quantum search (A2) is explained only in documentation.
 - **Derivation:** `master = Argon2id(handled bytes, core.salt, core.argon2_m/t/p)`; subkeys as in 5.1.
 - **Main kind `words`:** the duress passphrase uses the same handling, so **one** Argon2id run serves both the main keys and `duress_key`, as in spec 7.2.
-- **Main kind `custom`, with a duress tag present:** two derivations, always in this fixed order on every unlock:
+- **Main kind `custom`, with a duress tag present:** two derivations in this fixed order on every unlock whose input generated-word handling accepts (see the N3 exception below):
   - (1) `master_main = Argon2id(H_c(input), …)` gives the main keys;
   - (2) `master_duress = Argon2id(H_w(input), …)` gives `duress_key` for the tag check.
 
   The runs are **sequential**. Each run's block buffer is wiped and freed before the next starts, so **peak memory stays one `argon2_m` buffer** (the 4.3 resource check applies to each run). Both runs happen even when H_c and H_w give identical bytes. That alone does **not** establish timing equivalence; the complete paths are measured later (clarification 7).
+- **Exception (decision N3, 2026-10-05):** if generated-word handling refuses the typed input, the duress check is a non-match and run (2) is skipped. The refusal classes are an empty result after trimming, more than 1,024 bytes after NFKC, and, under the proposed `H_w_v1`, a code point unassigned in Unicode 17.0.0. Such input can never equal the generated duress words. The unlock then runs one Argon2id. A timing observer learns only that the typed text is in a refused class; for the correct passphrase, that is a property of the passphrase. The full statement is in spec 5.6.
 - **Verification-only authentication** runs only the main derivation, H_c for a custom main. It skips the duress check and the duress-only run (clarification 4).
 - **Collision rule** (clarification 5): a collision is `H_w(main input) == duress words`, the actual main credential after generated-word processing equal to the generated duress credential. That is exactly when typing the main passphrase would also match the duress tag, because the duress derivation always uses H_w. It is checked at duress setup and whenever either credential changes. The main passphrase is available at those moments, because `duress set` requires an ordinary unlock. (The earlier draft also compared `H_c(main input)`; that comparison is irrelevant to the duress tag and was dropped.)
 
@@ -1165,7 +1382,7 @@ None of these can be proven by process-crash tests (now stated in 2 and 8.5).
 | **Estimator (child process)** | **`custom` only.** On failure, **the new custom credential is refused** (retry, or choose generated) | **Never** | **Never** |
 | Word-list check (input only) | Type-back of `words` | Type-back | Only when the main kind is `words` |
 | Collision rule | When a duress tag exists | Yes | No |
-| Argon2id runs | 1 (new salt) | 1 (`words` main) or 2 (`custom` main) | 1, or **2** for a `custom` main with a duress tag |
+| Argon2id runs | 1 (new salt) | 1 (`words` main) or 2 (`custom` main) | 1, or **2** for a `custom` main with a duress tag (1 if generated-word handling refuses the input; N3) |
 
 Estimator failure never affects access to an existing vault, because the estimator does not run when an existing passphrase is used.
 
@@ -1175,7 +1392,7 @@ Estimator failure never affects access to an existing vault, because the estimat
 | --- | --- | --- | --- |
 | `words` main, with or without duress | 1 | ≈ 2.0 s | 1 GiB |
 | `custom` main, no duress | 1 | ≈ 2.0 s | 1 GiB |
-| `custom` main, with duress | 2 | ≈ 3.9 s | 1 GiB (sequential) |
+| `custom` main, with duress | 2 (1 if generated-word handling refuses the input; N3) | ≈ 3.9 s (≈ 2.0 s for refused input) | 1 GiB (sequential) |
 
 The bound-mode TPM work (salted session, `NV_ReadPublic`, `NV_Read`) is extra and not yet measured (Milestone 5). Key-table decryption runs at about 720 MiB/s. Slower machines scale proportionally.
 
@@ -1387,7 +1604,13 @@ The bound-mode TPM work (salted session, `NV_ReadPublic`, `NV_Read`) is extra an
 
 - **macOS man pages** (local): `fsync(2)`, `fcntl(2)` (`F_FULLFSYNC`), `rename(2)` (crash guarantee, `RENAME_EXCL`, `RENAME_SWAP`, `ENOTSUP`), `flock(2)` (upgrade releases first).
 - **man7.org:** `rename(2)` (observer atomicity, `RENAME_NOREPLACE` support list, `RENAME_EXCHANGE`), `fsync(2)` (disk caches, directory fsync), `flock(2)` (conversion not atomic; NFS and CIFS emulation).
-- **learn.microsoft.com:** `MoveFileExW` (`MOVEFILE_WRITE_THROUGH` semantics), `FlushFileBuffers` (volume flush needs admin), `LockFileEx` (no overlapping exclusive locks).
+- **learn.microsoft.com:** `NtCreateFile` (`RootDirectory`,
+  `FILE_OPEN_REPARSE_POINT`, `FILE_WRITE_THROUGH`),
+  `FILE_RENAME_INFORMATION` (`RootDirectory`-relative destination), CreateFile
+  caching flags (NTFS metadata flush for a write-through rename request),
+  `MoveFileExW` (`MOVEFILE_WRITE_THROUGH` copy/delete semantics),
+  `FlushFileBuffers` (volume flush needs admin), and `LockFileEx` (no
+  overlapping exclusive locks).
 - **doc.rust-lang.org (1.89.0):** `std::fs::rename` (Windows uses `MoveFileExW` or `SetFileInformationByHandle`); `File::lock` (re-locking a held handle is unspecified).
 
 ### 3.5 TPM constants (`tss-esapi` 7.7.0, `tss-esapi-sys` 0.6.0)
@@ -1417,16 +1640,32 @@ The bound-mode TPM work (salted session, `NV_ReadPublic`, `NV_Read`) is extra an
 5c. SI-51 section 7: approve the exact header and journal schema changes (`passphrase_kind` and the init-journal field).
 5d. SI-51 / M2-F4: approve a stable normalization-version policy for custom credentials (10.7). **Blocks the Milestone 3 schema review.**
 6. SI-07: `ciborium` with restrictions and a codec fallback for the key table, or the fixed-schema codec.
-7. SI-12: approve the durability primitive table and the wording of the Windows assumption; confirm the file-system allowlist.
+7. SI-12: W1 and its limitation wording are selected. Approve the remaining
+   durability table and confirm the exact file-system allowlist/detection.
 8. SI-14: approve the lock protocol (gate and mount locks, bounded retries).
-9. SI-35 / SI-38 / SI-40: approve the handle-allocation protocol, safe `init` (including the `.tmp` choice), the leftover-ownership rules and the `add`/`rm` reordering.
-10. SI-36: approve the revised TPM-identity mechanism: a keyed `tpm_id_mac` in the slots and journals, `ek_digest` bound into the duress tag, and the fixed EK template. SI-35 (c): the `pending_tpm_cleanup` core list. Both change formats.
-11. SI-30 / SI-07: confirm the key-table entry layout, the path limits, the decode-time versus input-time check split, and the **case-folding source** (an approved crate, a vendored table, or `to_lowercase`).
+9. SI-35 / SI-38 / SI-40: approve the handle-allocation protocol, explicit
+   old/new/tracking core-digest binding and `slots_mac` recomputation,
+   four-phase identity-owned safe `init`, confirmed-residue block rules, and
+   the live-vault `add`/`rm` reordering.
+10. SI-36: approve the exact five-scope encrypted TPM-identity-token mechanism,
+    fixed H-2 EK template, 32-entry cleanup list and duress integration. The
+    earlier keyed `tpm_id_mac` proposal is superseded because it cannot be
+    rekeyed remotely. P1 is selected separately and needs no further v1 choice.
+11. SI-30 / SI-07: confirm the key-table entry layout, the path limits and the decode-time versus input-time check split (F73 now states the split). The **case-folding source** moves to "Before Milestone 4" if the split is approved.
 11a. SI-07: approve the path classification (confidential, zeroized, not locked) and the proposed 5.8 message "The key table is damaged."
-12. SI-06: confirm the wizard default (Section 16 asks before Milestone 3).
-13. SI-16: confirm the 64 MiB resource margin.
+12. ~~SI-06: confirm the wizard default.~~ Moved to "Before Milestone 14": the desktop wizard is its only user (spec 16 item 3).
+13. SI-16: confirm the 64 MiB resource margin and the per-platform definitions (D8).
+14. Readiness-audit decisions N1 to N5 (10.9):
+    - N1 (decided): W1's risk boundary remains selected; its primitive name is amended to the required handle-relative NT rename. Windows power loss can break a vault, with WO-1 to WO-3 documented as unverified;
+    - N2 (decided): bound creation without a measurable EK identity is refused, and portable mode is offered;
+    - N3 (decided): a refused generated-word candidate is a duress non-match, and its run is skipped;
+    - N4 (decided): the scope-4 redundancy, removed;
+    - N5 (decided): the 65,536-entry vault limit (files and directories); exceeding it leaves the vault unchanged.
+15. Transition artifact identities, `old_keytable_digest` and `tracking_created` (SI-35, SI-38 and SI-40 schema impact), and the revised file-identity encoding.
 
 **Before Milestone 4**
+13a. SI-30: the case-folding source for input-time collision checks (an approved crate, a vendored `CaseFolding.txt` table with a Unicode notice, or `to_lowercase`), provided the decode/input split is approved.
+13b. Windows console interactive validation (M2-F7).
 14. SI-10: approve the card-file lifetime lock and cleaner rules. Should any terminal display of card text exist?
 15. SI-11: approve the `--force` design and its stated guarantees (proposed F90). Windows `--force` stays refused.
 16. SI-47 / SI-19 / SI-41: approve `docs/CLI.md`, including `--secrets-stdin` and the message wording.
@@ -1435,7 +1674,8 @@ The bound-mode TPM work (salted session, `NV_ReadPublic`, `NV_Read`) is extra an
 17. SI-18 / SI-22: approve the TPM pins, the exact public area and the salted-session design, with its trust assumptions.
 18. SI-42: approve capability checks C1 to C3; status-only reporting of unavailable duress.
 19. SI-32: confirm the duress-setup draft (6.10).
-20. SI-06: confirm PCR binding as opt-in.
+20. SI-06 PCR is closed for v1: P1, nonce-policy only. Any PCR binding is a
+    future reviewed format revision, not a Milestone 5 decision.
 
 **Before Milestone 6**
 21. SI-31: confirm the `convert` draft (6.9) and its confirmation phrases.
@@ -1447,6 +1687,9 @@ The bound-mode TPM work (salted session, `NV_ReadPublic`, `NV_Read`) is extra an
 
 **Before Milestone 11**
 25. SI-45: the encrypted-overlay write model, the macOS FUSE-T feasibility spike, and the WinFsp and power-event crates.
+
+**Before Milestone 14**
+25a. SI-06: the wizard default mode.
 
 **Before Milestone 13**
 26. SI-04: approve `cargo-about` for release notices; SI-05: pin the release toolchain.
@@ -1500,7 +1743,7 @@ The bound-mode TPM work (salted session, `NV_ReadPublic`, `NV_Read`) is extra an
 | SI-07 lacked path handling | Path decoding, storage, zeroization and error design added to SI-07. Spec 7.8 marks the decode-time check scope PENDING. Case-folding source flagged as an evidence gap | Pending |
 | Card files had no active-operation lock | Spec 7.4b now marks the lifetime lock and cleaner rules PENDING (SI-10), with the full design in SI-10. F78 extended | Pending |
 | `--force` was incomplete | Spec 7.9 marks `--force` PENDING, refused until approved. The success, rollback, failed-rollback and crash cases, plus the real guarantees and limits, are in SI-11. Proposed test F90 | Pending |
-| The TPM-identity proposal did not cover duress | Spec 9.6 and 9.3 (C4) gain PENDING notes. SI-36 binds `ek_digest` into the duress tag, and adds a keyed `tpm_id_mac` for the normal paths | Pending |
+| The TPM-identity proposal did not cover duress or remote rekeying | Spec 9.6 and 9.3 (C4) retain PENDING notes. SI-36 keeps `ek_digest` in the duress tag and supersedes keyed identity MACs with exact five-scope encrypted tokens that can be rewrapped across remote bundle rotations | Pending |
 | F7 vs the resource messages | F7 now allows the 4.3 / 5.8 policy or resource message for in-cap Argon2 flips. Recovery still fails, and no message depends on a secret | Applied |
 | F25 vs the same-TPM rule | F25 now requires "no index left **untracked**". It is deleted only on its own TPM with identity established, otherwise reported and tracked. Mechanism SI-35 (c) / SI-36 pending | Applied (expectation); mechanism pending |
 | F75 vs public TPM queries | F75 now forbids authorized or DA-affecting TPM commands before the hint, not public queries. Spec 5.7 states which TPM commands may run before Argon2id | Applied |
@@ -1625,6 +1868,135 @@ Custom credentials (H_c) feed Argon2id directly, so their normalization must sta
 
 Recommendation, for review only: (a), possibly with (b) as a recorded field for diagnostics. Nothing is implemented until the author decides.
 
+**Refinement (2026-10-05; `docs/M3_READINESS.md` D2):**
+- Option (a) uses pvault's own, monotonically non-decreasing Unicode tables rather than a frozen table. It applies at creation **and** at every entry, needs no header field, and gives forward stability by Unicode's Strong Normalization Stability. Older releases refuse characters they do not know (fail closed).
+- Generated-word handling becomes a frozen `H_w_v1`: Unicode 17.0.0 `Cn` refusal, NFKC, full default case folding and a fixed `White_Space` set, from vendored tables whose six source SHA-256 values were independently re-verified. This changes the approved Milestone 2 H_w for non-ASCII input.
+- When `H_w_v1` refuses a custom input, the duress check is a non-match and the duress-only run is skipped (decided N3; timing difference documented in spec 5.6).
+
 ### 10.8 Milestone 2 acceptance
 
-Pending the required CI jobs for the Milestone 2 commit. Recorded limitations: M2-F4 (normalization-version policy, a Milestone 3 blocker), M2-F5 (accepted platform limits; Job Object deferred), M2-F7 and 10.6 (Windows console compile-only), M2-F10 (RFC/IETF excerpt licensing, under SI-04), and the SI-51 tests that need unlock or the CLI (10.5).
+**Accepted on 2026-10-04:** commit `a099bb6` ("Implement secret sharing and passphrase handling"), pushed to `main`; CI run 37261091478 green on all nine jobs:
+
+| Job | Tests passed / failed / ignored |
+| --- | --- |
+| clippy + test, ubuntu-latest (stable; tests plus `--benches`) | 189 / 0 / 3 |
+| clippy + test, macos-latest | 187 / 0 / 3 |
+| clippy + test, windows-latest | 170 / 0 / 1 |
+| Rust 1.89 build + test, ubuntu-latest | 114 / 0 / 2 |
+| Rust 1.89 build + test, macos-latest | 113 / 0 / 2 |
+| Rust 1.89 build + test, windows-latest | 103 / 0 / 1 |
+| rustfmt; cargo-deny 0.20.2; swtpm smoke test | passed |
+
+Linux has one extra test (the over-long-line restoration test); Windows has none of the Unix-only pty, signal, reaping and resource-limit tests (10.6). The ignored tests are the two subprocess helpers. Recorded limitations: M2-F4 (normalization-version policy, a Milestone 3 blocker), M2-F5 (accepted platform limits; Job Object deferred), M2-F7 and 10.6 (Windows console compile-only), M2-F10 (RFC/IETF excerpt licensing, under SI-04), and the SI-51 tests that need unlock or the CLI (10.5).
+
+### 10.9 Milestone 3 readiness audit (2026-10-05)
+
+The full report is `docs/M3_READINESS.md`; its appendix B records the checks performed. Selected or decided by the author: **W1**, **P1**, and **N1 to N5** (2026-10-05). Every other item below is a recommendation and remains **PENDING**.
+
+| # | Finding | Proposed handling | Decision |
+| --- | --- | --- | --- |
+| A1 | Transition target, tracking and header temps had no ownership mechanism; `keytable.<old_gen>.pv` was deleted by name | Identity handoff for every journaled artifact (`target_created`, `tracking_created`, identity fields in `committing`/`rollback_tracking`); `old_keytable_digest` | Approve or reject (schema) |
+| A2 | Draft file identity `st_dev || st_ino` changes across reboots or remounts and is open to inode reuse | `st_ino || birth time` on the live directory's `st_dev`; Windows adds `CreationTime` | Approve or reject (schema) |
+| A3 | The remote-rollback commit increments generation by 2, against the glossary | Keep +2; glossary exception recorded | Approve or reject |
+| A4 | The scope-4 old-index token duplicates the staged cleanup entry | **Decided N4:** removed after the restart-path check; scope 4 reserved | Decided |
+| A5 | A required identity token makes C4 a precondition for any bound index | **Decided N2:** refuse before any write; offer portable mode (spec 9.3, F91) | Decided |
+| A6 | D2 cited a nonexistent "approved dummy-derivation timing rule" | Removed. **Decided N3:** a refused candidate is a duress non-match, the run is skipped, and the timing difference is documented (spec 5.6) | Decided |
+| A7 | `H_w_v1` changes the approved, implemented Milestone 2 H_w for non-ASCII input | Stated explicitly; Milestone 3 code and vector change if approved | With D2 |
+| A8 | Windows SMB shares report `NTFS` | Require that `FileRemoteProtocolInfo` fails | Approve or reject |
+| A9 | Post-replacement flush failures could be predictable `ENOTSUP`, against refusal-on-unsupported | Preflight before the first side effect | Approve or reject |
+| A10 | W1 covers header replacement only; the protocols need ordered create/delete durability | **Decided N1 (W1-b):** document the risk and the unverified ordering assumptions WO-1 to WO-3 | Decided |
+| A11 | `objects/` could be on another mount | Same-mount check | Approve or reject |
+| A12 | D8 named `host_page_size`, absent from `libc` 0.2.190; `mach_host_self` is deprecated there | `sysconf(_SC_PAGESIZE)`; scoped allow | With D8 |
+| A13 | The 65,536-entry key-table cap is a product limit | **Decided N5:** approved, counting files and directories; refused before any write (spec 7.8, F92) | Decided |
+| A14 | Requiring `header_file_id` for a committed init header only reduces availability | The identity owns temp residue only | Approve or reject |
+| A15 | Spec 7.6 still listed Shamir as `PENDING SI-08` | Corrected (decided in Milestone 2) | None |
+| A16 | A committing header temp could collide with the tracking header temp | Identity retained into `tracking_created`; identity-checked unlink plus directory flush before reuse; a mismatch blocks (spec 8.1) | Approve or reject |
+| A17 | Transition journal-temp promotion was undefined (only init had rules) | Permitted transitions, MAC rules, preserved fields, invalid-temp residue, crash table (spec 8.2) | Approve or reject |
+| A18 | Stale texts: SI-38 committed-header identity; 6.4 "stay in prepared"; 7.8 unconditional +1; F73 decode/input contradiction | Corrected (2026-10-05) | None (consistency) |
+| A19 | The case-folding and wizard deadlines did not match the milestones that use them | Case folding before M4 (if the split is approved); wizard before M14 | Confirm |
+| A20 | Init bootstrap order was undefined when T, the lock files or `objects/` are missing | Bootstrap creations limited to T and the two lock files; identify P before creating T; lock before the full preflight; `objects/` created by the first `add` (spec 8.3) | Approve or reject |
+| A21 | Windows local-volume detection lacked an exact criterion | Q1–Q4, fail closed, native probe required (spec 8.5) | Approve or reject |
+
+The RFC/IETF test-vector licensing question (SI-04, M1-F5, M2-F10) remains open and does not block Milestone 3.
+
+### 10.10 Milestone 3 approvals (author, 2026-10-05)
+
+The author approved, for Milestone 3, the designs D1–D8 of `docs/M3_READINESS.md`, together with every documented audit correction:
+
+| Item | What is approved |
+| --- | --- |
+| D1 | `CoreFields.passphrase_kind` and the init-journal field |
+| D2 | H_c refuses code points unassigned in pvault's Unicode version, at creation and at every entry. `H_w_v1` is frozen at Unicode 17.0.0 (`Cn` refusal, NFKC, full default case folding, a fixed `White_Space` set) from vendored, hash-pinned tables |
+| D3 | The fixed-schema in-house codec, two-pass key-table decode, exact arenas, the 65,536-entry cap (N5) and the decoded-size charge |
+| D4 | The G + L lock protocol (mount lock and upgrade remain with SI-45) |
+| D5 | Linux mountinfo identification; the macOS and Windows checks, including the Q1–Q4 local-volume criterion; the durability sequences, preflight and failure boundary; W1 and N1 as selected |
+| D6 | The schemas: encrypted TPM-identity tokens (scopes 1, 2, 3 and 5; scope 4 reserved, N4); the 32-entry `tpm_cleanup`; expected-core digests; the init and transition phases with artifact identities and `old_keytable_digest`; `tracking_created` and `rollback_tracking` with the +2 generation; the journal-temp promotion rules; header-temp resolution; the init bootstrap order; bound creation refused without identity (N2) |
+| D7 | The 7.8 entry layout, the 4096/255 limits and the decode/input split (F73 corrected) |
+| D8 | The memory-resource definitions (macOS: `sysconf(_SC_PAGESIZE)` × (free + inactive)) and the 64 MiB margin |
+
+- The revised deadlines are approved: case folding before Milestone 4, and the wizard default before Milestone 14.
+- W1, P1 and N1–N5 are unchanged.
+- Still pending: SI-04 release notices and the RFC/IETF excerpt question, SI-10, SI-11, SI-14 mount and upgrade, SI-18, SI-22, SI-29, SI-35 handle allocation and overflow, SI-40 live-vault rules, SI-42, SI-44, SI-45, and the N3 creation notice.
+
+
+### 10.11 Milestone 3: implementation findings (2026-10-05)
+
+Milestone 3 is implemented locally under the 10.10 approvals. Native CI has
+not run: it needs an authorized push. No approved format was changed, and
+implementation exposed **no missing schema rule**. The findings are:
+
+| # | Finding | Handling | Needs the author? |
+| --- | --- | --- | --- |
+| M3-F1 | Spec 4.1's `CoreFields` listing omitted the approved D1 field `passphrase_kind`, which 5.1, 7.3, D1 and the init-journal schema already require | Added to the 4.1 listing (documentation consistency; the field, type and values are as approved) | No |
+| M3-F2 | Windows child operations must remain relative to the already-held directory and must never follow a substituted reparse point | Replaced the path-based draft with platform-isolated `NtCreateFile` (`RootDirectory`, one validated component, `FILE_OPEN_REPARSE_POINT`) and verified-handle `NtSetInformationFile` rename/delete. Added directory-replacement and child reparse-substitution tests. SAFETY comments cover every pointer, buffer, output structure and owned handle. Native Windows execution remains required | No; directed correction applied |
+| M3-F3 | The decode-time reserved-name check sliced a `str` at byte 3, which panics for a four-byte component ending inside a multi-byte character (for example `abé`). An authenticated key table with such a path would have crashed decoding | Fixed (byte comparison); regression test and a fuzz seed with such paths added | No |
+| M3-F4 | Restart rule gap, not a schema gap: in `rollback_tracking` with the header still old, the tracking header temp may be **absent**. No single cause can be inferred safely | The state is `Indeterminate`: retain the journal, delete nothing, create no replacement temp, and use the approved fsck message. A new file would have an identity this authenticated phase cannot journal | No; author directed this handling |
+| M3-F5 | Windows lock files and artifacts inherit the directory's ACL; pvault sets no owner-only ACL itself yet. Unix uses mode `0600`/`0700` | The owner-only ACL on the vault directory belongs to `init` (Milestone 4, 8.3 step 2) | No (Milestone 4) |
+| M3-F6 | Three new user-facing failure classes needed exact wording | Applied the approved strings: replacement outcome unknown; generation changed before replacement; and indeterminate state/no cleanup. Missing tracking-header temp uses the indeterminate string, not a fourth message | No; author supplied wording |
+| M3-F7 | The `fuzz/` crate adds exactly pinned `libfuzzer-sys` 0.4.13 (fuzz-only, excluded from the workspace, own `Cargo.lock`). Its manifest says `(MIT OR Apache-2.0) AND NCSA`, while all 55 bundled LLVM source files carry `Apache-2.0 WITH LLVM-exception` headers | Recorded crates.io checksum `a9fd…929d2`, upstream git `719e4e…ed0f`, wrapper and bundled-source license evidence, and the direct `arbitrary`/build-only `cc` graph. `fuzz/deny.toml` grants a version-scoped exception only to `libfuzzer-sys@0.4.13`; CI and local checks cover the fuzz lockfile's advisories, bans, licenses and sources. Product `Cargo.lock` is unchanged | No; 0.4.13 fuzz-only use approved |
+
+**Scope of the executor.** `store.rs` executes the remote-rollback tracking
+commit and the old-side and new-side transition restarts on real files.
+Deciding between local and remote rollback, resolving a TPM index, and the
+forward recovery and `convert` paths are Milestones 5 and 6; the crash tests
+drive the forward path with a test harness. `init` (Milestone 4) will use the
+same primitives.
+
+**Verification status.**
+- **Current macOS host:** stable `cargo test --workspace --locked` has 181
+  distinct passing executions, 0 failures and 5 ignored helpers. This includes
+  142 passing library tests (4 ignored), 33 passing integration/CLI tests (1
+  ignored), and 6 passing documentation tests. Rust 1.89 gives the same
+  181/0/5 result. `cargo test --workspace --benches --locked` repeats the 142
+  library tests (4 ignored) and runs 8 Criterion functions; those repetitions
+  and functions are not additional distinct tests. The focused filesystem
+  slice is 8/0/0; journal plus store is 22/0/1.
+- **Static and policy checks:** host fmt and workspace/all-target clippy pass;
+  Windows and Linux library cross-clippy pass. Release fault injection is
+  refused and no failpoint name occurs in release artifacts. `cargo-deny`
+  reports product 177 and fuzz 101 license notes, with zero advisory, license
+  or source findings (one allowed duplicate-`syn` warning in each lockfile).
+  All four fuzz targets build with the pinned nightly and completed a local
+  five-second smoke run without a finding.
+- **Crash and restart:** 48 child-process crash runs (16 crash points × 3
+  starting phases). After every restart, the header is exactly the
+  reconstructed tracking core. In the 15 runs where `rollback_tracking` was
+  durable, it equals `tracking_core_digest`. A tracking key table re-encrypted
+  in place (same file identity, fresh nonces) blocks as indeterminate.
+- **Promotions:** every permitted journal-temp promotion and duplicate/residue
+  case is tested on real files, on the old side and the new side (the WO-1
+  case).
+- **Windows locality probe:** written and type-checked; it runs only in
+  native CI (`windows_native_locality_probe`, and the mapping probe with
+  `--include-ignored`). Unexpected answers refuse; no detection is relaxed.
+  Local NTFS, a loopback UNC path, `subst` and a loopback-mapped SMB drive are
+  covered. A mounted VHD, a ReFS dev drive and a real remote SMB server remain
+  outstanding (8.5 probe list); until then the criterion fails closed.
+- **Process crashes only:** power-loss safety is not tested (8.5 "Testing").
+- **Native Windows remains an acceptance gate:** the Windows test binaries did
+  not run on this macOS host. Cross-checking their dev-test graph also stops at
+  the expected missing MSVC C headers for Criterion's `alloca`; native CI has
+  the required toolchain. The NTFS directory-replacement and reparse-point
+  branches, Q1–Q4 locality/mapping probes, and runtime rename/delete semantics
+  remain unverified until that CI runs. ReFS, mounted VHD and real remote SMB
+  coverage remain separate manual gaps; no test claims power-loss safety.

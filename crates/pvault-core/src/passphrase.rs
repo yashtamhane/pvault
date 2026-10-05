@@ -25,6 +25,7 @@ use crate::crypto::random;
 use crate::errors::Error;
 use crate::normalize::{Form, normalize};
 use crate::secrets::SecretBuf;
+use crate::ucd17;
 
 /// Largest raw input accepted, in bytes, before any processing.
 pub const MAX_RAW_BYTES: usize = 1024;
@@ -184,15 +185,25 @@ pub(crate) fn generate_with(
     Ok(out)
 }
 
-/// Generated-word handling, `H_w` (spec 7.3): NFKC, trim, collapse every
-/// whitespace run to one U+0020, then lowercase each character (full
-/// Unicode mapping, applied per character).
+/// Generated-word handling, `H_w_v1` (spec 7.3; D2), frozen at Unicode
+/// 17.0.0 so that it gives the same bytes in every release:
+/// 1. refuse a code point unassigned in Unicode 17.0.0 (private use is
+///    allowed), checked on the raw scalars;
+/// 2. NFKC;
+/// 3. full default case folding (`CaseFolding.txt` statuses C and F);
+/// 4. trim, and map every run of the frozen `White_Space` set to one U+0020.
+///
+/// The output is at most [`MAX_WORDS_BYTES`] and never empty.
 pub fn handle_words(raw: &[u8]) -> Result<SecretBuf, PassphraseError> {
     let text = checked_text(raw)?;
+    if text.is_empty() {
+        return Err(PassphraseError::Empty);
+    }
+    check_assigned(text, ucd17::is_assigned)?;
     let too_long = PassphraseError::TooLong {
         limit: MAX_WORDS_BYTES,
     };
-    let normalized = normalize(text, Form::Nfkc).ok_or(too_long)?;
+    let normalized = normalize(text, Form::NfkcV1).ok_or(too_long)?;
     let len = words_pipeline(normalized.chars())
         .map(char::len_utf8)
         .sum::<usize>();
@@ -210,26 +221,71 @@ pub fn handle_words(raw: &[u8]) -> Result<SecretBuf, PassphraseError> {
 fn words_pipeline(mut chars: impl Iterator<Item = char>) -> impl Iterator<Item = char> {
     let mut started = false;
     let mut pending_space = false;
-    let mut lower: Option<core::char::ToLowercase> = None;
+    // Case folding emits at most three characters per input character.
+    let mut folded = ['\0'; 3];
+    let mut folded_len = 0;
+    let mut folded_pos = 0;
     core::iter::from_fn(move || {
         loop {
-            if let Some(c) = lower.as_mut().and_then(Iterator::next) {
+            if folded_pos < folded_len {
+                let c = folded[folded_pos];
+                folded[folded_pos] = '\0';
+                folded_pos += 1;
+                if ucd17::is_white_space(c) {
+                    pending_space |= started;
+                    continue;
+                }
+                started = true;
+                if pending_space {
+                    pending_space = false;
+                    // Re-deliver `c` after the single space.
+                    folded_pos -= 1;
+                    folded[folded_pos] = c;
+                    return Some(' ');
+                }
                 return Some(c);
             }
-            lower = None;
             let c = chars.next()?;
-            if c.is_whitespace() {
-                pending_space |= started;
-                continue;
-            }
-            started = true;
-            lower = Some(c.to_lowercase());
-            if pending_space {
-                pending_space = false;
-                return Some(' ');
-            }
+            folded_len = 0;
+            folded_pos = 0;
+            ucd17::case_fold(c, &mut |d| {
+                if folded_len < folded.len() {
+                    folded[folded_len] = d;
+                    folded_len += 1;
+                }
+            });
         }
     })
+}
+
+/// Refuses the first code point that `is_assigned` rejects, counted on the
+/// raw input (character numbers start at 1). Noncharacters are left to the
+/// noncharacter rule, which names them precisely.
+fn check_assigned(text: &str, is_assigned: impl Fn(char) -> bool) -> Result<(), PassphraseError> {
+    for (n, c) in text.chars().enumerate() {
+        if !is_assigned(c) && !is_noncharacter(c) {
+            return Err(PassphraseError::Refused {
+                position: n + 1,
+                class: RefusedClass::Unassigned,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn is_noncharacter(c: char) -> bool {
+    let cp = u32::from(c);
+    (0xFDD0..=0xFDEF).contains(&cp) || cp & 0xFFFE == 0xFFFE
+}
+
+/// H_c's assigned test: the pinned crate's tables (its Unicode version may
+/// only increase), plus the private-use ranges, which are assigned forever.
+fn assigned_for_custom(c: char) -> bool {
+    let cp = u32::from(c);
+    unicode_normalization::char::is_public_assigned(c)
+        || (0xE000..=0xF8FF).contains(&cp)
+        || (0xF0000..=0xFFFFD).contains(&cp)
+        || (0x100000..=0x10FFFD).contains(&cp)
 }
 
 /// Checks every word of a [`handle_words`] result against the word list.
@@ -316,6 +372,10 @@ impl fmt::Display for CustomWarning {
 /// than altered.
 pub fn handle_custom(raw: &[u8]) -> Result<CustomPassphrase, PassphraseError> {
     let text = checked_text(raw)?;
+    // D2: a code point unassigned in pvault's Unicode version is refused, at
+    // creation and at every entry, so that NFC stays identical in every later
+    // release (Unicode Strong Normalization Stability).
+    check_assigned(text, assigned_for_custom)?;
     let normalized = normalize(text, Form::Nfc).ok_or(PassphraseError::TooLong {
         limit: MAX_CUSTOM_BYTES,
     })?;
@@ -391,6 +451,9 @@ pub enum RefusedClass {
     ByteOrderMark,
     /// Unicode noncharacters.
     Noncharacter,
+    /// A code point that is unassigned in this pvault's Unicode version
+    /// (custom), or in Unicode 17.0.0 (generated words).
+    Unassigned,
 }
 
 fn refused_class(c: char) -> Option<RefusedClass> {
@@ -484,6 +547,12 @@ impl fmt::Display for PassphraseError {
                     RefusedClass::Bidirectional => "a bidirectional text control",
                     RefusedClass::ByteOrderMark => "a byte-order mark",
                     RefusedClass::Noncharacter => "a Unicode noncharacter",
+                    RefusedClass::Unassigned => {
+                        return write!(
+                            f,
+                            "Character {position} is not supported by this version of pvault."
+                        );
+                    }
                 };
                 write!(
                     f,
@@ -603,15 +672,25 @@ mod tests {
                     );
                     assert_eq!(at.to_string(), field(&v, "bytes_used"));
                 }
-                "words" => {
-                    let out = handle_words(&hex_field(&v, "input")).unwrap();
-                    assert_eq!(
-                        out.expose_secret(),
-                        hex_field(&v, "output").as_slice(),
-                        "{}",
-                        field(&v, "name")
-                    );
-                }
+                "words" => match field(&v, "result") {
+                    "ok" => {
+                        let out = handle_words(&hex_field(&v, "input")).unwrap();
+                        assert_eq!(
+                            out.expose_secret(),
+                            hex_field(&v, "output").as_slice(),
+                            "{}",
+                            field(&v, "name")
+                        );
+                    }
+                    class => {
+                        let err = handle_words(&hex_field(&v, "input")).unwrap_err();
+                        let got = match err {
+                            PassphraseError::Refused { class, .. } => format!("{class:?}"),
+                            other => format!("{other:?}"),
+                        };
+                        assert_eq!(got, class, "{}", field(&v, "name"));
+                    }
+                },
                 "custom" => {
                     let input = hex_field(&v, "input");
                     match field(&v, "result") {

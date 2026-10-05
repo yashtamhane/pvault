@@ -52,6 +52,12 @@ jobs:
       - run: cargo test --workspace --locked
       # Runs every Criterion benchmark once, as a smoke test.
       - run: cargo test --workspace --benches --locked
+      # Native Windows locality probe (spec 8.5): prints the raw Q1-Q4
+      # answers for the local temp directory, a loopback UNC path, a `subst`
+      # drive and a mapped SMB drive. Every non-local answer must refuse.
+      - name: Windows locality probe
+        if: runner.os == 'Windows'
+        run: cargo test -p pvault-core --lib --locked windows_native_locality_probe -- --include-ignored --nocapture --test-threads=1
 
   # Minimum supported Rust version (spec Section 12, SI-05). Must pass on all
   # three operating systems before a milestone is accepted.
@@ -72,6 +78,80 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo build --workspace --all-targets --locked
       - run: cargo test --workspace --locked
+
+  # F85: a release build that requests the test-only `fault-injection`
+  # feature is refused, and no failpoint name reaches a release artifact.
+  release-checks:
+    name: release build checks (F85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Release build with fault-injection is refused
+        run: |
+          if cargo build --release --locked -p pvault-core --features fault-injection; then
+            echo "release build with fault-injection succeeded" >&2
+            exit 1
+          fi
+      - name: No failpoint names in release artifacts
+        run: |
+          cargo build --release --locked --workspace
+          names=$(grep -rhoE --exclude=failpoints.rs 'failpoint!\("[^"]+"|fail_io!\("[^"]+"' crates/pvault-core/src | sed -E 's/.*\("//; s/"$//' | sort -u)
+          test -n "$names"
+          for f in target/release/pvault target/release/libpvault_core.rlib; do
+            for n in PVAULT_FAILPOINT $names; do
+              if grep -aqF "$n" "$f"; then
+                echo "$n found in $f" >&2
+                exit 1
+              fi
+            done
+          done
+
+  # The frozen Unicode 17.0.0 tables (spec 7.3, D2) regenerate byte for byte
+  # from the pinned UCD archive.
+  unicode-tables:
+    name: Unicode table regeneration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Regenerate and compare
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSfL https://www.unicode.org/Public/17.0.0/ucd/UCD.zip -o "$RUNNER_TEMP/UCD.zip"
+          python3 tools/unicode/gen_ucd17.py --ucd-zip "$RUNNER_TEMP/UCD.zip" --out-root .
+          git diff --exit-code
+
+  # Fuzz smoke test (spec 12): every target for 60 s from generated seeds,
+  # with a pinned nightly and cargo-fuzz. Deep fuzzing is Milestone 7.
+  fuzz-smoke:
+    name: fuzz smoke
+    runs-on: ubuntu-latest
+    env:
+      NIGHTLY: nightly-2026-10-01
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: nightly-2026-10-01
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Seeds
+        run: PVAULT_FUZZ_SEEDS="$PWD/fuzz/corpus" cargo test -p pvault-core --lib --locked fuzz_seeds -- --ignored
+      - name: Fuzz each target
+        run: |
+          for t in header_parse journal_parse keytable_parse stream_parse; do
+            cargo +"$NIGHTLY" fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=2048
+          done
 
   # Advisories, bans, sources and dependency licenses (deny.toml), over the
   # full graph: production, test, benchmark and build dependencies, all
@@ -100,7 +180,12 @@ jobs:
           tar -xzf "${archive}" --strip-components=1 -C "${RUNNER_TEMP}"
           "${RUNNER_TEMP}/cargo-deny" --version
       - name: cargo deny check
-        run: '"${RUNNER_TEMP}/cargo-deny" --locked check --show-stats'
+        run: |
+          "${RUNNER_TEMP}/cargo-deny" --locked check --show-stats
+          "${RUNNER_TEMP}/cargo-deny" \
+            --manifest-path fuzz/Cargo.toml \
+            --config fuzz/deny.toml \
+            --locked check --show-stats
 
   # TPM emulator for bound-mode development (spec Section 9.1). Until
   # Milestone 5 this only proves the emulator starts and answers commands.

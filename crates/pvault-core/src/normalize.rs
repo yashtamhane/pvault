@@ -8,13 +8,19 @@
 //! and primary composition), which do not allocate. The only working storage
 //! is one fixed-capacity buffer, allocated once and wiped when dropped.
 //!
-//! The results are tested to be identical to the crate's `nfc()` and
-//! `nfkc()` iterators.
+//! Two data sources are used (spec 7.3; `docs/M3_READINESS.md` D2):
+//! - [`Form::Nfc`] (custom passphrases, H_c) uses the pinned
+//!   `unicode-normalization` crate, whose Unicode version only increases;
+//! - [`Form::NfkcV1`] (generated words, `H_w_v1`) uses the frozen Unicode
+//!   17.0.0 tables of [`crate::ucd17`], so it never changes between releases.
+//!
+//! The results are tested against the crate's `nfc()` and `nfkc()` iterators
+//! and against the Unicode 17.0.0 conformance file.
 
-use unicode_normalization::char::{
-    canonical_combining_class, compose, decompose_canonical, decompose_compatible,
-};
+use unicode_normalization::char as crate_char;
 use zeroize::Zeroizing;
+
+use crate::ucd17;
 
 use crate::passphrase::MAX_RAW_BYTES;
 
@@ -27,10 +33,27 @@ const CAPACITY: usize = 6 * MAX_RAW_BYTES;
 /// Normalization form.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Form {
-    /// Canonical composition.
+    /// Canonical composition, with the crate's tables (H_c).
     Nfc,
-    /// Compatibility decomposition, then canonical composition.
-    Nfkc,
+    /// Compatibility decomposition, then canonical composition, with the
+    /// frozen Unicode 17.0.0 tables (`H_w_v1`).
+    NfkcV1,
+}
+
+impl Form {
+    fn ccc(self, c: char) -> u8 {
+        match self {
+            Self::Nfc => crate_char::canonical_combining_class(c),
+            Self::NfkcV1 => ucd17::ccc(c),
+        }
+    }
+
+    fn compose(self, a: char, b: char) -> Option<char> {
+        match self {
+            Self::Nfc => crate_char::compose(a, b),
+            Self::NfkcV1 => ucd17::compose(a, b),
+        }
+    }
 }
 
 /// Normalized text, held in a buffer that is wiped on drop.
@@ -66,8 +89,8 @@ pub(crate) fn normalize(text: &str, form: Form) -> Option<Normalized> {
         };
         for c in text.chars() {
             match form {
-                Form::Nfc => decompose_canonical(c, &mut emit),
-                Form::Nfkc => decompose_compatible(c, &mut emit),
+                Form::Nfc => crate_char::decompose_canonical(c, &mut emit),
+                Form::NfkcV1 => ucd17::decompose_compatible(c, &mut emit),
             }
         }
     }
@@ -78,13 +101,13 @@ pub(crate) fn normalize(text: &str, form: Form) -> Option<Normalized> {
     // 2. Canonical ordering: a stable sort, by combining class, of every run
     //    of non-starters. Insertion sort works in place.
     for i in 1..len {
-        let ccc = canonical_combining_class(buf[i]);
+        let ccc = form.ccc(buf[i]);
         if ccc == 0 {
             continue;
         }
         let mut j = i;
         while j > 0 {
-            let before = canonical_combining_class(buf[j - 1]);
+            let before = form.ccc(buf[j - 1]);
             if before == 0 || before <= ccc {
                 break;
             }
@@ -102,10 +125,10 @@ pub(crate) fn normalize(text: &str, form: Form) -> Option<Normalized> {
     let mut last_ccc: Option<u8> = None;
     for i in 0..len {
         let c = buf[i];
-        let ccc = canonical_combining_class(c);
+        let ccc = form.ccc(c);
         if let Some(s) = starter {
             let blocked = last_ccc.is_some_and(|last| last >= ccc);
-            if !blocked && let Some(composite) = compose(buf[s], c) {
+            if !blocked && let Some(composite) = form.compose(buf[s], c) {
                 buf[s] = composite;
                 continue;
             }
@@ -141,7 +164,7 @@ mod tests {
             "NFC {text:?}"
         );
         assert_eq!(
-            ours(text, Form::Nfkc),
+            ours(text, Form::NfkcV1),
             text.nfkc().collect::<String>(),
             "NFKC {text:?}"
         );
@@ -170,14 +193,45 @@ mod tests {
         }
     }
 
+    /// Unicode 17.0.0 `NormalizationTest.txt` (Unicode License V3): for every
+    /// line, `c4 == NFKC(c1) == NFKC(c2) == NFKC(c3) == NFKC(c4) == NFKC(c5)`,
+    /// and for NFC `c2 == NFC(c1) == NFC(c2) == NFC(c3)`. The `H_w_v1` tables
+    /// must pass the NFKC part exactly; the crate-backed NFC is checked too.
+    #[test]
+    fn unicode_17_conformance_file() {
+        let text = include_str!("../testdata/unicode/NormalizationTest-17.0.0.txt");
+        let parse = |field: &str| -> String {
+            field
+                .split(' ')
+                .map(|h| char::from_u32(u32::from_str_radix(h, 16).unwrap()).unwrap())
+                .collect()
+        };
+        let mut lines = 0;
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap().trim();
+            if line.is_empty() || line.starts_with('@') {
+                continue;
+            }
+            let cols: Vec<String> = line.split(';').take(5).map(parse).collect();
+            for col in &cols {
+                assert_eq!(ours(col, Form::NfkcV1), cols[3], "NFKC {line}");
+            }
+            for col in &cols[..3] {
+                assert_eq!(ours(col, Form::Nfc), cols[1], "NFC {line}");
+            }
+            lines += 1;
+        }
+        assert!(lines > 19_000, "{lines}");
+    }
+
     #[test]
     fn largest_input_fits() {
         let text = "\u{fdfa}".repeat(MAX_RAW_BYTES / 3);
-        let count = normalize(&text, Form::Nfkc).unwrap().chars().count();
+        let count = normalize(&text, Form::NfkcV1).unwrap().chars().count();
         assert_eq!(count, 18 * (MAX_RAW_BYTES / 3));
         assert!(count <= CAPACITY);
         let too_much = "\u{fdfa}".repeat(MAX_RAW_BYTES / 3 + 1);
-        assert!(normalize(&too_much, Form::Nfkc).is_none());
+        assert!(normalize(&too_much, Form::NfkcV1).is_none());
     }
 
     fn interesting_char() -> impl Strategy<Value = char> {
@@ -216,7 +270,7 @@ mod tests {
         ) {
             let text: String = chars.into_iter().collect();
             prop_assert_eq!(ours(&text, Form::Nfc), text.nfc().collect::<String>());
-            prop_assert_eq!(ours(&text, Form::Nfkc), text.nfkc().collect::<String>());
+            prop_assert_eq!(ours(&text, Form::NfkcV1), text.nfkc().collect::<String>());
         }
     }
 }
