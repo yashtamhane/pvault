@@ -1,6 +1,7 @@
 //! `pvault` command-line interface.
 
 use clap::Parser;
+use pvault_core::estimator;
 use pvault_core::platform::disable_core_dumps;
 
 /// Offline encrypted file vault.
@@ -9,6 +10,15 @@ use pvault_core::platform::disable_core_dumps;
 struct Cli {}
 
 fn main() {
+    // The custom-passphrase estimator child (SI-51). It hardens itself and
+    // never reaches the argument parser.
+    let mut args = std::env::args_os().skip(1);
+    if let (Some(first), None) = (args.next(), args.next())
+        && first == estimator::CHILD_ARG
+    {
+        std::process::exit(estimator::run_child());
+    }
+
     // Before anything else, so no later crash can write secrets to disk
     // (spec Section 10.3).
     if let Err(err) = disable_core_dumps() {

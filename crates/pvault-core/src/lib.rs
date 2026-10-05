@@ -4,8 +4,13 @@
 
 pub mod crypto;
 pub mod errors;
+pub mod estimator;
+pub mod input;
+mod normalize;
+pub mod passphrase;
 pub mod platform;
 pub mod secrets;
+pub mod shamir;
 
 #[cfg(test)]
 mod testvec;

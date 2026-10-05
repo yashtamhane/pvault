@@ -4,8 +4,11 @@
 This script never runs pvault code. It computes pvault-specific vectors with
 independent implementations (OpenSSL through `cryptography`, libsodium through
 `PyNaCl`, and the Argon2 reference implementation through `argon2-cffi`), and
-converts published vectors (Wycheproof, RFC 4231, RFC 9106) into a simple
-line-based format that the Rust tests read.
+converts published vectors (Wycheproof, RFC 4231, RFC 9106 and
+draft-irtf-cfrg-xchacha-03) into a simple line-based format that the Rust tests
+read. Shamir, wrap and passphrase vectors are computed here in plain Python,
+with algorithms written independently of the Rust code (for example GF(2^8)
+log/antilog tables rather than shift-and-add multiplication).
 
 Usage (development only, inside an isolated virtual environment):
 
@@ -16,8 +19,9 @@ Usage (development only, inside an isolated virtual environment):
 
 DIR for --wycheproof holds the four Wycheproof files listed in WYCHEPROOF_FILES,
 taken from commit WYCHEPROOF_COMMIT. DIR for --rfc holds rfc4231.txt and
-rfc9106.txt from rfc-editor.org. Every input is checked against a pinned SHA-256
-before use.
+rfc9106.txt from rfc-editor.org, and draft-irtf-cfrg-xchacha-03.txt from the
+IETF datatracker. The EFF wordlist is read from assets/ in this repository.
+Every input is checked against a pinned SHA-256 before use.
 """
 
 import argparse
@@ -28,6 +32,7 @@ import platform
 import re
 import struct
 import sys
+import unicodedata
 from importlib import metadata
 from pathlib import Path
 
@@ -35,6 +40,7 @@ import argon2.low_level as argon2_ll
 import nacl.bindings as sodium
 from cryptography.hazmat.backends.openssl import backend as openssl_backend
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers import Cipher, algorithms
 from cryptography.hazmat.primitives.ciphers.aead import AESGCMSIV
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
@@ -49,7 +55,10 @@ WYCHEPROOF_FILES = {
 RFC_FILES = {
     "rfc4231.txt": "72178527ce93500e730bc8eb182b857e583096d652b64ece0879c52ba1df973b",
     "rfc9106.txt": "855c06f060379e34285e83a217e9069b5c72e161a1e54df9af5cd88dbb231f31",
+    "draft-irtf-cfrg-xchacha-03.txt": "fa796b50265eeee383d40e82fed880267c7835e1b3d64c50c4f06162adaa1cfd",
 }
+WORDLIST = Path(__file__).resolve().parents[2] / "assets" / "eff_large_wordlist.txt"
+WORDLIST_SHA256 = "addd35536511597a02fa0a9ff1e5284677b8883b83e986e43f15a3db996b903e"
 PINNED_WYCHEPROOF_SHA256 = {
     # Filled from the files at WYCHEPROOF_COMMIT; checked on every run.
     "hkdf_sha512_test.json": "bb9a21f4e86041caf5d7792b030349f8ff289087f195b2fbc0fc0afc39deca6f",
@@ -313,6 +322,301 @@ def stream_vector(name, kind, stream_id, context, plain_size, key_aes, key_chach
     return record
 
 
+# ---------------------------------------------------------------------------
+# Shamir over GF(2^8), polynomial 0x11B (spec 7.4)
+# ---------------------------------------------------------------------------
+
+# Log and antilog tables with generator 0x03. The Rust tests use a different
+# algorithm (shift-and-add), and vsss-rs uses a third (branch-free).
+GF_EXP = [0] * 512
+GF_LOG = [0] * 256
+
+
+def _gf_tables():
+    x = 1
+    for i in range(255):
+        GF_EXP[i] = x
+        GF_LOG[x] = i
+        # x * 3 = x * 2 + x, with x * 2 reduced by 0x11B
+        doubled = (x << 1) ^ (0x11B if x & 0x80 else 0)
+        x = doubled ^ x
+    if x != 1 or len(set(GF_EXP[:255])) != 255:
+        sys.exit("0x03 is not a generator of GF(2^8)*")
+    for i in range(255, 512):
+        GF_EXP[i] = GF_EXP[i - 255]
+
+
+_gf_tables()
+
+
+def gf_mul(a, b):
+    if a == 0 or b == 0:
+        return 0
+    return GF_EXP[GF_LOG[a] + GF_LOG[b]]
+
+
+def gf_inv(a):
+    return 0 if a == 0 else GF_EXP[255 - GF_LOG[a]]
+
+
+def gf_record():
+    table = bytes(gf_mul(a, b) for a in range(256) for b in range(256))
+    inverses = bytes(gf_inv(a) for a in range(256))
+    for a in range(1, 256):
+        assert gf_mul(a, inverses[a]) == 1
+    return [
+        ("mul_table_sha256", hashlib.sha256(table).hexdigest()),
+        ("inverses", inverses.hex()),
+    ]
+
+
+def shamir_record(name, secret, coefficients):
+    assert len(secret) == len(coefficients) == 96
+    record = [("name", name), ("secret", secret.hex()), ("coefficients", coefficients.hex())]
+    shares = {}
+    for x in (1, 2, 3):
+        shares[x] = bytes(s ^ gf_mul(a, x) for s, a in zip(secret, coefficients))
+        record.append((f"share_x{x}", shares[x].hex()))
+    # Independent check: Lagrange interpolation at 0 from every pair.
+    for i, j in ((1, 2), (1, 3), (2, 3)):
+        li = gf_mul(j, gf_inv(i ^ j))
+        lj = gf_mul(i, gf_inv(i ^ j))
+        back = bytes(gf_mul(yi, li) ^ gf_mul(yj, lj) for yi, yj in zip(shares[i], shares[j]))
+        assert back == secret, (name, i, j)
+    return record
+
+
+def stream_bytes(label, n):
+    out = b""
+    counter = 0
+    while len(out) < n:
+        out += hashlib.sha256(label + struct.pack(">I", counter)).digest()
+        counter += 1
+    return out[:n]
+
+
+# ---------------------------------------------------------------------------
+# XChaCha20 (draft-irtf-cfrg-xchacha-03) and wraps (spec 7.5)
+# ---------------------------------------------------------------------------
+
+
+def _rotl(v, c):
+    return ((v << c) & 0xFFFFFFFF) | (v >> (32 - c))
+
+
+def _quarter(s, a, b, c, d):
+    s[a] = (s[a] + s[b]) & 0xFFFFFFFF
+    s[d] = _rotl(s[d] ^ s[a], 16)
+    s[c] = (s[c] + s[d]) & 0xFFFFFFFF
+    s[b] = _rotl(s[b] ^ s[c], 12)
+    s[a] = (s[a] + s[b]) & 0xFFFFFFFF
+    s[d] = _rotl(s[d] ^ s[a], 8)
+    s[c] = (s[c] + s[d]) & 0xFFFFFFFF
+    s[b] = _rotl(s[b] ^ s[c], 7)
+
+
+def hchacha20(key, nonce16):
+    """HChaCha20 (draft section 2.2), written from the draft text."""
+    state = list(struct.unpack("<4I", b"expand 32-byte k"))
+    state += list(struct.unpack("<8I", key)) + list(struct.unpack("<4I", nonce16))
+    for _ in range(10):
+        _quarter(state, 0, 4, 8, 12)
+        _quarter(state, 1, 5, 9, 13)
+        _quarter(state, 2, 6, 10, 14)
+        _quarter(state, 3, 7, 11, 15)
+        _quarter(state, 0, 5, 10, 15)
+        _quarter(state, 1, 6, 11, 12)
+        _quarter(state, 2, 7, 8, 13)
+        _quarter(state, 3, 4, 9, 14)
+    return struct.pack("<8I", *(state[0:4] + state[12:16]))
+
+
+def xchacha20_xor(key, nonce24, data, counter=0):
+    """XChaCha20 (draft section 2.3): HChaCha20 subkey, then OpenSSL ChaCha20
+    with nonce 0x00000000 || nonce24[16:24] starting at block `counter`."""
+    subkey = hchacha20(key, nonce24[:16])
+    full_nonce = struct.pack("<I", counter) + b"\0\0\0\0" + nonce24[16:]
+    encryptor = Cipher(algorithms.ChaCha20(subkey, full_nonce), mode=None).encryptor()
+    return encryptor.update(data) + encryptor.finalize()
+
+
+def check_hchacha20_against_draft():
+    key = bytes(range(32))
+    nonce = bytes.fromhex("000000090000004a0000000031415927")
+    expected = bytes.fromhex(
+        "82413b4227b27bfed30e42508a877d73a0f9e4d58a74a853c12ec41326d3ecdc"
+    )
+    assert hchacha20(key, nonce) == expected, "HChaCha20 section 2.2.1"
+
+
+def check_xchacha20_against_libsodium(key, nonce, data):
+    """libsodium's XChaCha20-Poly1305 encrypts the payload with the keystream
+    from block 1. Its body must equal our construction at counter 1."""
+    sealed = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(data, b"", nonce, key)
+    assert sealed[: len(data)] == xchacha20_xor(key, nonce, data, counter=1)
+
+
+def _hex_block(lines, start):
+    out = []
+    i = start
+    while i < len(lines) and not lines[i].strip():
+        i += 1
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line:
+            # A page break may split a block; skip page furniture.
+            j = i
+            while j < len(lines) and (
+                not lines[j].strip()
+                or lines[j].startswith("Arciszewski")
+                or lines[j].startswith("Internet-Draft")
+            ):
+                j += 1
+            if j < len(lines) and re.fullmatch(r"[0-9a-f]+", lines[j].strip()):
+                i = j
+                continue
+            break
+        if not re.fullmatch(r"[0-9a-f]+", line):
+            break
+        out.append(line)
+        i += 1
+    return bytes.fromhex("".join(out))
+
+
+def parse_xchacha_draft(text):
+    heading = "\nA.3.2.1.  Block Counter = 0\n"
+    if text.count(heading) != 1:
+        sys.exit("draft: expected exactly one A.3.2.1 section heading")
+    section = text.split(heading, 1)[1]
+    section = section.split("A.3.2.2.", 1)[0]
+    lines = section.splitlines()
+    found = {}
+    for n, line in enumerate(lines):
+        label = line.strip().rstrip(":")
+        if line.strip().endswith(":") and label in ("Plaintext", "Key", "IV", "Keystream", "Ciphertext"):
+            found[label.lower()] = _hex_block(lines, n + 1)
+    if "Counter: 0" not in section:
+        sys.exit("draft A.3.2.1: counter is not 0")
+    key, iv, plaintext = found["key"], found["iv"], found["plaintext"]
+    keystream, ciphertext = found["keystream"], found["ciphertext"]
+    assert len(key) == 32 and len(iv) == 24
+    assert len(plaintext) == len(keystream) == len(ciphertext) == 304
+    assert bytes(p ^ k for p, k in zip(plaintext, keystream)) == ciphertext
+    assert xchacha20_xor(key, iv, plaintext) == ciphertext, "draft A.3.2.1"
+    return [
+        ("key", key.hex()),
+        ("iv", iv.hex()),
+        ("plaintext", plaintext.hex()),
+        ("keystream", keystream.hex()),
+        ("ciphertext", ciphertext.hex()),
+    ]
+
+
+def wrap_record(name, key, nonce, plaintext):
+    check_xchacha20_against_libsodium(key, nonce, plaintext)
+    return [
+        ("name", name),
+        ("key", key.hex()),
+        ("nonce", nonce.hex()),
+        ("plaintext", plaintext.hex()),
+        ("ciphertext", xchacha20_xor(key, nonce, plaintext).hex()),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Passphrases (spec 7.3, SI-51)
+# ---------------------------------------------------------------------------
+
+# Unicode White_Space (PropList.txt), written out rather than using
+# str.isspace(), which differs (it also matches U+001C to U+001F).
+WHITE_SPACE = set(
+    [0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0x85, 0xA0, 0x1680]
+    + list(range(0x2000, 0x200B))
+    + [0x2028, 0x2029, 0x202F, 0x205F, 0x3000]
+)
+
+
+def load_wordlist():
+    data = WORDLIST.read_bytes()
+    if hashlib.sha256(data).hexdigest() != WORDLIST_SHA256:
+        sys.exit("assets/eff_large_wordlist.txt does not match its pinned SHA-256")
+    words = [line.split("\t")[1] for line in data.decode("ascii").splitlines()]
+    assert len(words) == 7776
+    return words
+
+
+def sample_words(words, count, stream):
+    chosen, used = [], 0
+    while len(chosen) < count:
+        value = int.from_bytes(stream[used : used + 2], "big")
+        used += 2
+        if value < 62208:
+            chosen.append(words[value % 7776])
+    return " ".join(chosen), used
+
+
+def sampling_record(words, count, stream):
+    passphrase, used = sample_words(words, count, stream)
+    return [
+        ("kind", "sampling"),
+        ("words", str(count)),
+        ("random_bytes", stream.hex()),
+        ("passphrase_utf8", passphrase.encode("utf-8").hex()),
+        ("bytes_used", str(used)),
+    ]
+
+
+def handle_words(text):
+    text = unicodedata.normalize("NFKC", text)
+    parts, current = [], []
+    for c in text:
+        if ord(c) in WHITE_SPACE:
+            if current:
+                parts.append("".join(current))
+                current = []
+        else:
+            current.append(c)
+    if current:
+        parts.append("".join(current))
+    return "".join(c.lower() for c in " ".join(parts))
+
+
+def words_record(name, text):
+    return [
+        ("kind", "words"),
+        ("name", name),
+        ("input", text.encode("utf-8").hex()),
+        ("output", handle_words(text).encode("utf-8").hex()),
+    ]
+
+
+def refused_class(cp):
+    if cp <= 0x1F or 0x7F <= cp <= 0x9F:
+        return "Control"
+    if cp in (0x2028, 0x2029):
+        return "LineSeparator"
+    if cp in (0x061C, 0x200E, 0x200F) or 0x202A <= cp <= 0x202E or 0x2066 <= cp <= 0x2069:
+        return "Bidirectional"
+    if cp == 0xFEFF:
+        return "ByteOrderMark"
+    if 0xFDD0 <= cp <= 0xFDEF or (cp & 0xFFFE) == 0xFFFE:
+        return "Noncharacter"
+    return None
+
+
+def custom_record(name, text):
+    record = [("kind", "custom"), ("name", name), ("input", text.encode("utf-8").hex())]
+    handled = unicodedata.normalize("NFC", text)
+    refused = next((refused_class(ord(c)) for c in handled if refused_class(ord(c))), None)
+    if refused:
+        return record + [("result", refused)]
+    return record + [
+        ("result", "ok"),
+        ("output", handled.encode("utf-8").hex()),
+        ("nfc_changed", "true" if handled != text else "false"),
+    ]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--wycheproof", required=True, type=Path)
@@ -405,6 +709,110 @@ def main():
             stream_vector("object-64k", "object", object_id, 0, CHUNK, key_aes, key_chacha),
             stream_vector("object-64k-plus-1", "object", object_id, 0, CHUNK + 1, key_aes, key_chacha),
             stream_vector("keytable-100", "keytable", vault_id, 7, 100, key_aes, key_chacha),
+        ],
+    )
+
+    write_records(
+        args.out / "pvault_gf256.txt",
+        [
+            "GF(2^8) with polynomial 0x11B, computed with log/antilog tables (generator 0x03).",
+            "mul_table_sha256: SHA-256 of the 65,536 products a * b, a-major (a = 0..255,",
+            "then b = 0..255). inverses: byte a is the inverse of a; byte 0 is 00.",
+        ],
+        [gf_record()],
+    )
+
+    write_records(
+        args.out / "pvault_shamir.txt",
+        [
+            "pvault spec 7.4: 2-of-n Shamir over GF(2^8) (0x11B), per byte",
+            "share_x = secret XOR coefficient * x, for x = 1, 2, 3.",
+            "Computed with log/antilog tables; every pair was re-interpolated at x = 0.",
+        ],
+        [
+            shamir_record("counting", bytes(range(96)), bytes(range(96, 192))),
+            shamir_record("zero-coefficients", bytes(range(96)), bytes(96)),
+            shamir_record("all-ff", b"\xff" * 96, b"\xff" * 96),
+            shamir_record(
+                "derived",
+                stream_bytes(b"pvault shamir secret", 96),
+                stream_bytes(b"pvault shamir coefficients", 96),
+            ),
+        ],
+    )
+
+    check_hchacha20_against_draft()
+    draft = (args.rfc / "draft-irtf-cfrg-xchacha-03.txt").read_text()
+    write_records(
+        args.out / "xchacha20_draft.txt",
+        [
+            "Parsed from draft-irtf-cfrg-xchacha-03, Appendix A.3.2.1 (block counter 0)",
+            f"(file SHA-256 {RFC_FILES['draft-irtf-cfrg-xchacha-03.txt']}).",
+            "Source: https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-xchacha-03",
+            "IETF Trust and the persons identified as the document authors; excerpt used",
+            "under the IETF Trust Legal Provisions (see THIRD_PARTY_NOTICES.md).",
+            "The IV is reproduced exactly as published (its 23rd byte is 0x58).",
+            "Re-verified with a Python HChaCha20 and OpenSSL ChaCha20.",
+        ],
+        [parse_xchacha_draft(draft)],
+    )
+
+    wrap_key = bytes(range(0x60, 0x80))
+    write_records(
+        args.out / "pvault_wrap.txt",
+        [
+            "pvault spec 7.5: ct = plaintext XOR XChaCha20 keystream (block counter 0).",
+            "Computed with a Python HChaCha20 (checked against the draft's section 2.2.1",
+            "vector) and OpenSSL ChaCha20; cross-checked against libsodium's",
+            "XChaCha20-Poly1305 body at block counter 1.",
+        ],
+        [
+            wrap_record("bundle-counting", wrap_key, bytes(range(0xB0, 0xC8)), bytes(range(96))),
+            wrap_record("bundle-zero", wrap_key, bytes(24), bytes(96)),
+            wrap_record(
+                "bundle-derived",
+                stream_bytes(b"pvault wrap key", 32),
+                stream_bytes(b"pvault wrap nonce", 24),
+                stream_bytes(b"pvault wrap plaintext", 96),
+            ),
+        ],
+    )
+
+    words = load_wordlist()
+    rejecting = bytes.fromhex("ffff f300 0000 f2ff 1e60 1e5f".replace(" ", ""))
+    write_records(
+        args.out / "pvault_passphrase.txt",
+        [
+            f"pvault spec 7.3 and SI-51. Word list: assets/eff_large_wordlist.txt (SHA-256 {WORDLIST_SHA256}).",
+            "sampling: u16 big-endian values; reject >= 62208, else index = value mod 7776.",
+            "words: NFKC, trim, collapse Unicode White_Space runs to U+0020, per-character",
+            "lowercase. custom: NFC only; refused classes per SI-51.",
+            f"Python unicodedata {unicodedata.unidata_version}. Inputs use characters whose",
+            "properties are stable across recent Unicode versions.",
+        ],
+        [
+            sampling_record(words, 12, rejecting + stream_bytes(b"pvault sampling 12", 64)),
+            sampling_record(words, 10, stream_bytes(b"pvault sampling 10", 40)),
+            sampling_record(words, 16, stream_bytes(b"pvault sampling 16", 64)),
+            words_record("plain", "abacus zone yo-yo"),
+            words_record("case-and-space", "  Abacus\t\tZONE \u3000 \uff59\uff4f-\uff59\uff4f \n"),
+            words_record("nbsp-and-nel", "T-SHIRT\u00a0felt-tip\u0085drop-down"),
+            words_record("compatibility-ligature", "\ufb01ve \u2163"),
+            words_record("non-ascii-lowercase", "\u0130STANBUL \u03a3\u039f\u03a6\u0399\u0391 \u00c9T\u00c9"),
+            words_record("decomposed", "Cafe\u0301"),
+            custom_record("ascii-kept-exactly", "  Mixed Case  and   spaces "),
+            custom_record("already-nfc", "caf\u00e9 \u00e9t\u00e9"),
+            custom_record("decomposed-composes", "cafe\u0301"),
+            custom_record("compatibility-kept", "\ufb01 \uff21 \u2163"),
+            custom_record("invisible-kept", "a\u200db\u00adc"),
+            custom_record("tab-refused", "a\tb"),
+            custom_record("del-refused", "a\u007fb"),
+            custom_record("c1-refused", "a\u0085b"),
+            custom_record("line-separator-refused", "a\u2028b"),
+            custom_record("bidi-refused", "abc\u202edef"),
+            custom_record("bom-refused", "\ufeffabc"),
+            custom_record("noncharacter-refused", "abc\ufdd0"),
+            custom_record("plane-noncharacter-refused", "abc\U0001fffe"),
         ],
     )
 

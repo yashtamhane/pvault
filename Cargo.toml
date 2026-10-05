@@ -9,7 +9,7 @@ rust-version = "1.89"
 authors = ["Yash Sandeep Tamhane"]
 repository = "https://github.com/yashtamhane/pvault"
 publish = false
-# License: open decision (spec Section 16, item 5).
+license = "GPL-3.0-only"
 
 [workspace.dependencies]
 pvault-core = { path = "crates/pvault-core" }
@@ -30,6 +30,14 @@ hkdf = "0.13.0"
 hmac = { version = "0.13.0", features = ["zeroize"] }
 sha2 = "0.11.0"
 argon2 = { version = "0.6.0", default-features = false, features = ["zeroize"] }
+chacha20 = { version = "0.10.2", default-features = false, features = ["xchacha", "zeroize"] }
+unicode-normalization = "0.1.25"
+# Shamir (SI-08): used only through its public polynomial API with
+# pvault-owned, zeroizing storage.
+vsss-rs = { version = "=6.0.1", default-features = false }
+# Custom-passphrase strength estimate (SI-51): called only inside the
+# creation-time estimator child process.
+zxcvbn = { version = "=3.1.1", default-features = false }
 assert_cmd = "2"
 criterion = "0.8.2"
 proptest = "1.11"
@@ -37,6 +45,10 @@ proptest = "1.11"
 # Platform FFI (spec Section 7.6a).
 libc = "0.2"
 windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_ErrorReporting",
 ] }

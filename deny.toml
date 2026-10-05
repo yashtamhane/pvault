@@ -11,10 +11,16 @@ yanked = "deny"
 ignore = []
 
 [licenses]
-# The licenses present in the dependency graph at Milestone 1. Adding a
-# license here is a reviewed decision. Compatibility with the project
-# license is open until that license is chosen (SI-04).
+# pvault is GPL-3.0-only (SI-04). These are the dependency licenses present
+# in the graph, all assessed as compatible with GPL-3.0-only. Adding a license
+# here is a reviewed decision.
 allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0"]
+# pvault's own crates are checked against the project license, which is
+# deliberately not part of the dependency allowlist.
+exceptions = [
+    { allow = ["GPL-3.0-only"], crate = "pvault-core" },
+    { allow = ["GPL-3.0-only"], crate = "pvault-cli" },
+]
 confidence-threshold = 0.93
 # By default the license check skips crates that are reachable only through
 # dev- or build-dependencies of workspace crates. Test, benchmark and build
@@ -24,9 +30,8 @@ include-dev = true
 include-build = true
 
 [licenses.private]
-# pvault's own crates are unpublished and have no license yet (SI-04), so
-# they are not checked here.
-ignore = true
+# pvault's own crates are unpublished but licensed, so they are checked too.
+ignore = false
 
 [bans]
 multiple-versions = "warn"

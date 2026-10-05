@@ -21,6 +21,10 @@ pub enum Error {
     #[error("could not disable core dumps: {0}")]
     CoreDumps(#[source] std::io::Error),
 
+    /// Resource limits for the estimator child process could not be set.
+    #[error("could not set process limits: {0}")]
+    ProcessLimits(#[source] std::io::Error),
+
     /// The operating system's random number generator failed. No other
     /// source is ever substituted (spec Section 7.1).
     #[error("the operating system's random number generator failed: {0}")]
@@ -46,6 +50,14 @@ pub enum Error {
     /// The plaintext source did not supply exactly the declared size.
     #[error("the input did not match its declared size")]
     InputLength,
+
+    /// Shares are invalid or inconsistent (zero or duplicate x-coordinates).
+    #[error("invalid secret shares")]
+    Shamir,
+
+    /// The custom-passphrase strength estimate could not be obtained.
+    #[error("the passphrase strength could not be estimated")]
+    Estimator,
 
     /// Reading or writing a stream failed.
     #[error("I/O error: {0}")]

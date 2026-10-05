@@ -5,6 +5,17 @@
 
 use crate::errors::Error;
 
+pub mod terminal;
+
+/// Hardening for the estimator child process (SI-51), applied before it
+/// reads any input: core dumps off (10.3), plus resource limits where the
+/// platform provides them (Unix CPU time 5 s; Linux address space 512 MiB).
+/// The parent's 5 s wall-clock timeout applies on every platform.
+pub fn harden_estimator_child() -> Result<(), Error> {
+    disable_core_dumps()?;
+    imp::limit_estimator_resources().map_err(Error::ProcessLimits)
+}
+
 /// How well [`disable_core_dumps`] could protect this process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -58,6 +69,30 @@ mod imp {
 
         Ok(CoreDumpProtection::Disabled)
     }
+
+    pub(super) fn limit_estimator_resources() -> io::Result<()> {
+        let cpu = libc::rlimit {
+            rlim_cur: 5,
+            rlim_max: 5,
+        };
+        // SAFETY: `cpu` is a fully initialized `rlimit` that outlives the
+        // call, and `setrlimit` only reads through the pointer.
+        if unsafe { libc::setrlimit(libc::RLIMIT_CPU, &cpu) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let memory = libc::rlimit {
+                rlim_cur: 512 * 1024 * 1024,
+                rlim_max: 512 * 1024 * 1024,
+            };
+            // SAFETY: as above.
+            if unsafe { libc::setrlimit(libc::RLIMIT_AS, &memory) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -95,6 +130,13 @@ mod imp {
 
         Ok(CoreDumpProtection::BestEffort)
     }
+
+    /// Windows has no per-process CPU or memory limit without a job object,
+    /// which is outside the approved FFI scope. The parent's wall-clock
+    /// timeout applies.
+    pub(super) fn limit_estimator_resources() -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -104,6 +146,10 @@ mod imp {
     use super::CoreDumpProtection;
 
     pub(super) fn disable_core_dumps() -> io::Result<CoreDumpProtection> {
+        Err(io::Error::from(io::ErrorKind::Unsupported))
+    }
+
+    pub(super) fn limit_estimator_resources() -> io::Result<()> {
         Err(io::Error::from(io::ErrorKind::Unsupported))
     }
 }
