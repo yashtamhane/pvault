@@ -950,11 +950,21 @@ variable set it fails there, as verified locally.
   (`source_writers_are_blocked_on_windows`); Unix keeps the detection tests.
 - Linux CI: the in-kernel exFAT driver comes from `linux-modules-extra`.
 
-**Vaults on FUSE (`fuseblk`):** no vault there can be opened, read-only
-included: the accepted vault-artifact identity (8.1) needs a birth time for
-the lock files, and FUSE provides none. This predates Milestone 4 and fails
-closed (nothing changed); the image test asserts it. In-kernel FAT and exFAT
-provide birth times, so read-only access to vaults there works.
+**Vaults without a stable file identity (open item O4).** The accepted
+vault-artifact identity (8.1) needs a birth time on Unix and `FILE_ID_INFO`
+on Windows. FUSE (`fuseblk`) has no birth time; Windows FAT and exFAT have no
+`FILE_ID_INFO` (their fallback file index is not stable across renames). No
+vault there can be locked, so none opens: every command, read-only included,
+is refused with exit 6 ("This file system cannot safely store vault changes
+(no stable file identity) …") and nothing is changed. This predates
+Milestone 4. In-kernel FAT and exFAT on Linux and macOS provide birth times,
+so read-only access to vaults there works, as F74 requires. On Windows
+FAT/exFAT and Linux FUSE, **F74's "read-only commands work" part is not
+met**; the real-image test asserts the fail-closed behavior instead.
+
+| # | Item | Options |
+| --- | --- | --- |
+| O4 | Read-only access to a vault on a file system without a stable identity (Windows FAT/exFAT, FUSE) | (a) accept as a documented limitation and narrow F74's read-only part to file systems with a stable identity; (b) allow read-only commands there without the vault lock's identity registry (a change to the accepted 8.4 lock rules) |
 
 **Validation not performed locally:**
 

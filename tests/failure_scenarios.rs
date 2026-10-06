@@ -962,9 +962,10 @@ fn fat_exfat_images() {
             .tempdir_in(&root)
             .unwrap();
         println!("    {label} image at {}", root.display());
-        // FUSE gives no birth time, which the accepted vault-artifact
-        // identity (8.1) needs for the lock files, so no vault there opens.
-        let reads = !label.contains("fuseblk");
+        // The accepted vault-artifact identity (8.1) needs a birth time
+        // (FUSE has none) and, on Windows, FILE_ID_INFO (FAT and exFAT have
+        // none), so no vault there opens: it fails closed (exit 6).
+        let reads = !label.contains("fuseblk") && !cfg!(windows);
         image_vault_refused(label, &template, base.path(), reads);
         image_export(label, &template, base.path());
         image_cards(label, base.path());
@@ -1003,18 +1004,23 @@ fn image_vault_refused(label: &str, template: &Env, base: &Path, reads: bool) {
     let before = tree_bytes(&env.vault());
     if !reads {
         // Fails closed before anything: the vault lock cannot be taken
-        // without a birth-time identity (8.1). Nothing is changed.
+        // without a stable file identity (8.1). Nothing is changed.
         for out in [
             env.list(),
             env.add(&env.source("b", b"b"), "b", &[], None),
             env.pv("rm", &["a"], None),
+            env.run(&[arg("status"), arg(&env.vault())], b"", None),
         ] {
-            assert_ne!(out.code, Some(0), "{label}: {}", out.stderr);
-            assert!(!out.crashed());
+            out.expect(6, &format!("{label}: vault without a stable identity"));
+            assert!(
+                out.says("no stable file identity"),
+                "{label}: {}",
+                out.stderr
+            );
         }
         assert_eq!(tree_bytes(&env.vault()), before, "{label}: vault unchanged");
         println!(
-            "    {label}: vault refused; reads unsupported (no birth time for the lock identity, 8.1)"
+            "    {label}: vault refused (exit 6, no stable file identity, 8.1); reads unsupported"
         );
         return;
     }

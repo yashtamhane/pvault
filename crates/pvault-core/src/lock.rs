@@ -58,7 +58,12 @@ impl LockFile {
         if file.metadata().map_err(Error::Io)?.len() != 0 {
             return Err(Error::Blocked("a lock file is not empty"));
         }
-        let id = dir.identity(&file).map_err(Error::Io)?;
+        // Without a stable file identity (8.1: Windows FAT/exFAT have no
+        // FILE_ID_INFO; FUSE has no birth time) no lock is taken and no vault
+        // there opens. Reported as the file-system refusal, not an I/O error.
+        let id = dir
+            .identity(&file)
+            .map_err(|_| Error::UnsupportedFileSystem("no stable file identity".to_owned()))?;
         let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
         if open.contains(&id) {
             return Err(Error::Unsupported(
