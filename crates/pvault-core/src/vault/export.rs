@@ -13,8 +13,8 @@ use crate::keytable::{EntryKind, MAX_PLAINTEXT};
 use crate::paths;
 use crate::platform::fs::{self as pfs, Dir};
 use crate::records::{
-    self, CardRole, OpKind, PartialEntry, RecordedFile, Settings, StaleOutcome, native_path,
-    path_from_native,
+    self, CardRole, Delivery, OpKind, PartialEntry, RecordedFile, Settings, StaleOutcome,
+    native_path, path_from_native,
 };
 use crate::render;
 
@@ -109,7 +109,7 @@ fn render_recorded(f: &RecordedFile) -> String {
 /// Opens the destination folder. A symbolic link or reparse point is
 /// refused (Rust reports Windows name-surrogate reparse points, including
 /// junctions, as symlinks); `Dir::open` itself does not follow one.
-fn open_parent(parent: &Path) -> Result<Dir, Error> {
+pub(crate) fn open_parent(parent: &Path) -> Result<Dir, Error> {
     if std::fs::symlink_metadata(parent).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err(Error::DestinationFolderLink);
     }
@@ -378,41 +378,91 @@ pub fn clean_partials(settings: &Settings, ui: &mut dyn Prompter) -> Result<Clea
     }
     let partials = settings.stale_partials(None).unwrap_or_default();
     let cards = settings.stale_cards(None).unwrap_or_default();
-    report.stale = partials.len() + cards.iter().map(|(e, _)| e.len()).sum::<usize>();
+    // Digital card files are the owner's recovery files: never deleted here
+    // (SI-52 8.2); only their record entries can be forgotten.
+    let (digital, paper): (Vec<_>, Vec<_>) = cards
+        .into_iter()
+        .partition(|(entries, _)| entries.iter().any(|e| e.delivery == Delivery::Digital));
+    let paper_files = paper.iter().map(|(e, _)| e.len()).sum::<usize>();
+    let digital_files = digital.iter().map(|(e, _)| e.len()).sum::<usize>();
+    report.stale = partials.len() + paper_files + digital_files;
     if report.stale == 0 {
         return Ok(report);
     }
-    let mut msg = String::from("Stale files recorded by interrupted operations:\n");
-    for (e, _) in &partials {
-        msg.push_str(&format!("  export: {}\n", render_recorded(&e.file)));
-    }
-    for (entries, _) in &cards {
-        for e in entries {
-            let role = match e.role {
-                CardRole::CardA => "Card A",
-                CardRole::CardB => "Card B",
-                CardRole::Bound => "card",
-            };
-            msg.push_str(&format!("  {role} file: {}\n", render_recorded(&e.file)));
+    let role = |r: CardRole| match r {
+        CardRole::CardA => "Card A",
+        CardRole::CardB => "Card B",
+        CardRole::Bound => "card",
+    };
+    let mut confirmed = true;
+    let deletable = partials.len() + paper_files;
+    if deletable > 0 {
+        let mut msg = String::from("Stale files recorded by interrupted operations:\n");
+        for (e, _) in &partials {
+            msg.push_str(&format!("  export: {}\n", render_recorded(&e.file)));
+        }
+        for (entries, _) in &paper {
+            for e in entries {
+                msg.push_str(&format!(
+                    "  {} file: {}\n",
+                    role(e.role),
+                    render_recorded(&e.file)
+                ));
+            }
+        }
+        ui.notice(msg.trim_end());
+        let phrase = format!("DELETE {deletable} STALE FILES");
+        if ui.confirm(&format!("Type {phrase} to confirm: "), &phrase)? {
+            for (e, lock) in partials {
+                report_stale(ui, &e.file, " It may contain exported plaintext.")?;
+                settings.unregister_partial(&e.transfer_id)?;
+                lock.finish();
+            }
+            for (entries, lock) in paper {
+                for e in &entries {
+                    report_stale(ui, &e.file, " It may hold a recovery card.")?;
+                }
+                settings.unregister_cards(&lock.id())?;
+                lock.finish();
+            }
+        } else {
+            confirmed = false;
         }
     }
-    ui.notice(msg.trim_end());
-    let phrase = format!("DELETE {} STALE FILES", report.stale);
-    if !ui.confirm(&format!("Type {phrase} to confirm: "), &phrase)? {
-        return Ok(report);
-    }
-    report.confirmed = true;
-    for (e, lock) in partials {
-        report_stale(ui, &e.file, " It may contain exported plaintext.")?;
-        settings.unregister_partial(&e.transfer_id)?;
-        lock.finish();
-    }
-    for (entries, lock) in cards {
-        for e in &entries {
-            report_stale(ui, &e.file, " It may hold a recovery card.")?;
+    if digital_files > 0 {
+        let mut msg = String::from(
+            "Digital recovery card files of interrupted setups (pvault never deletes these; they may be valid current cards):\n",
+        );
+        for (entries, _) in &digital {
+            for e in entries {
+                let vault = e
+                    .vault_path
+                    .as_deref()
+                    .map(|p| render::path(&path_from_native(p)))
+                    .unwrap_or_else(|| "unknown".to_owned());
+                msg.push_str(&format!(
+                    "  {} file: {} (card set {}, vault folder {vault})\n",
+                    role(e.role),
+                    render_recorded(&e.file),
+                    records::hex(&e.set_id)
+                ));
+            }
         }
-        settings.unregister_cards(&lock.id())?;
-        lock.finish();
+        msg.push_str("Compare the card set with pvault status for that vault, or run pvault init on the vault folder. Forgetting the records keeps every file.");
+        ui.notice(&msg);
+        let phrase = format!("FORGET {digital_files} CARD RECORDS");
+        if ui.confirm(
+            &format!("Type {phrase} to remove only the records: "),
+            &phrase,
+        )? {
+            for (_, lock) in digital {
+                settings.unregister_cards(&lock.id())?;
+                lock.finish();
+            }
+        } else {
+            confirmed = false;
+        }
     }
+    report.confirmed = confirmed;
     Ok(report)
 }

@@ -230,6 +230,40 @@ pub enum Error {
     )]
     DestinationNotPrivate(String),
 
+    /// A card file failed the format 1 reader (SI-52 6.1).
+    #[error("{0}")]
+    CardFile(crate::card::CardFileError),
+
+    /// Digital mode: both card folders are the same folder (SI-52 7).
+    #[error("Card A and Card B cannot be saved in the same folder.")]
+    SameCardFolder,
+
+    /// Digital mode: a required risk acknowledgment was not given (SI-52 5).
+    #[error("{0}")]
+    AckRequired(&'static str),
+
+    /// A typed confirmation that only a terminal can give was missing or
+    /// declined; nothing was changed.
+    #[error("{0}")]
+    NotConfirmed(&'static str),
+
+    /// A saved digital card file no longer is the file pvault wrote.
+    #[error("The saved {0} file changed after it was written; the setup was rolled back.")]
+    CardFileChanged(&'static str),
+
+    /// The optional card check after the commit failed (SI-52 R5). The
+    /// vault exists and is unchanged; no card file was deleted.
+    #[error(
+        "The vault was created, but the card check failed: {0} The vault is unchanged and no card file was deleted. Check the drives and the card files before relying on them."
+    )]
+    CardCheckFailed(String),
+
+    /// The recovery rehearsal with the delivered cards failed (SI-52 6.4).
+    #[error(
+        "Recovering this vault from the delivered cards failed, so the setup was rolled back; the cards are invalid."
+    )]
+    RehearsalFailed,
+
     /// The card destination is the vault folder or inside it (7.4b).
     #[error("Card files cannot be written inside the vault folder.")]
     CardDestinationInVault,

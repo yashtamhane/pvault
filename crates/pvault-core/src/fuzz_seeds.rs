@@ -137,4 +137,6 @@ fn fuzz_seeds() {
     let card = Card::new(&[0xa1; 16], CardMode::Portable, &[0xc5; 8], &share).unwrap();
     write(out, "card_parse", "payload", card.payload());
     write(out, "card_parse", "base32", card.base32().expose_secret());
+    let file = crate::card::render_svg(&card, "2026-01-02").unwrap();
+    write(out, "card_parse", "card_file", file.as_bytes());
 }

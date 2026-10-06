@@ -28,10 +28,10 @@ use crate::lock::VaultLock;
 use crate::passphrase::{self, CustomPassphrase, WordCount};
 use crate::platform::fs::{self as pfs, Dir};
 use crate::records::{
-    CardEntry, CardRole, OpKind, OpLock, RecordedFile, Settings, hex, native_path,
+    CardEntry, CardRole, Delivery, OpKind, OpLock, RecordedFile, Settings, hex, native_path,
 };
 use crate::resources::{self, SystemMemory};
-use crate::secrets::SecretBuf;
+use crate::secrets::{SecretBuf, SecretBytes};
 use crate::shamir;
 use crate::store::{
     self, HEADER, HEADER_TMP, JOURNAL, JOURNAL_TMP, Owned, keytable_name, keytable_tmp_name,
@@ -58,8 +58,18 @@ pub type Estimate<'a> = &'a dyn Fn(&CustomPassphrase, &str) -> Result<(Band, Vec
 pub struct InitOptions<'a> {
     /// The vault folder.
     pub vault: PathBuf,
-    /// The card folder (outside the vault).
+    /// Paper or digital card delivery (SI-52 R1).
+    pub delivery: Delivery,
+    /// Paper: the card folder (outside the vault).
     pub cards_dir: PathBuf,
+    /// Digital: Card A's folder.
+    pub card_a_dir: Option<PathBuf>,
+    /// Digital: Card B's folder.
+    pub card_b_dir: Option<PathBuf>,
+    /// Digital: `--accept-risk digital-cards` (SI-52 5).
+    pub accept_digital_cards: bool,
+    /// Digital: `--accept-risk same-volume` (SI-52 5).
+    pub accept_same_volume: bool,
     /// Generated or custom.
     pub passphrase: PassphraseChoice,
     /// Argon2id parameters (already range-checked by the CLI).
@@ -76,7 +86,10 @@ impl std::fmt::Debug for InitOptions<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InitOptions")
             .field("vault", &self.vault)
+            .field("delivery", &self.delivery)
             .field("cards_dir", &self.cards_dir)
+            .field("card_a_dir", &self.card_a_dir)
+            .field("card_b_dir", &self.card_b_dir)
             .field("passphrase", &self.passphrase)
             .field("argon2", &self.argon2)
             .finish_non_exhaustive()
@@ -84,12 +97,15 @@ impl std::fmt::Debug for InitOptions<'_> {
 }
 
 /// What `init` did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InitOutcome {
     /// A new vault.
     Created {
         /// Its ID.
         vault_id: [u8; 16],
+        /// Digital delivery: the saved Card A and Card B files, for the
+        /// optional check after the commit ([`card_check_after_commit`]).
+        card_files: Option<[PathBuf; 2]>,
     },
     /// An interrupted setup whose header was committed was finished.
     Finished {
@@ -295,7 +311,7 @@ fn verify_card(
     label: &'static str,
     png: Option<&Path>,
     ui: &mut dyn Prompter,
-) -> Result<(), Error> {
+) -> Result<SecretBytes<{ card::PAYLOAD_LEN }>, Error> {
     let attempts = if png.is_none() && ui.interactive() {
         3
     } else {
@@ -310,9 +326,11 @@ fn verify_card(
             },
             None => ui.card_text(label),
         };
+        // On success the delivered payload itself is returned: the
+        // rehearsal (SI-52 6.4) uses it, never the in-memory original.
         let result = decoded.and_then(|payload| {
             if card.matches(&payload) {
-                Ok(())
+                Ok(payload)
             } else {
                 // Report structure errors of the entered card; never its content.
                 match Card::parse(payload) {
@@ -328,7 +346,7 @@ fn verify_card(
             }
         });
         match result {
-            Ok(()) => return Ok(()),
+            Ok(payload) => return Ok(payload),
             Err(e) if ends_attempts(&e) || attempt == attempts => return Err(e),
             Err(e) => ui.notice(&e.to_string()),
         }
@@ -354,40 +372,60 @@ fn type_back(chosen: &Chosen, ui: &mut dyn Prompter) -> Result<(), Error> {
     Err(Error::PassphraseMismatch)
 }
 
-/// Card files of one operation, held open from creation to deletion
-/// (`docs/M4_READINESS.md` 11.2).
+/// One card file, held open from creation to its end (`docs/M4_READINESS.md`
+/// 11.2; SI-52 11).
+struct CardFile {
+    dir: Dir,
+    name: String,
+    path: PathBuf,
+    file: File,
+}
+
+/// The card files of one operation: paper (temporary print artifacts) or
+/// digital (the owner's permanent files).
 struct CardFiles<'a> {
-    dir: &'a Dir,
     settings: &'a Settings,
     lock: OpLock,
-    files: Vec<(String, PathBuf, File)>,
+    files: Vec<CardFile>,
     registered: bool,
 }
 
+/// Reads at most [`card::MAX_CARD_FILE`] + 1 bytes into wiped memory.
+pub(crate) fn read_bounded(file: &File) -> Result<Zeroizing<Vec<u8>>, Error> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    let f: &File = file;
+    f.take(card::MAX_CARD_FILE + 1)
+        .read_to_end(&mut bytes)
+        .map_err(Error::Io)?;
+    Ok(bytes)
+}
+
 impl<'a> CardFiles<'a> {
-    /// W1 to W4.
+    /// W1 to W4 (paper) and D1 to D4 (digital). `targets` are the folder of
+    /// each card; for paper both are the same folder.
+    #[allow(clippy::too_many_arguments)]
     fn write(
         settings: &'a Settings,
-        dir: &'a Dir,
-        dir_path: &Path,
+        targets: [(Dir, PathBuf); 2],
         cards: [(&Card, CardRole, &str); 2],
         vault_id: &[u8; 16],
         set_id: &[u8; 8],
+        delivery: Delivery,
+        vault_path: Vec<u8>,
     ) -> Result<Self, Error> {
-        // W1 (the settings policy was checked before anything was written).
+        // W1 / D1 (the settings policy was checked before anything else).
         let lock = settings.begin_operation(OpKind::Cards)?;
         let mut this = Self {
-            dir,
             settings,
             lock,
             files: Vec::new(),
             registered: false,
         };
         let result = (|| -> Result<(), Error> {
-            // W2.
+            // W2 / D2.
             let mut entries = Vec::new();
             let created_at = now();
-            for (_, role, suffix) in &cards {
+            for ((dir, dir_path), (_, role, suffix)) in targets.into_iter().zip(&cards) {
                 let name = format!(
                     "pvault-{}-{}-{suffix}.svg",
                     hex(&vault_id[..4]),
@@ -402,7 +440,12 @@ impl<'a> CardFiles<'a> {
                     _ => Error::Io(e),
                 })?;
                 let id = pfs::record_identity(&file).map_err(Error::Io);
-                this.files.push((name, path.clone(), file));
+                this.files.push(CardFile {
+                    dir,
+                    name,
+                    path: path.clone(),
+                    file,
+                });
                 entries.push(CardEntry {
                     op_id: this.lock.id(),
                     role: *role,
@@ -413,32 +456,45 @@ impl<'a> CardFiles<'a> {
                         path: native_path(&path).ok_or(Error::PathTooLongToTrack)?,
                         id: id?,
                     },
+                    delivery,
+                    vault_path: Some(vault_path.clone()),
                 });
             }
             failpoint!("init.cards-created");
-            // W3.
+            // W3 / D3.
             this.registered = true;
             settings.register_cards(entries).map_err(|e| match e {
                 Error::NotRegistered(_) => Error::NotRegistered("card files"),
                 other => other,
             })?;
             failpoint!("init.cards-registered");
-            // W4.
+            // W4 / D4.
             let today = date(created_at);
-            for ((card, _, _), (_, _, file)) in cards.iter().zip(&this.files) {
+            for ((card, _, _), f) in cards.iter().zip(&this.files) {
                 let svg = card::render_svg(card, &today)?;
-                let mut f: &File = file;
-                f.write_all(svg.as_bytes()).map_err(Error::Io)?;
-                pfs::flush_file(file).map_err(Error::Io)?;
+                let mut w: &File = &f.file;
+                w.write_all(svg.as_bytes()).map_err(Error::Io)?;
+                pfs::flush_file(&f.file).map_err(Error::Io)?;
             }
-            dir.flush().map_err(Error::Io)?;
+            for f in &this.files {
+                f.dir.flush().map_err(Error::Io)?;
+            }
             failpoint!("init.cards-written");
+            #[cfg(test)]
+            hooks::after_cards_written(
+                &this
+                    .files
+                    .iter()
+                    .map(|f| f.path.clone())
+                    .collect::<Vec<_>>(),
+            );
             Ok(())
         })();
         match result {
             Ok(()) => Ok(this),
             Err(e) => {
-                this.finish();
+                // Before `committing`: the cards can never be valid (SI-52 8.1).
+                report_kept(&this.delete(), None);
                 Err(e)
             }
         }
@@ -448,19 +504,57 @@ impl<'a> CardFiles<'a> {
     fn shown(&self) -> Vec<String> {
         self.files
             .iter()
-            .map(|(_, p, _)| crate::render::path(p))
+            .map(|f| crate::render::path(&f.path))
             .collect()
     }
 
-    /// W7 and W8. Returns the rendered paths left in place.
-    fn finish(self) -> Vec<String> {
+    /// Digital delivery (SI-52 6.4 step 1): reopen each file by name without
+    /// following links, require the identity of the handle pvault created,
+    /// read it through the format 1 reader and compare it with the card
+    /// that was written. Returns the payloads read from the files.
+    fn read_back(
+        &self,
+        expected: [&Card; 2],
+    ) -> Result<[SecretBytes<{ card::PAYLOAD_LEN }>; 2], Error> {
+        let mut out = Vec::with_capacity(2);
+        for (f, (card, label)) in self
+            .files
+            .iter()
+            .zip(expected.into_iter().zip(["Card A", "Card B"]))
+        {
+            let reopened = f
+                .dir
+                .open_regular(&f.name, false)
+                .map_err(Error::Io)?
+                .ok_or(Error::CardFileChanged(label))?;
+            let held = f.dir.identity(&f.file).map_err(Error::Io)?;
+            if f.dir.identity(&reopened).map_err(Error::Io)? != held {
+                return Err(Error::CardFileChanged(label));
+            }
+            let bytes = read_bounded(&reopened)?;
+            let read = card::parse_card_file(&bytes).map_err(Error::CardFile)?;
+            if !card.matches(&SecretBytes::take_from(&mut read.payload().to_vec())?) {
+                return Err(Error::CardFileChanged(label));
+            }
+            out.push(SecretBytes::take_from(&mut read.payload().to_vec())?);
+        }
+        let b = out.pop().ok_or(Error::RehearsalFailed)?;
+        let a = out.pop().ok_or(Error::RehearsalFailed)?;
+        Ok([a, b])
+    }
+
+    /// W7 and W8, or the in-process rollback before `committing` (both
+    /// modes): delete through the held handles. Returns the paths left.
+    fn delete(self) -> Vec<String> {
         let mut kept = Vec::new();
-        for (name, path, file) in &self.files {
-            if !self.dir.delete_held(name, file).unwrap_or(false) {
-                kept.push(crate::render::path(path));
+        for f in &self.files {
+            if !f.dir.delete_held(&f.name, &f.file).unwrap_or(false) {
+                kept.push(crate::render::path(&f.path));
             }
         }
-        let _ = self.dir.flush();
+        for f in &self.files {
+            let _ = f.dir.flush();
+        }
         failpoint!("init.cards-deleted");
         drop(self.files);
         if !self.registered || self.settings.unregister_cards(&self.lock.id()).is_ok() {
@@ -468,6 +562,222 @@ impl<'a> CardFiles<'a> {
         }
         kept
     }
+
+    /// D7 (digital, after the commit): keep the files, remove the entries.
+    fn release(self) {
+        drop(self.files);
+        failpoint!("init.cards-released");
+        if self.settings.unregister_cards(&self.lock.id()).is_ok() {
+            self.lock.finish();
+        }
+    }
+
+    /// Digital, after the `committing` attempt, when the outcome is not
+    /// known to be a commit: keep the files and the entries (SI-52 8.1).
+    fn retain(self) {
+        drop(self.files);
+        drop(self.lock);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod hooks {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    type Hook = Box<dyn FnOnce(&[PathBuf])>;
+
+    thread_local! {
+        static AFTER_CARDS: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    /// Runs `hook` once with the card file paths, right after they are
+    /// written and before delivery verification.
+    pub(crate) fn set_after_cards_written(hook: impl FnOnce(&[PathBuf]) + 'static) {
+        AFTER_CARDS.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn after_cards_written(paths: &[PathBuf]) {
+        if let Some(hook) = AFTER_CARDS.with(|h| h.borrow_mut().take()) {
+            hook(paths);
+        }
+    }
+}
+
+/// The recovery rehearsal (SI-52 6.4): from the delivered payloads only,
+/// through the recovery path, against the candidate header and key table.
+pub(crate) fn rehearse(
+    t: &Dir,
+    delivered: &[SecretBytes<{ card::PAYLOAD_LEN }>; 2],
+    candidate: &[u8],
+) -> Result<(), Error> {
+    let header = Header::parse(candidate)?;
+    let core = header.core();
+    let mut cards = Vec::with_capacity(2);
+    for p in delivered {
+        let c = Card::parse(SecretBytes::take_from(&mut p.expose_secret().to_vec())?)
+            .map_err(Error::Card)?;
+        c.check_for_vault(&core.vault_id, &core.card_set_id, CardMode::Portable)
+            .map_err(Error::Card)?;
+        cards.push(c);
+    }
+    card::check_portable_roles(&cards[0], &cards[1]).map_err(Error::Card)?;
+    let secret = shamir::combine(&cards[0].share()?, &cards[1].share()?)?;
+    let recovered = Bundle::from_bytes(&secret)?;
+    drop(secret);
+    if !header.verify_core(&recovered.k_mac) || !header.verify_slots(&recovered.k_mac) {
+        return Err(Error::RehearsalFailed);
+    }
+    let table = t
+        .open_regular(keytable_name(core.keytable_gen), false)
+        .map_err(Error::Io)?
+        .ok_or(Error::RehearsalFailed)?;
+    keytable::read_file(
+        table,
+        &core.vault_id,
+        core.keytable_gen,
+        &core.keytable_digest,
+        &recovered.keytable_keys()?,
+        &SystemMemory,
+    )
+    .map_err(|_| Error::RehearsalFailed)?;
+    Ok(())
+}
+
+/// The digital folders, checked before any secret (SI-52 D0).
+struct DigitalTargets {
+    a: (Dir, PathBuf),
+    b: (Dir, PathBuf),
+}
+
+/// The digital-card risk text (SI-52 5, 10), printed in every case.
+pub const DIGITAL_RISKS: &str = "Digital recovery cards: Card A and Card B together open this vault without the passphrase. Keep them on different drives in different places, never in one cloud account or one backup set, and never both on the computer that holds the vault. Losing a card's drive loses that card; with the passphrase forgotten and one card lost, the vault cannot be recovered. Deleting a card file does not erase it from flash storage, snapshots, backups, cloud history or thumbnail caches. pvault never deletes these files after the vault is created.";
+
+#[cfg(test)]
+thread_local! {
+    static MOCK_SYNC_ROOTS: std::cell::RefCell<Option<Vec<PathBuf>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Replaces the listed sync roots on this thread (`None` restores them).
+#[cfg(test)]
+pub(crate) fn mock_sync_roots(roots: Option<Vec<PathBuf>>) {
+    MOCK_SYNC_ROOTS.with(|m| *m.borrow_mut() = roots);
+}
+
+/// The well-known sync roots of R4: a best-effort list, not exhaustive.
+fn sync_roots() -> Vec<PathBuf> {
+    #[cfg(test)]
+    if let Some(r) = MOCK_SYNC_ROOTS.with(|m| m.borrow().clone()) {
+        return r;
+    }
+    let mut roots = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let home = PathBuf::from(home);
+        roots.push(home.join("Library").join("Mobile Documents"));
+        roots.push(home.join("Library").join("CloudStorage"));
+        roots.push(home.join("Dropbox"));
+    }
+    for var in ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"] {
+        if let Some(p) = std::env::var_os(var) {
+            roots.push(PathBuf::from(p));
+        }
+    }
+    roots
+}
+
+/// The listed sync root containing `path`, if any (SI-52 R4); not
+/// exhaustive, and never presented as such.
+fn sync_root(path: &Path) -> Option<PathBuf> {
+    let roots = sync_roots();
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    roots.into_iter().find(|r| {
+        let r = std::fs::canonicalize(r).unwrap_or_else(|_| r.clone());
+        real.starts_with(&r)
+    })
+}
+
+fn open_card_folder(p: &Path) -> Result<(Dir, PathBuf), Error> {
+    let abs = std::path::absolute(p).map_err(Error::Io)?;
+    if is_link(&abs) {
+        return Err(Error::Unsupported(
+            "a card folder is a symbolic link or reparse point",
+        ));
+    }
+    let dir = Dir::open(&abs).map_err(Error::Io)?;
+    // O3 and G1: owner-only access must be verifiable (exit 6).
+    pfs::check_private_destination(&dir)?;
+    Ok((dir, abs))
+}
+
+/// SI-52 D0 for digital mode: folders, acknowledgments and warnings, all
+/// before any secret is read or anything is created.
+fn digital_preflight(
+    opts: &InitOptions<'_>,
+    ui: &mut dyn Prompter,
+) -> Result<DigitalTargets, Error> {
+    let a = open_card_folder(opts.card_a_dir.as_deref().ok_or(Error::Unsupported(
+        "digital cards need --card-a-dir and --card-b-dir",
+    ))?)?;
+    let b = open_card_folder(opts.card_b_dir.as_deref().ok_or(Error::Unsupported(
+        "digital cards need --card-a-dir and --card-b-dir",
+    ))?)?;
+    if a.0.contains(&b.0).map_err(Error::Io)? && b.0.contains(&a.0).map_err(Error::Io)? {
+        return Err(Error::SameCardFolder);
+    }
+    ui.notice(DIGITAL_RISKS);
+    if !opts.accept_digital_cards {
+        let phrase = "STORE CARDS DIGITALLY";
+        if !ui.has_terminal() || !ui.confirm(&format!("Type {phrase} to continue: "), phrase)? {
+            return Err(Error::AckRequired(
+                "Digital recovery cards need your acknowledgment: give --accept-risk digital-cards, or type STORE CARDS DIGITALLY on a terminal. Nothing was written.",
+            ));
+        }
+    }
+    let (va, vb) = (
+        a.0.volume().map_err(Error::Io)?,
+        b.0.volume().map_err(Error::Io)?,
+    );
+    if va == vb {
+        ui.notice(&format!(
+            "Card A and Card B are on the same volume ({}). Anyone who gets that drive, its backups or its synced copies gets both cards, which open the vault without the passphrase. Different volumes are not proof of different devices either: keep the cards on separate drives in separate places.",
+            va.fs_type
+        ));
+        if !opts.accept_same_volume {
+            let phrase = "SAME DRIVE";
+            if !ui.has_terminal()
+                || !ui.confirm(
+                    &format!("Type {phrase} to keep both cards on this drive: "),
+                    phrase,
+                )?
+            {
+                return Err(Error::AckRequired(
+                    "Both cards on one volume need your acknowledgment: give --accept-risk same-volume, or type SAME DRIVE on a terminal. Nothing was written.",
+                ));
+            }
+        }
+    }
+    let vault_abs = std::path::absolute(&opts.vault).map_err(Error::Io)?;
+    if let Some(parent) = vault_abs.parent()
+        && let Ok(pv) = Dir::open(parent).and_then(|d| d.volume())
+    {
+        for (label, v) in [("Card A", &va), ("Card B", &vb)] {
+            if *v == pv {
+                ui.notice(&format!(
+                    "Warning: {label} is on the same drive as the vault."
+                ));
+            }
+        }
+    }
+    for (label, p) in [("Card A", &a.1), ("Card B", &b.1)] {
+        if let Some(root) = sync_root(p) {
+            ui.notice(&format!(
+                "Warning: {label}'s folder is inside {}, which is usually synced to a cloud account: the card would be copied to the provider, to other devices and to version history. pvault cannot detect every synced or backed-up folder, so no warning does not mean not synced.",
+                crate::render::path(&root)
+            ));
+        }
+    }
+    Ok(DigitalTargets { a, b })
 }
 
 /// Removes the authenticated init artifacts (rollback) and the journal.
@@ -484,11 +794,13 @@ fn rollback_setup(t: &Dir, rec: &InitRecord) -> Result<(), Error> {
     store::remove_journal(t)
 }
 
-fn report_kept(kept: &[String], ui: &mut dyn Prompter) {
-    for k in kept {
-        ui.notice(&format!(
-            "The card file {k} was moved or replaced and was not deleted; delete it yourself. It may hold a recovery card."
-        ));
+fn report_kept(kept: &[String], ui: Option<&mut dyn Prompter>) {
+    if let Some(ui) = ui {
+        for k in kept {
+            ui.notice(&format!(
+                "The card file {k} was moved or replaced and was not deleted; delete it yourself. It may hold a recovery card."
+            ));
+        }
     }
 }
 
@@ -498,22 +810,31 @@ pub fn init(
     settings: &Settings,
     ui: &mut dyn Prompter,
 ) -> Result<InitOutcome, Error> {
+    let digital = opts.delivery == Delivery::Digital;
     // A PNG photo of a printed card can exist only after the cards are
     // written and printed: its verification waits for the printing
     // acknowledgment on the terminal device (decided 2026-10-06, O1), also
     // under `--secrets-stdin`. Without a terminal it is refused here, before
     // any bootstrap creation.
     let photos = opts.card_a_png.is_some() || opts.card_b_png.is_some();
+    if photos && digital {
+        return Err(Error::Unsupported(
+            "PNG verification belongs to paper cards",
+        ));
+    }
     if photos && !ui.has_terminal() {
         return Err(Error::NeedsTerminal(
             "Verifying a card from a PNG photo needs a terminal for the printing acknowledgment, also with --secrets-stdin. Nothing was written.",
         ));
     }
     // O3 (decided 2026-10-06): card files hold shares and must stay
-    // owner-only; a FAT or exFAT card folder is refused before anything is
-    // created, the vault folder included. (A resume without `--cards-dir`
+    // owner-only; an unverifiable card folder is refused before anything is
+    // created, the vault folder included. (A resume without card options
     // writes no card file.)
-    if !opts.cards_dir.as_os_str().is_empty() {
+    let mut targets = None;
+    if digital {
+        targets = Some(digital_preflight(opts, ui)?);
+    } else if !opts.cards_dir.as_os_str().is_empty() {
         let cards_path = std::path::absolute(&opts.cards_dir).map_err(Error::Io)?;
         if let Ok(dir) = Dir::open(&cards_path) {
             pfs::check_private_destination(&dir)?;
@@ -526,18 +847,29 @@ pub fn init(
     // Settings and card destination, before any vault artifact.
     settings.check_registration()?;
     settings.check_card_room(2)?;
-    let cards_path = std::path::absolute(&opts.cards_dir).map_err(Error::Io)?;
-    if is_link(&cards_path) {
-        return Err(Error::Unsupported(
-            "the card folder is a symbolic link or reparse point",
-        ));
+    let vault_abs = std::path::absolute(&opts.vault).map_err(Error::Io)?;
+    let vault_path = native_path(&vault_abs).ok_or(Error::PathTooLongToTrack)?;
+    let folders: [(Dir, PathBuf); 2] = match targets {
+        Some(DigitalTargets { a, b }) => [a, b],
+        None => {
+            let cards_path = std::path::absolute(&opts.cards_dir).map_err(Error::Io)?;
+            if is_link(&cards_path) {
+                return Err(Error::Unsupported(
+                    "the card folder is a symbolic link or reparse point",
+                ));
+            }
+            let first = Dir::open(&cards_path).map_err(Error::Io)?;
+            let second = Dir::open(&cards_path).map_err(Error::Io)?;
+            [(first, cards_path.clone()), (second, cards_path)]
+        }
+    };
+    for (dir, _) in &folders {
+        if t.contains(dir).map_err(Error::Io)? {
+            return Err(Error::CardDestinationInVault);
+        }
+        // Again on the handle the cards are written through (O3, G1).
+        pfs::check_private_destination(dir)?;
     }
-    let cards_dir = Dir::open(&cards_path).map_err(Error::Io)?;
-    if t.contains(&cards_dir).map_err(Error::Io)? {
-        return Err(Error::CardDestinationInVault);
-    }
-    // Again on the handle the cards are written through (O3).
-    pfs::check_private_destination(&cards_dir)?;
     opts.argon2.check_hard_caps()?;
     resources::check_argon2(&opts.argon2, &SystemMemory)?;
     let context = opts
@@ -549,7 +881,6 @@ pub fn init(
         .take(64)
         .collect::<String>();
     let chosen = choose_passphrase(opts.passphrase, opts.estimate, &context, ui)?;
-
     ui.notice("Deriving keys…");
     let vault_id = random::array::<16>()?;
     let setup_id = random::array::<16>()?;
@@ -638,14 +969,15 @@ pub fn init(
     card::check_pair(&card_a, &card_b).map_err(Error::Card)?;
     let files = match CardFiles::write(
         settings,
-        &cards_dir,
-        &cards_path,
+        folders,
         [
             (&card_a, CardRole::CardA, "card-a"),
             (&card_b, CardRole::CardB, "card-b"),
         ],
         &vault_id,
         &set_id,
+        opts.delivery,
+        vault_path,
     ) {
         Ok(f) => f,
         Err(e) => {
@@ -654,26 +986,47 @@ pub fn init(
         }
     };
     let shown = files.shown();
-    ui.notice(&format!(
-        "Card files written: {}. Print both, then keep the printed cards in two different places.",
-        shown.join(", ")
-    ));
+    if digital {
+        ui.notice(&format!(
+            "Card files saved: {} (Card A), {} (Card B). Checking them now.",
+            shown[0], shown[1]
+        ));
+    } else {
+        ui.notice(&format!(
+            "Card files written: {}. Print both, then keep the printed cards in two different places.",
+            shown.join(", ")
+        ));
+    }
 
-    // W5, then the header temp and `committing`.
+    // W5 / D5, then the header temp and `committing`.
+    let mut committing_attempted = false;
     let verified = (|| -> Result<Owned, Error> {
-        // With a terminal this always waits (also under `--secrets-stdin`);
-        // PNG photos are opened only after it.
-        ui.acknowledge(if photos {
-            "Print both cards and save the PNG photos at the paths you gave, then press Enter. "
+        let delivered = if digital {
+            // Digital: no printing acknowledgment; the saved files are read
+            // back through the format 1 reader (SI-52 6.4).
+            files.read_back([&card_a, &card_b])?
         } else {
-            "Press Enter after printing. "
-        })?;
-        verify_card(&card_a, "Card A", opts.card_a_png.as_deref(), ui)?;
-        verify_card(&card_b, "Card B", opts.card_b_png.as_deref(), ui)?;
+            // With a terminal this always waits (also under
+            // `--secrets-stdin`); PNG photos are opened only after it.
+            ui.acknowledge(if photos {
+                "Print both cards and save the PNG photos at the paths you gave, then press Enter. "
+            } else {
+                "Press Enter after printing. "
+            })?;
+            [
+                verify_card(&card_a, "Card A", opts.card_a_png.as_deref(), ui)?,
+                verify_card(&card_b, "Card B", opts.card_b_png.as_deref(), ui)?,
+            ]
+        };
+        // The recovery rehearsal from the delivered cards (SI-52 6.4).
+        rehearse(&t, &delivered, &header_bytes)?;
+        drop(delivered);
+        failpoint!("init.rehearsed");
         type_back(&chosen, ui)?;
         let hdr = Owned::create(&t, HEADER_TMP, HEADER_TMP)?;
         rec.phase = InitPhase::Committing;
         rec.header_id = Some(hdr.id());
+        committing_attempted = true;
         write_init(&t, &rec, &init_key)?;
         failpoint!("init.committing");
         Ok(hdr)
@@ -681,10 +1034,24 @@ pub fn init(
     let mut hdr = match verified {
         Ok(h) => h,
         Err(e) => {
-            report_kept(&files.finish(), ui);
+            if digital && committing_attempted {
+                // SI-52 8.1: once `committing` may exist, keep the files.
+                files.retain();
+                let _ = rollback_setup(&t, &rec);
+                ui.notice(&format!(
+                    "The setup was rolled back. The card files {} were kept; they are probably invalid. pvault does not delete them now; check them with pvault discard-card.",
+                    shown.join(", ")
+                ));
+                return Err(e);
+            }
+            report_kept(&files.delete(), Some(ui));
             let _ = rollback_setup(&t, &rec);
             if !matches!(e, Error::NeedsTerminal(_)) {
-                ui.notice("The setup was rolled back; the printed cards are invalid.");
+                ui.notice(if digital {
+                    "The setup was rolled back; the card files were deleted. If you copied them anywhere, delete those copies: they are invalid."
+                } else {
+                    "The setup was rolled back; the printed cards are invalid."
+                });
             }
             return Err(e);
         }
@@ -695,7 +1062,10 @@ pub fn init(
     // W6: the first header, by no-replace rename.
     let committed = (|| -> Result<(), Error> {
         hdr.rewrite(&header_bytes).map_err(Error::Io)?;
-        if let Err(e) = t.rename_noreplace(HEADER_TMP, HEADER) {
+        // Tests fail the rename here: after `committing`, before the header.
+        let renamed =
+            fail_io!("init.header-rename").and_then(|()| t.rename_noreplace(HEADER_TMP, HEADER));
+        if let Err(e) = renamed {
             let now = store::read_capped(&t, HEADER, crate::header::MAX_HEADER_LEN, || {
                 Error::HeaderInvalid
             })
@@ -714,50 +1084,196 @@ pub fn init(
     match committed {
         Ok(()) => {}
         Err(Error::Io(e)) => {
-            report_kept(&files.finish(), ui);
-            let _ = rollback_setup(&t, &rec);
-            ui.notice("The setup was rolled back; the printed cards are invalid.");
+            if digital {
+                // After `committing`: retained (SI-52 8.1).
+                files.retain();
+                let _ = rollback_setup(&t, &rec);
+                ui.notice(&format!(
+                    "The setup was rolled back. The card files {} were kept; they are probably invalid. pvault does not delete them now; check them with pvault discard-card.",
+                    shown.join(", ")
+                ));
+            } else {
+                report_kept(&files.delete(), Some(ui));
+                let _ = rollback_setup(&t, &rec);
+                ui.notice("The setup was rolled back; the printed cards are invalid.");
+            }
             return Err(Error::Io(e));
         }
         Err(e) => {
-            // Committed or unknown: the journal stays for the resume; the
-            // card files are printed and verified, so they go now (W7).
-            report_kept(&files.finish(), ui);
+            // Committed or unknown: the journal stays for the resume. Paper:
+            // the cards are printed and verified, so the files go now (W7).
+            // Digital: the files are kept with their entries (SI-52 8.1).
+            if digital {
+                files.retain();
+            } else {
+                report_kept(&files.delete(), Some(ui));
+            }
             return Err(e);
         }
     }
-    // W7, W8.
-    report_kept(&files.finish(), ui);
+    let card_files = digital.then(|| [files.files[0].path.clone(), files.files[1].path.clone()]);
+    if digital {
+        // D7: the files are the owner's; only the entries go.
+        files.release();
+        ui.notice(&format!(
+            "Your recovery card files: {} (Card A) and {} (Card B). Keep them on different drives in different places; pvault will not delete them.",
+            shown[0], shown[1]
+        ));
+    } else {
+        // W7, W8.
+        report_kept(&files.delete(), Some(ui));
+    }
     store::remove_journal(&t)?;
     let _ = settings.rollback_observe(&vault_id, 1);
-    Ok(InitOutcome::Created { vault_id })
+    Ok(InitOutcome::Created {
+        vault_id,
+        card_files,
+    })
 }
 
-/// Lists and, with confirmation, deletes stale card files of `vault_id`
-/// (11.3); `current` labels them as the vault's current cards.
+/// What the optional card check after the commit did (SI-52 R5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardCheck {
+    /// Not offered (no interactive terminal) or skipped by the owner.
+    Skipped,
+    /// Both files read back and recovered the vault.
+    Passed,
+}
+
+/// SI-52 R5 (decided 2026-10-06): an optional check of digital card files
+/// after the commit. Run after `init` returned, so its card-file handles,
+/// card-operation lock and vault lock are all released and the owner can
+/// eject and re-insert the drives. Offered only to an interactive `init`.
+///
+/// Each file is opened afresh by path (no link followed), read through the
+/// format 1 reader, and the pair goes through the recovery rehearsal (6.4)
+/// against the header and key table as now stored, under a shared lock. The
+/// recovery itself shows that the files are this vault's current Card A and
+/// Card B, so no copy of the cards is kept in memory while the owner
+/// re-inserts the drives. A failure is reported as
+/// [`Error::CardCheckFailed`]: the vault is not rolled back and no card file
+/// is deleted.
+pub fn card_check_after_commit(
+    vault: &Path,
+    files: &[PathBuf; 2],
+    ui: &mut dyn Prompter,
+) -> Result<CardCheck, Error> {
+    if !ui.interactive() {
+        return Ok(CardCheck::Skipped);
+    }
+    ui.notice(
+        "The vault has already been created. Optional check: pvault has closed the card files, so you can now eject the drives that hold them, insert them again, and let pvault check that both cards read back and recover the vault. A failed check changes nothing: the vault stays, and no card file is deleted.",
+    );
+    let phrase = "CHECK";
+    if !ui.confirm(
+        &format!("Type {phrase} after re-inserting the drives to check the card files, or press Enter to skip: "),
+        phrase,
+    )? {
+        ui.notice("Card check skipped.");
+        return Ok(CardCheck::Skipped);
+    }
+    check_saved_cards(vault, files).map_err(|e| {
+        // The vault exists: never repeat a setup-time "rolled back" text.
+        let mut reason = match e {
+            Error::RehearsalFailed => "the two files do not recover this vault.".to_owned(),
+            other => other.to_string(),
+        };
+        if !reason.ends_with('.') {
+            reason.push('.');
+        }
+        Error::CardCheckFailed(reason)
+    })?;
+    ui.notice(&format!(
+        "Card check passed: {} (Card A) and {} (Card B) read back and recover this vault.",
+        crate::render::path(&files[0]),
+        crate::render::path(&files[1])
+    ));
+    Ok(CardCheck::Passed)
+}
+
+fn check_saved_cards(vault: &Path, files: &[PathBuf; 2]) -> Result<(), Error> {
+    let mut delivered = Vec::with_capacity(2);
+    for path in files {
+        let abs = std::path::absolute(path).map_err(Error::Io)?;
+        let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) else {
+            return Err(Error::Unsupported("a card file needs a folder and a name"));
+        };
+        let dir = super::export::open_parent(parent)?;
+        let file = dir
+            .open_regular(name, false)
+            .map_err(Error::Io)?
+            .ok_or_else(|| {
+                Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "a card file is missing",
+                ))
+            })?;
+        let bytes = read_bounded(&file)?;
+        let read = card::parse_card_file(&bytes).map_err(Error::CardFile)?;
+        delivered.push(SecretBytes::take_from(&mut read.payload().to_vec())?);
+    }
+    let delivered: [SecretBytes<{ card::PAYLOAD_LEN }>; 2] =
+        delivered.try_into().map_err(|_| Error::RehearsalFailed)?;
+    let t = Dir::open(vault).map_err(Error::Io)?;
+    let _shared = crate::lock::status_shared(&t)?.ok_or(Error::VaultInUse)?;
+    let header = crate::store::read_capped(
+        &t,
+        crate::store::HEADER,
+        crate::header::MAX_HEADER_LEN,
+        || Error::HeaderInvalid,
+    )?
+    .ok_or(Error::HeaderInvalid)?;
+    rehearse(&t, &delivered, &header)
+}
+
+/// Card entries left by an interrupted setup of `vault_id` (11.3; SI-52 8.2).
+/// Paper files are offered for deletion as before. Digital files are never
+/// deleted here: with `current_set` (an authenticated header's card set)
+/// matching, their entries are released and the files named as the
+/// owner's current cards; otherwise files and entries are kept and the files
+/// named as probably invalid.
 fn offer_stale_cards(
     settings: &Settings,
     vault_id: &[u8; 16],
-    current: bool,
+    current_set: Option<[u8; 8]>,
     ui: &mut dyn Prompter,
 ) -> Result<(), Error> {
     let stale = settings.stale_cards(Some(vault_id)).unwrap_or_default();
-    let n: usize = stale.iter().map(|(e, _)| e.len()).sum();
+    let (digital, paper): (Vec<_>, Vec<_>) = stale
+        .into_iter()
+        .partition(|(entries, _)| entries.iter().any(|e| e.delivery == Delivery::Digital));
+    let shown =
+        |e: &CardEntry| crate::render::path(&crate::records::path_from_native(&e.file.path));
+    for (entries, lock) in digital {
+        let names = entries.iter().map(shown).collect::<Vec<_>>().join(", ");
+        let current = entries.iter().all(|e| Some(e.set_id) == current_set);
+        if current {
+            ui.notice(&format!(
+                "Your recovery card files are: {names}. Keep them on different drives in different places."
+            ));
+            settings.unregister_cards(&lock.id())?;
+            lock.finish();
+        } else {
+            let set = entries.first().map(|e| hex(&e.set_id)).unwrap_or_default();
+            ui.notice(&format!(
+                "Card files of the interrupted setup (card set {set}) were kept: {names}. They are probably invalid, but pvault does not delete them after a restart; check them with pvault discard-card."
+            ));
+            drop(lock);
+        }
+    }
+    let n: usize = paper.iter().map(|(e, _)| e.len()).sum();
     if n == 0 {
         return Ok(());
     }
-    let label = if current {
+    let label = if current_set.is_some() {
         format!("current cards of vault {}", hex(vault_id))
     } else {
         "cards of the interrupted setup (invalid)".to_owned()
     };
     let mut msg = format!("Card files left by an interrupted setup ({label}):\n");
-    for (entries, _) in &stale {
+    for (entries, _) in &paper {
         for e in entries {
-            msg.push_str(&format!(
-                "  {}\n",
-                crate::render::path(&crate::records::path_from_native(&e.file.path))
-            ));
+            msg.push_str(&format!("  {}\n", shown(e)));
         }
     }
     ui.notice(msg.trim_end());
@@ -765,14 +1281,14 @@ fn offer_stale_cards(
     if !ui.confirm(&format!("Type {phrase} to confirm: "), &phrase)? {
         return Ok(());
     }
-    for (entries, lock) in stale {
+    for (entries, lock) in paper {
         for e in &entries {
-            let shown = crate::render::path(&crate::records::path_from_native(&e.file.path));
+            let name = shown(e);
             match crate::records::delete_recorded(&e.file)? {
-                crate::records::StaleOutcome::Deleted => ui.notice(&format!("Deleted {shown}.")),
+                crate::records::StaleOutcome::Deleted => ui.notice(&format!("Deleted {name}.")),
                 crate::records::StaleOutcome::Missing => {}
                 _ => ui.notice(&format!(
-                    "pvault cannot prove that {shown} is the file it created; delete it yourself if it is. It may hold a recovery card."
+                    "pvault cannot prove that {name} is the file it created; delete it yourself if it is. It may hold a recovery card."
                 )),
             }
         }
@@ -853,7 +1369,7 @@ fn finish_committed(
     {
         ui.notice("A vault.hdr.tmp that pvault cannot prove it created was left in place.");
     }
-    offer_stale_cards(settings, &rec.vault_id, true, ui)?;
+    offer_stale_cards(settings, &rec.vault_id, Some(h.core().card_set_id), ui)?;
     store::remove_journal(t)?;
     let _ = settings.rollback_observe(&rec.vault_id, h.core().generation);
     Ok(InitOutcome::Finished {
@@ -948,7 +1464,7 @@ fn remove_uncommitted(
             return Err(Error::UnownedLeftovers(reported));
         }
     }
-    offer_stale_cards(settings, &rec.vault_id, false, ui)?;
+    offer_stale_cards(settings, &rec.vault_id, None, ui)?;
     store::remove_journal(t)?;
     Ok(InitOutcome::RolledBack)
 }

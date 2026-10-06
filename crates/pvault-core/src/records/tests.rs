@@ -257,3 +257,59 @@ fn settings_folder_dacl_is_read_back() {
     ));
     std::fs::remove_dir_all(&tmp).unwrap();
 }
+
+/// SI-52 R7 (F101, records): `cards.cbor` version 1 is read and migrated to
+/// version 2 by the first update; keys that do not belong to a version, a
+/// digital entry without its vault path and a newer version are refused,
+/// and a refused record is never changed.
+#[test]
+fn card_record_versions() {
+    let (tmp, s) = settings();
+    let (file, _f) = recorded(&tmp, "c.svg");
+    let entry = |op: u8, delivery: Delivery, vault_path: Option<Vec<u8>>| CardEntry {
+        op_id: [op; 16],
+        role: CardRole::CardA,
+        set_id: [1; 8],
+        vault_id: [2; 16],
+        created_at: 3,
+        file: file.clone(),
+        delivery,
+        vault_path,
+    };
+    let path = s.path().join("cards.cbor");
+    // Version 1 on disk: read as paper.
+    let v1 = encode_version(RecordKind::Cards, &[entry(1, Delivery::Paper, None)], 1);
+    std::fs::write(&path, &v1).unwrap();
+    let read = s.load::<CardEntry>(RecordKind::Cards).unwrap();
+    assert_eq!((read.len(), read[0].delivery), (1, Delivery::Paper));
+    // The first update migrates the whole record to version 2.
+    s.register_cards(vec![entry(2, Delivery::Digital, Some(b"/vault".to_vec()))])
+        .unwrap();
+    let all = s.load::<CardEntry>(RecordKind::Cards).unwrap();
+    let v2 = std::fs::read(&path).unwrap();
+    assert_eq!(v2, encode_version(RecordKind::Cards, &all, 2));
+    assert_eq!(*v2.last().unwrap(), 2, "version 2 written");
+    assert_eq!(
+        all.iter()
+            .filter(|e| e.delivery == Delivery::Digital)
+            .count(),
+        1
+    );
+    // Version 1 claimed for a record with version 2 keys: refused.
+    let mut wrong = v2.clone();
+    *wrong.last_mut().unwrap() = 1;
+    assert!(decode::<CardEntry>(RecordKind::Cards, &wrong).is_err());
+    // A digital entry without its vault path: refused.
+    let no_path = encode_version(RecordKind::Cards, &[entry(4, Delivery::Digital, None)], 2);
+    assert!(decode::<CardEntry>(RecordKind::Cards, &no_path).is_err());
+    // A newer version: refused, and the record is never changed.
+    let mut newer = v2.clone();
+    *newer.last_mut().unwrap() = 3;
+    std::fs::write(&path, &newer).unwrap();
+    assert!(matches!(
+        s.register_cards(vec![entry(5, Delivery::Paper, None)]),
+        Err(Error::RecordDamaged(_))
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), newer);
+    std::fs::remove_dir_all(&tmp).unwrap();
+}

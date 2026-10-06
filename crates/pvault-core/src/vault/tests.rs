@@ -55,6 +55,11 @@ pub(crate) struct Script {
     shown_words: Option<Vec<u8>>,
     /// Every card payload entered, in order.
     entered_cards: Vec<SecretBytes<PAYLOAD_LEN>>,
+    /// Runs at the next typed confirmation, before it is answered.
+    on_confirm: Option<Box<dyn FnOnce()>>,
+    /// An interactive run (terminal, no `--secrets-stdin`); only the
+    /// optional card check after the commit asks for it.
+    interactive: bool,
 }
 
 impl Script {
@@ -69,6 +74,8 @@ impl Script {
             tty: false,
             shown_words: None,
             entered_cards: Vec::new(),
+            on_confirm: None,
+            interactive: false,
         }
     }
 
@@ -135,6 +142,9 @@ impl Prompter for Script {
 
     fn confirm(&mut self, prompt: &str, _phrase: &str) -> Result<bool, Error> {
         self.notices.push(format!("[confirm] {prompt}"));
+        if let Some(f) = self.on_confirm.take() {
+            f();
+        }
         Ok(self.confirms.pop_front().unwrap_or(false))
     }
 
@@ -173,7 +183,7 @@ impl Prompter for Script {
     }
 
     fn interactive(&self) -> bool {
-        false
+        self.interactive
     }
 
     fn has_terminal(&self) -> bool {
@@ -209,7 +219,12 @@ impl Fixture {
     fn opts(&self) -> InitOptions<'static> {
         InitOptions {
             vault: self.vault.clone(),
+            delivery: crate::records::Delivery::Paper,
             cards_dir: self.cards.clone(),
+            card_a_dir: None,
+            card_b_dir: None,
+            accept_digital_cards: false,
+            accept_same_volume: false,
             passphrase: PassphraseChoice::Custom,
             argon2: FAST,
             card_a_png: None,
@@ -1350,4 +1365,510 @@ fn private_destinations_required_for_exports_and_cards() {
     let msg = Error::DestinationNotPrivate("fuseblk".into()).to_string();
     assert!(msg.contains("only where it can confirm") && msg.contains("on fuseblk"));
     assert!(msg.contains("Nothing was written.") && msg.contains("Choose a folder on a local"));
+}
+
+/// G1 (decided 2026-10-06), mocked mount flag: on a volume mounted with
+/// ownership ignored, export destinations and card folders are refused
+/// before any secret, destination file or record, and a settings folder
+/// there is not private. The real macOS images are in
+/// `tests/failure_scenarios.rs` (`ownership_ignored_mounts_are_refused`).
+#[test]
+fn ownership_ignored_mounts_are_refused() {
+    use crate::platform::fs::tests::mock_ownership_ignored;
+    let f = Fixture::new().init();
+    f.add(&f.source("a", b"aaa"), "a", false).unwrap();
+    let mut ui = Script::new();
+    let s = f.unlock(Access::Read, &mut ui).unwrap();
+    let dest = f.root.join("out");
+    mock_ownership_ignored(true);
+    let early = export::check_destination(&dest);
+    let r = export::get(&s, "a", &dest, &f.settings, &mut ui);
+    mock_ownership_ignored(false);
+    for e in [
+        early.err(),
+        r.err().map(|e| match e {
+            GetError::Failed(e) => e,
+            other => panic!("{other:?}"),
+        }),
+    ] {
+        assert!(
+            matches!(e, Some(Error::DestinationNotPrivate(ref t)) if t.contains("ownership ignored")),
+            "{e:?}"
+        );
+    }
+    assert!(!dest.exists() && !f.root.join("out.pvpartial").exists());
+    assert!(f.settings.stale_partials(None).unwrap().is_empty());
+    drop(s);
+    // Card folder: refused before the vault folder exists, no secret read.
+    let g = Fixture::new();
+    mock_ownership_ignored(true);
+    let mut ui = Script::pw(3);
+    ui.cards_dir = Some(g.cards.clone());
+    let r = super::init::init(&g.opts(), &g.settings, &mut ui);
+    mock_ownership_ignored(false);
+    assert!(matches!(r, Err(Error::DestinationNotPrivate(_))), "{r:?}");
+    assert!(!g.vault.exists());
+    assert_eq!(ui.secrets.len(), 3);
+    assert_eq!(fs::read_dir(&g.cards).unwrap().count(), 0);
+    // Settings folder: not private (7.1).
+    mock_ownership_ignored(true);
+    let r = Settings::open_at(&g.root.join("other-settings"));
+    mock_ownership_ignored(false);
+    assert!(matches!(r, Err(Error::SettingsNotPrivate(_))), "{r:?}");
+    let msg = Error::DestinationNotPrivate("apfs with ownership ignored".into()).to_string();
+    assert!(msg.contains("This destination is on apfs with ownership ignored"));
+}
+
+// ---- SI-52 digital recovery cards ----
+
+impl Fixture {
+    fn digital_opts(&self) -> InitOptions<'static> {
+        let (a, b) = (self.root.join("a"), self.root.join("b"));
+        let _ = fs::create_dir(&a);
+        let _ = fs::create_dir(&b);
+        let mut o = self.opts();
+        o.delivery = crate::records::Delivery::Digital;
+        o.cards_dir = PathBuf::new();
+        o.card_a_dir = Some(a);
+        o.card_b_dir = Some(b);
+        o.accept_digital_cards = true;
+        // Both test folders are on one volume.
+        o.accept_same_volume = true;
+        o
+    }
+
+    fn card_files(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = ["a", "b"]
+            .iter()
+            .flat_map(|d| {
+                fs::read_dir(self.root.join(d))
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+            })
+            .collect();
+        v.sort();
+        v
+    }
+}
+
+/// F95: digital `init` keeps both files (format 1, one per folder) and
+/// releases its records; three secret lines, no printing acknowledgment.
+#[test]
+fn digital_init_keeps_the_card_files() {
+    let f = Fixture::new();
+    let mut ui = Script::pw(3);
+    let out = super::init::init(&f.digital_opts(), &f.settings, &mut ui).unwrap();
+    assert!(matches!(out, InitOutcome::Created { .. }));
+    assert!(ui.secrets.is_empty(), "exactly three lines");
+    let files = f.card_files();
+    assert_eq!(files.len(), 2);
+    for (p, x) in files.iter().zip([1u8, 2]) {
+        let card = card::parse_card_file(&fs::read(p).unwrap()).unwrap();
+        assert_eq!(card.x(), x);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(fs::metadata(p).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+    assert!(
+        f.settings.stale_cards(None).unwrap().is_empty(),
+        "records released"
+    );
+    assert!(ui.said("pvault will not delete them"));
+}
+
+/// F100, F101 (in process): acknowledgments and folder rules, all before
+/// any secret is read or anything is created.
+#[test]
+fn digital_acknowledgments_and_folders() {
+    let nothing = |f: &Fixture, ui: &Script| {
+        assert!(!f.vault.exists());
+        assert!(f.card_files().is_empty());
+        assert_eq!(ui.secrets.len(), 3, "no secret read");
+    };
+    // No acknowledgment and no terminal.
+    let f = Fixture::new();
+    let mut o = f.digital_opts();
+    o.accept_digital_cards = false;
+    let mut ui = Script::pw(3);
+    assert!(matches!(
+        super::init::init(&o, &f.settings, &mut ui),
+        Err(Error::AckRequired(_))
+    ));
+    nothing(&f, &ui);
+    // Same volume without its acknowledgment.
+    let mut o = f.digital_opts();
+    o.accept_same_volume = false;
+    let mut ui = Script::pw(3);
+    assert!(matches!(
+        super::init::init(&o, &f.settings, &mut ui),
+        Err(Error::AckRequired(_))
+    ));
+    assert!(ui.said("Different volumes are not proof of different devices"));
+    nothing(&f, &ui);
+    // The same folder twice.
+    let mut o = f.digital_opts();
+    o.card_b_dir = o.card_a_dir.clone();
+    let mut ui = Script::pw(3);
+    assert!(matches!(
+        super::init::init(&o, &f.settings, &mut ui),
+        Err(Error::SameCardFolder)
+    ));
+    nothing(&f, &ui);
+    // A card folder on an unverifiable file system (mocked).
+    let o = f.digital_opts();
+    crate::platform::fs::tests::mock_fs_type(Some("exfat"));
+    let mut ui = Script::pw(3);
+    let r = super::init::init(&o, &f.settings, &mut ui);
+    crate::platform::fs::tests::mock_fs_type(None);
+    assert!(matches!(r, Err(Error::DestinationNotPrivate(_))), "{r:?}");
+    nothing(&f, &ui);
+    // The typed phrases on a terminal replace the options.
+    let mut o = f.digital_opts();
+    o.accept_digital_cards = false;
+    o.accept_same_volume = false;
+    let mut ui = Script::pw(3).confirm(&[true, true]);
+    ui.tty = true;
+    super::init::init(&o, &f.settings, &mut ui).unwrap();
+    assert!(ui.said("STORE CARDS DIGITALLY") && ui.said("SAME DRIVE"));
+    // Q3: the options also work with a terminal; no phrase is asked, and
+    // the risk text is still shown.
+    let f = Fixture::new();
+    let mut ui = Script::pw(3);
+    ui.tty = true;
+    super::init::init(&f.digital_opts(), &f.settings, &mut ui).unwrap();
+    assert!(!ui.said("[confirm]"), "no typed phrase with the options");
+    assert!(ui.said("Card A and Card B together open this vault"));
+    // R4: a card folder under a listed sync root gets the non-exhaustive
+    // warning; elsewhere nothing is claimed.
+    let f = Fixture::new();
+    super::init::mock_sync_roots(Some(vec![f.root.join("a")]));
+    let mut ui = Script::pw(3);
+    let r = super::init::init(&f.digital_opts(), &f.settings, &mut ui);
+    super::init::mock_sync_roots(None);
+    r.unwrap();
+    assert!(ui.said("Warning: Card A's folder is inside"));
+    assert!(ui.said("no warning does not mean not synced"));
+    assert!(!ui.said("Warning: Card B's folder"));
+}
+
+/// F96: the rehearsal works from the delivered cards only and checks the
+/// candidate header and key table.
+#[test]
+fn rehearsal_uses_the_delivered_cards() {
+    // A key table changed after it was written: the files deliver, the
+    // rehearsal fails, the setup rolls back, the invalid files go.
+    let f = Fixture::new();
+    let kt = f.vault.join("keytable.1.pv");
+    super::init::hooks::set_after_cards_written(move |_| {
+        let mut b = fs::read(&kt).unwrap();
+        let n = b.len() - 1;
+        b[n] ^= 1;
+        fs::write(&kt, b).unwrap();
+    });
+    let mut ui = Script::pw(3);
+    let r = super::init::init(&f.digital_opts(), &f.settings, &mut ui);
+    assert!(matches!(r, Err(Error::RehearsalFailed)), "{r:?}");
+    assert!(
+        f.card_files().is_empty(),
+        "rolled back before committing: deleted"
+    );
+    assert!(!f.vault.join("vault.hdr").exists());
+    // Paper mode: the same rehearsal, from the typed cards.
+    let f = Fixture::new();
+    let kt = f.vault.join("keytable.1.pv");
+    super::init::hooks::set_after_cards_written(move |_| {
+        let mut b = fs::read(&kt).unwrap();
+        let n = b.len() - 1;
+        b[n] ^= 1;
+        fs::write(&kt, b).unwrap();
+    });
+    let mut ui = Script::pw(2);
+    ui.cards_dir = Some(f.cards.clone());
+    let r = super::init::init(&f.opts(), &f.settings, &mut ui);
+    assert!(matches!(r, Err(Error::RehearsalFailed)), "{r:?}");
+    assert_eq!(fs::read_dir(&f.cards).unwrap().count(), 0);
+    // A saved file replaced with the other card (same file, new content):
+    // delivery fails.
+    let f = Fixture::new();
+    super::init::hooks::set_after_cards_written(|paths| {
+        let b = fs::read(&paths[1]).unwrap();
+        fs::write(&paths[0], b).unwrap();
+    });
+    let mut ui = Script::pw(3);
+    let r = super::init::init(&f.digital_opts(), &f.settings, &mut ui);
+    assert!(matches!(r, Err(Error::CardFileChanged("Card A"))), "{r:?}");
+    assert!(f.card_files().is_empty());
+    // Direct: delivered payloads in the wrong order, or from another vault.
+    let f = Fixture::new();
+    super::init::init(&f.digital_opts(), &f.settings, &mut Script::pw(3)).unwrap();
+    let t = crate::platform::fs::Dir::open(&f.vault).unwrap();
+    let header = fs::read(f.vault.join("vault.hdr")).unwrap();
+    let payload = |p: &PathBuf| {
+        let c = card::parse_card_file(&fs::read(p).unwrap()).unwrap();
+        SecretBytes::take_from(&mut c.payload().to_vec()).unwrap()
+    };
+    let files = f.card_files();
+    super::init::rehearse(&t, &[payload(&files[0]), payload(&files[1])], &header).unwrap();
+    assert!(matches!(
+        super::init::rehearse(&t, &[payload(&files[1]), payload(&files[0])], &header),
+        Err(Error::Card(card::CardError::WrongRole(1)))
+    ));
+    let g = Fixture::new();
+    super::init::init(&g.digital_opts(), &g.settings, &mut Script::pw(3)).unwrap();
+    let other = g.card_files();
+    assert!(matches!(
+        super::init::rehearse(&t, &[payload(&files[0]), payload(&other[1])], &header),
+        Err(Error::Card(card::CardError::OtherVault))
+    ));
+}
+
+/// F97: in-process rollback before `committing` deletes the digital files;
+/// a failure after the `committing` attempt keeps them (and their records),
+/// and a resume after that keeps them too (F98, in process).
+#[test]
+fn digital_files_retained_after_committing() {
+    let f = Fixture::new();
+    let mut ui = Script::new();
+    ui.secrets
+        .extend([PW.to_vec(), PW.to_vec(), b"wrong".to_vec()]);
+    assert!(matches!(
+        super::init::init(&f.digital_opts(), &f.settings, &mut ui),
+        Err(Error::PassphraseMismatch)
+    ));
+    assert!(f.card_files().is_empty(), "before committing: deleted");
+    let f = Fixture::new();
+    crate::failpoints::inject("init.header-rename");
+    let mut ui = Script::pw(3);
+    assert!(matches!(
+        super::init::init(&f.digital_opts(), &f.settings, &mut ui),
+        Err(Error::Io(_))
+    ));
+    let kept = f.card_files();
+    assert_eq!(kept.len(), 2, "after committing: kept");
+    assert!(ui.said("were kept; they are probably invalid"));
+    assert_eq!(
+        f.settings.stale_cards(None).unwrap().len(),
+        1,
+        "records kept"
+    );
+    // The setup was rolled back; another `init` on the folder starts over,
+    // and nothing deletes the kept files.
+    let mut opts = f.digital_opts();
+    opts.card_a_dir = Some(f.root.join("a2"));
+    opts.card_b_dir = Some(f.root.join("b2"));
+    fs::create_dir(f.root.join("a2")).unwrap();
+    fs::create_dir(f.root.join("b2")).unwrap();
+    super::init::init(&opts, &f.settings, &mut Script::pw(3)).unwrap();
+    for p in &kept {
+        assert!(p.exists(), "never deleted after the run");
+    }
+    // `clean-partials` never deletes them either, even when confirmed.
+    let mut ui = Script::new().confirm(&[true]);
+    ui.tty = true;
+    export::clean_partials(&f.settings, &mut ui).unwrap();
+    assert!(ui.said("FORGET 2 CARD RECORDS"));
+    for p in &kept {
+        assert!(p.exists());
+    }
+    assert!(
+        f.settings.stale_cards(None).unwrap().is_empty(),
+        "records forgotten"
+    );
+}
+
+/// F99: `discard-card` deletes only the file the owner names, after the
+/// stronger typed confirmation; `--vault` is an unverified comparison.
+#[test]
+fn discard_card_is_owner_directed() {
+    let f = Fixture::new();
+    super::init::init(&f.digital_opts(), &f.settings, &mut Script::pw(3)).unwrap();
+    let files = f.card_files();
+    // No terminal: refused, nothing deleted.
+    let mut ui = Script::new();
+    assert!(matches!(
+        super::discard::discard_card(&files[0], Some(&f.vault), Some(&f.settings), &mut ui),
+        Err(Error::NotConfirmed(_))
+    ));
+    assert!(files[0].exists());
+    assert!(ui.said("Not verified") && ui.said("names this card's set as its current card set"));
+    assert!(ui.said("is Card A of vault") && ui.said("labeled as created 2"));
+    // Declined on a terminal: nothing deleted.
+    let mut ui = Script::new().confirm(&[false]);
+    ui.tty = true;
+    assert!(matches!(
+        super::discard::discard_card(&files[0], None, Some(&f.settings), &mut ui),
+        Err(Error::NotConfirmed(_))
+    ));
+    assert!(files[0].exists());
+    assert!(ui.said("DISCARD RECOVERY CARD"));
+    // A modified file is not a card file: refused.
+    let mut b = fs::read(&files[1]).unwrap();
+    b.push(b'\n');
+    let modified = f.root.join("modified.svg");
+    fs::write(&modified, b).unwrap();
+    let mut ui = Script::new().confirm(&[true]);
+    ui.tty = true;
+    assert!(matches!(
+        super::discard::discard_card(&modified, None, Some(&f.settings), &mut ui),
+        Err(Error::CardFile(_))
+    ));
+    assert!(modified.exists());
+    // A directory or a link is not a card file: refused, nothing deleted.
+    let mut ui = Script::new().confirm(&[true]);
+    ui.tty = true;
+    assert!(
+        super::discard::discard_card(&f.root.join("a"), None, Some(&f.settings), &mut ui).is_err()
+    );
+    assert!(f.root.join("a").is_dir());
+    #[cfg(unix)]
+    {
+        let link = f.root.join("link.svg");
+        std::os::unix::fs::symlink(&files[1], &link).unwrap();
+        let mut ui = Script::new().confirm(&[true]);
+        ui.tty = true;
+        assert!(super::discard::discard_card(&link, None, Some(&f.settings), &mut ui).is_err());
+        assert!(link.symlink_metadata().is_ok() && files[1].exists());
+        fs::remove_file(&link).unwrap();
+    }
+    // A file swapped after it was opened and read: the swapped-in file is
+    // not deleted.
+    let copy = f.root.join("copy.svg");
+    fs::copy(&files[1], &copy).unwrap();
+    let (c, moved) = (copy.clone(), f.root.join("moved.svg"));
+    let mut ui = Script::new().confirm(&[true]);
+    ui.tty = true;
+    ui.on_confirm = Some(Box::new(move || {
+        fs::rename(&c, &moved).unwrap();
+        fs::write(&c, b"another file").unwrap();
+    }));
+    let out = super::discard::discard_card(&copy, None, Some(&f.settings), &mut ui).unwrap();
+    assert!(!out.deleted && ui.said("nothing was deleted"));
+    assert_eq!(fs::read(&copy).unwrap(), b"another file");
+    // Confirmed: deleted.
+    let mut ui = Script::new().confirm(&[true]);
+    ui.tty = true;
+    let out = super::discard::discard_card(&files[0], Some(&f.vault), Some(&f.settings), &mut ui)
+        .unwrap();
+    assert!(out.deleted && !files[0].exists() && files[1].exists());
+    assert!(ui.said("does not erase it"));
+}
+
+/// SI-52 R5: the optional check after the commit. Not offered without an
+/// interactive terminal; skipped unless CHECK is typed; with the drives
+/// "ejected" and "re-inserted" (folder removed and recreated: the files are
+/// new, only their content is the same) it passes, which also shows that no
+/// handle of `init` is still open (Windows refuses to remove a folder with
+/// open files). A failed check neither rolls back nor deletes anything.
+#[test]
+fn card_check_after_commit() {
+    use super::init::{CardCheck, card_check_after_commit as check};
+    let f = Fixture::new();
+    let out = super::init::init(&f.digital_opts(), &f.settings, &mut Script::pw(3)).unwrap();
+    let InitOutcome::Created {
+        card_files: Some(files),
+        ..
+    } = out
+    else {
+        panic!("{out:?}")
+    };
+    assert_eq!(files.to_vec(), f.card_files());
+    // Non-interactive: not offered.
+    let mut ui = Script::new();
+    ui.tty = true;
+    assert_eq!(
+        check(&f.vault, &files, &mut ui).unwrap(),
+        CardCheck::Skipped
+    );
+    assert!(!ui.said("[confirm]"));
+    // Interactive, Enter: skipped.
+    let mut ui = Script::new().confirm(&[false]);
+    (ui.tty, ui.interactive) = (true, true);
+    assert_eq!(
+        check(&f.vault, &files, &mut ui).unwrap(),
+        CardCheck::Skipped
+    );
+    assert!(ui.said("The vault has already been created") && ui.said("Type CHECK"));
+    // Ejected and re-inserted, then CHECK: passes.
+    let a_dir = files[0].parent().unwrap().to_path_buf();
+    let a = files[0].clone();
+    let mut ui = Script::new().confirm(&[true]);
+    (ui.tty, ui.interactive) = (true, true);
+    ui.on_confirm = Some(Box::new(move || {
+        let bytes = fs::read(&a).unwrap();
+        fs::remove_dir_all(&a_dir).unwrap();
+        fs::create_dir(&a_dir).unwrap();
+        fs::write(&a, bytes).unwrap();
+    }));
+    assert_eq!(check(&f.vault, &files, &mut ui).unwrap(), CardCheck::Passed);
+    assert!(ui.said("Card check passed"));
+    // Failures: a changed file, the two files swapped, a missing file. Each
+    // is reported; the vault and the files stay.
+    let header = fs::read(f.vault.join("vault.hdr")).unwrap();
+    let originals: Vec<Vec<u8>> = files.iter().map(|p| fs::read(p).unwrap()).collect();
+    let restore = |files: &[PathBuf; 2]| {
+        for (p, b) in files.iter().zip(&originals) {
+            fs::write(p, b).unwrap();
+        }
+    };
+    let kt_path = f.vault.join("keytable.1.pv");
+    let keytable = fs::read(&kt_path).unwrap();
+    let restore_keytable = || fs::write(&kt_path, &keytable).unwrap();
+    type Damage = Box<dyn Fn(&[PathBuf; 2])>;
+    let damages: [Damage; 4] = [
+        Box::new(|f| {
+            let mut b = fs::read(&f[0]).unwrap();
+            b.push(b'\n');
+            fs::write(&f[0], b).unwrap();
+        }),
+        Box::new(|f| {
+            let (x, y) = (fs::read(&f[0]).unwrap(), fs::read(&f[1]).unwrap());
+            fs::write(&f[0], y).unwrap();
+            fs::write(&f[1], x).unwrap();
+        }),
+        Box::new(|f| fs::remove_file(&f[1]).unwrap()),
+        // Both files valid, but the key table no longer authenticates.
+        Box::new(|f| {
+            let kt = f[0]
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("vault")
+                .join("keytable.1.pv");
+            let mut b = fs::read(&kt).unwrap();
+            let n = b.len() - 1;
+            b[n] ^= 1;
+            fs::write(&kt, b).unwrap();
+        }),
+    ];
+    for damage in damages {
+        let mut ui = Script::new().confirm(&[true]);
+        (ui.tty, ui.interactive) = (true, true);
+        let (fs2, d) = (files.clone(), damage);
+        ui.on_confirm = Some(Box::new(move || d(&fs2)));
+        let r = check(&f.vault, &files, &mut ui);
+        assert!(matches!(r, Err(Error::CardCheckFailed(_))), "{r:?}");
+        let message = r.unwrap_err().to_string();
+        assert!(message.contains("The vault was created"), "{message}");
+        assert!(!message.contains("rolled back"), "{message}");
+        assert_eq!(fs::read(f.vault.join("vault.hdr")).unwrap(), header);
+        assert!(files[0].exists());
+        restore(&files);
+        restore_keytable();
+    }
+    // The vault still opens with the passphrase, and with the cards.
+    let mut ui = Script::new().confirm(&[true]);
+    (ui.tty, ui.interactive) = (true, true);
+    assert_eq!(check(&f.vault, &files, &mut ui).unwrap(), CardCheck::Passed);
+    assert!(
+        unlock(
+            &f.vault,
+            &mut Script::pw(1),
+            Some(&f.settings),
+            Access::Read
+        )
+        .is_ok()
+    );
 }

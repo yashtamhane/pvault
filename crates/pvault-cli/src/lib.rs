@@ -16,7 +16,7 @@ use pvault_core::input::{InputError, SecretLine, StdinSecrets, read_line};
 use pvault_core::passphrase::WordCount;
 use pvault_core::platform::terminal;
 use pvault_core::platform::{CoreDumpProtection, disable_core_dumps};
-use pvault_core::records::Settings;
+use pvault_core::records::{Delivery, Settings};
 use pvault_core::render;
 use pvault_core::secrets::SecretBytes;
 use pvault_core::vault::export::GetError;
@@ -35,6 +35,22 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CardsArg {
+    /// Printed cards; the card files are temporary.
+    Paper,
+    /// The card files are the recovery cards.
+    Digital,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum RiskArg {
+    /// Digital recovery cards (SI-52).
+    DigitalCards,
+    /// Both digital cards on one volume.
+    SameVolume,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum ModeArg {
     Portable,
@@ -50,9 +66,24 @@ enum Command {
         /// Vault mode. Milestone 4 builds portable vaults only.
         #[arg(long, value_enum)]
         mode: Option<ModeArg>,
-        /// An existing folder outside the vault for the two card files.
+        /// Recovery cards: printed (paper) or kept as files (digital).
+        /// Required for a new vault.
+        #[arg(long, value_enum)]
+        cards: Option<CardsArg>,
+        /// Paper: an existing folder outside the vault for the two card
+        /// files to print.
         #[arg(long)]
         cards_dir: Option<PathBuf>,
+        /// Digital: the folder for Card A (a supported local drive).
+        #[arg(long)]
+        card_a_dir: Option<PathBuf>,
+        /// Digital: the folder for Card B (another drive and place).
+        #[arg(long)]
+        card_b_dir: Option<PathBuf>,
+        /// Digital: acknowledge a risk without a typed phrase
+        /// (digital-cards, same-volume). Repeatable. Not a secret.
+        #[arg(long, value_enum)]
+        accept_risk: Vec<RiskArg>,
         /// Generated passphrase of this many words (10 to 16).
         #[arg(long, value_parser = clap::value_parser!(u8).range(10..=16), conflicts_with = "custom")]
         words: Option<u8>,
@@ -125,6 +156,14 @@ enum Command {
     },
     /// Remove files left by interrupted exports and setups.
     CleanPartials,
+    /// Delete one recovery card file you name (asks on the terminal).
+    DiscardCard {
+        /// The card file.
+        card_file: PathBuf,
+        /// Compare with this vault's public header (not verified).
+        #[arg(long)]
+        vault: Option<PathBuf>,
+    },
 }
 
 /// Exit codes (`docs/CLI.md` 3).
@@ -135,7 +174,9 @@ fn code(e: &Error) -> u8 {
         | Error::UnownedLeftovers(_)
         | Error::RecordFull(_)
         | Error::InitPending
-        | Error::Blocked(_) => 4,
+        | Error::Blocked(_)
+        | Error::AckRequired(_)
+        | Error::NotConfirmed(_) => 4,
         Error::OutcomeUnknown
         | Error::DurabilityUnknown
         | Error::Indeterminate
@@ -154,7 +195,7 @@ fn code(e: &Error) -> u8 {
         | Error::DestinationNotPrivate(_)
         | Error::Unsupported(_) => 6,
         Error::Input(InputError::NoTerminal | InputError::StdinIsTerminal) => 6,
-        Error::ForceRefused => 2,
+        Error::ForceRefused | Error::SameCardFolder => 2,
         Error::Cancelled => 7,
         _ => 1,
     }
@@ -359,7 +400,11 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
         Command::Init {
             vault_dir,
             mode,
+            cards,
             cards_dir,
+            card_a_dir,
+            card_b_dir,
+            accept_risk,
             words,
             custom,
             kdf_memory,
@@ -368,7 +413,15 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
             card_a_png,
             card_b_png,
         } => {
-            let resume_only = mode.is_none() && cards_dir.is_none();
+            // A resume (`pvault init <vault>`) takes no card options.
+            let resume_only = mode.is_none()
+                && cards.is_none()
+                && cards_dir.is_none()
+                && card_a_dir.is_none()
+                && card_b_dir.is_none()
+                && accept_risk.is_empty()
+                && card_a_png.is_none()
+                && card_b_png.is_none();
             match mode {
                 Some(ModeArg::Bound) => {
                     eprintln!("Bound mode is not available in this version.");
@@ -380,9 +433,37 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
                 }
                 _ => {}
             }
-            if !resume_only && cards_dir.is_none() {
-                eprintln!("--cards-dir is required.");
-                return ExitCode::from(2);
+            let digital = cards == Some(CardsArg::Digital);
+            if !resume_only {
+                let usage = |m: &str| {
+                    eprintln!("{m}");
+                    ExitCode::from(2)
+                };
+                match cards {
+                    None => return usage("--cards paper or --cards digital is required."),
+                    Some(CardsArg::Paper) => {
+                        if card_a_dir.is_some() || card_b_dir.is_some() || !accept_risk.is_empty() {
+                            return usage(
+                                "--card-a-dir, --card-b-dir and --accept-risk belong to --cards digital.",
+                            );
+                        }
+                        if cards_dir.is_none() {
+                            return usage("--cards-dir is required with --cards paper.");
+                        }
+                    }
+                    Some(CardsArg::Digital) => {
+                        if cards_dir.is_some() || card_a_png.is_some() || card_b_png.is_some() {
+                            return usage(
+                                "--cards-dir, --card-a-png and --card-b-png belong to --cards paper.",
+                            );
+                        }
+                        if card_a_dir.is_none() || card_b_dir.is_none() {
+                            return usage(
+                                "--card-a-dir and --card-b-dir are required with --cards digital.",
+                            );
+                        }
+                    }
+                }
             }
             // O1 (2026-10-06): PNG verification waits for the printing
             // acknowledgment on the terminal; refused before anything exists.
@@ -390,6 +471,18 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
                 return fail(
                     &Error::NeedsTerminal(
                         "Verifying a card from a PNG photo needs a terminal for the printing acknowledgment, also with --secrets-stdin. Nothing was written.",
+                    ),
+                    None,
+                );
+            }
+            // SI-52 5: without the option and without a terminal the
+            // acknowledgment cannot be given; refused before anything exists
+            // (the settings folder included).
+            if digital && !accept_risk.contains(&RiskArg::DigitalCards) && !ui.tty {
+                eprintln!("{}", vault::init::DIGITAL_RISKS);
+                return fail(
+                    &Error::AckRequired(
+                        "Digital recovery cards need your acknowledgment: give --accept-risk digital-cards, or type STORE CARDS DIGITALLY on a terminal. Nothing was written.",
                     ),
                     None,
                 );
@@ -411,7 +504,16 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
             };
             let opts = InitOptions {
                 vault: vault_dir.clone(),
+                delivery: if digital {
+                    Delivery::Digital
+                } else {
+                    Delivery::Paper
+                },
                 cards_dir: cards_dir.unwrap_or_default(),
+                card_a_dir,
+                card_b_dir,
+                accept_digital_cards: accept_risk.contains(&RiskArg::DigitalCards),
+                accept_same_volume: accept_risk.contains(&RiskArg::SameVolume),
                 passphrase,
                 argon2: Argon2Params {
                     m_kib: kdf_memory * 1024,
@@ -426,18 +528,28 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
                 // Only an existing folder can be resumed; a new vault needs
                 // the options.
                 if !vault_dir.exists() {
-                    eprintln!("--mode portable and --cards-dir are required to create a vault.");
+                    eprintln!("--mode portable and --cards are required to create a vault.");
                     return ExitCode::from(2);
                 }
             }
             match vault::init::init(&opts, &settings, &mut ui) {
-                Ok(InitOutcome::Created { vault_id }) => {
+                Ok(InitOutcome::Created {
+                    vault_id,
+                    card_files,
+                }) => {
                     eprintln!(
-                        "Vault created: {} (portable, vault ID {}). Keep Card A and Card B apart; together they can open the vault without the passphrase.",
+                        "Vault created: {} (portable, vault ID {}). Keep Card A and Card B apart; together they can recover the vault without the passphrase.",
                         render::path(&vault_dir),
                         pvault_core::records::hex(&vault_id)
                     );
-                    ExitCode::SUCCESS
+                    // SI-52 R5: optional, interactive only, after every
+                    // handle and lock of `init` is released.
+                    match card_files.map(|files| {
+                        vault::init::card_check_after_commit(&vault_dir, &files, &mut ui)
+                    }) {
+                        Some(Err(e)) => fail(&e, None),
+                        _ => ExitCode::SUCCESS,
+                    }
                 }
                 Ok(InitOutcome::Finished { vault_id }) => {
                     eprintln!(
@@ -452,7 +564,7 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 Err(Error::TargetNotEmpty) if resume_only => {
-                    eprintln!("--mode portable and --cards-dir are required to create a vault.");
+                    eprintln!("--mode portable and --cards are required to create a vault.");
                     ExitCode::from(2)
                 }
                 Err(e) => fail(&e, None),
@@ -596,6 +708,19 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
                     eprintln!("The header does not parse.");
                     ExitCode::from(1)
                 }
+                Err(e) => fail(&e, None),
+            }
+        }
+        Command::DiscardCard { card_file, vault } => {
+            let settings = Settings::open().ok();
+            match vault::discard::discard_card(
+                &card_file,
+                vault.as_deref(),
+                settings.as_ref(),
+                &mut ui,
+            ) {
+                Ok(o) if o.deleted => ExitCode::SUCCESS,
+                Ok(_) => ExitCode::from(1),
                 Err(e) => fail(&e, None),
             }
         }

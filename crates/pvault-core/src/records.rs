@@ -409,6 +409,19 @@ impl Settings {
         })
     }
 
+    /// Removes every card entry naming `path` (native bytes, 7.2); returns
+    /// how many were removed. Never touches a file (SI-52 8.3).
+    pub fn forget_card_file(&self, path: &[u8]) -> Result<usize, Error> {
+        let mut removed = 0;
+        self.modify::<CardEntry>(RecordKind::Cards, |all| {
+            let before = all.len();
+            all.retain(|e| e.file.path != path);
+            removed = before - all.len();
+            Ok(())
+        })?;
+        Ok(removed)
+    }
+
     /// Removes one card entry.
     pub fn unregister_card(&self, op_id: &[u8; 16], role: CardRole) -> Result<(), Error> {
         self.modify::<CardEntry>(RecordKind::Cards, |all| {
@@ -588,6 +601,23 @@ impl RecordKind {
             Self::Partials | Self::Cards => 256,
         }
     }
+    /// The version this pvault writes (SI-52 R7: `cards.cbor` version 2).
+    fn version(self) -> u64 {
+        match self {
+            Self::Cards => 2,
+            Self::Rollback | Self::Partials => 1,
+        }
+    }
+
+    /// The versions this pvault reads. Any other version is refused and
+    /// never changed (7.2 "damaged or newer").
+    fn reads(self, version: u64) -> bool {
+        match self {
+            Self::Cards => matches!(version, 1 | 2),
+            Self::Rollback | Self::Partials => version == 1,
+        }
+    }
+
     fn max_bytes(self) -> u64 {
         match self {
             Self::Rollback => 256 << 10,
@@ -619,12 +649,22 @@ enum V {
 
 trait Entry: Sized {
     const KEYS: &'static [&'static str];
-    fn fields(&self) -> Vec<(&'static str, V)>;
+    /// The fields written for record `version`.
+    fn fields(&self, version: u64) -> Vec<(&'static str, V)>;
     fn decode(d: &mut Decoder<'_>) -> Result<Self, CborError>;
     fn sort_key(&self) -> Vec<u8>;
+    /// Rules that depend on the record version beyond the exact
+    /// re-encoding (which already rejects keys that do not belong to it).
+    fn valid_for(_entries: &[Self], _version: u64) -> bool {
+        true
+    }
 }
 
 fn encode<E: Entry>(kind: RecordKind, entries: &[E]) -> Vec<u8> {
+    encode_version(kind, entries, kind.version())
+}
+
+fn encode_version<E: Entry>(kind: RecordKind, entries: &[E], version: u64) -> Vec<u8> {
     let mut e = Encoder::new(Vec::new());
     let _ = (|| -> Result<(), CborError> {
         e.map(3)?;
@@ -633,7 +673,7 @@ fn encode<E: Entry>(kind: RecordKind, entries: &[E]) -> Vec<u8> {
         e.key("entries")?;
         e.array(entries.len())?;
         for entry in entries {
-            let mut f = entry.fields();
+            let mut f = entry.fields(version);
             f.sort_by(|a, b| key_order(a.0, b.0));
             e.map(f.len())?;
             for (k, v) in &f {
@@ -646,7 +686,7 @@ fn encode<E: Entry>(kind: RecordKind, entries: &[E]) -> Vec<u8> {
             }
         }
         e.key("version")?;
-        e.uint(1)
+        e.uint(version)
     })();
     e.into_sink()
 }
@@ -670,7 +710,7 @@ fn decode<E: Entry>(kind: RecordKind, bytes: &[u8]) -> Result<Vec<E>, CborError>
         Ok(())
     })?;
     d.finish()?;
-    if !ok_kind || version != 1 {
+    if !ok_kind || !kind.reads(version) || !E::valid_for(&entries, version) {
         return Err(CborError);
     }
     if entries
@@ -680,7 +720,7 @@ fn decode<E: Entry>(kind: RecordKind, bytes: &[u8]) -> Result<Vec<E>, CborError>
         return Err(CborError);
     }
     // Exactly canonical: re-encoding reproduces the input.
-    if encode(kind, &entries) != bytes {
+    if encode_version(kind, &entries, version) != bytes {
         return Err(CborError);
     }
     Ok(entries)
@@ -697,7 +737,7 @@ pub struct RollbackEntry {
 
 impl Entry for RollbackEntry {
     const KEYS: &'static [&'static str] = &["vault_id", "generation"];
-    fn fields(&self) -> Vec<(&'static str, V)> {
+    fn fields(&self, _version: u64) -> Vec<(&'static str, V)> {
         vec![
             ("vault_id", V::B(self.vault_id.to_vec())),
             ("generation", V::U(self.generation)),
@@ -852,7 +892,7 @@ impl Entry for PartialEntry {
         "created_at",
         "transfer_id",
     ];
-    fn fields(&self) -> Vec<(&'static str, V)> {
+    fn fields(&self, _version: u64) -> Vec<(&'static str, V)> {
         let mut f = Vec::new();
         id_fields(&self.file, &mut f);
         f.push(("vault_id", V::B(self.vault_id.to_vec())));
@@ -924,6 +964,31 @@ pub struct CardEntry {
     pub created_at: u64,
     /// The card file.
     pub file: RecordedFile,
+    /// Paper (temporary print artifact) or digital (the owner's permanent
+    /// file); version 2 (SI-52 R7). Version 1 entries are paper.
+    pub delivery: Delivery,
+    /// The vault folder (7.2 native encoding); version 2. Absent in entries
+    /// migrated from version 1; always present for digital entries.
+    pub vault_path: Option<Vec<u8>>,
+}
+
+/// How a card set is delivered (SI-52).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Printed; the card files are deleted after the commit.
+    Paper,
+    /// The card files are the deliverable and are never deleted after a
+    /// restart or a commit.
+    Digital,
+}
+
+impl Delivery {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Paper => "paper",
+            Self::Digital => "digital",
+        }
+    }
 }
 
 impl Entry for CardEntry {
@@ -936,10 +1001,12 @@ impl Entry for CardEntry {
         "op_id",
         "set_id",
         "id_kind",
+        "delivery",
         "vault_id",
         "created_at",
+        "vault_path",
     ];
-    fn fields(&self) -> Vec<(&'static str, V)> {
+    fn fields(&self, version: u64) -> Vec<(&'static str, V)> {
         let mut f = Vec::new();
         id_fields(&self.file, &mut f);
         f.push(("role", V::T(self.role.as_str())));
@@ -947,12 +1014,22 @@ impl Entry for CardEntry {
         f.push(("set_id", V::B(self.set_id.to_vec())));
         f.push(("vault_id", V::B(self.vault_id.to_vec())));
         f.push(("created_at", V::U(self.created_at)));
+        if version >= 2 {
+            f.push(("delivery", V::T(self.delivery.as_str())));
+            if let Some(p) = &self.vault_path {
+                f.push(("vault_path", V::B(p.clone())));
+            }
+        }
         f
     }
     fn decode(d: &mut Decoder<'_>) -> Result<Self, CborError> {
         let mut id = IdRaw::default();
         let (mut role, mut op, mut set, mut vault, mut created) = (None, None, None, None, None);
-        d.map(Self::KEYS, 0b11_1110_1111, |d, k| {
+        let (mut delivery, mut vault_path) = (Delivery::Paper, None);
+        // `btime`, `delivery` and `vault_path` are optional here; which of
+        // the last two must be present is decided by the record version
+        // through the exact re-encoding (`decode`) and `valid_for`.
+        d.map(Self::KEYS, 0b0110_1110_1111, |d, k| {
             match Self::KEYS[k] {
                 "dev" => id.dev = Some(d.uint()?),
                 "ino" => id.ino = Some(d.bytes_max(16)?),
@@ -970,6 +1047,14 @@ impl Entry for CardEntry {
                 "set_id" => set = Some(*d.bytes_exact::<8>()?),
                 "id_kind" => id.kind = Some(d.text()?),
                 "vault_id" => vault = Some(*d.bytes_exact::<16>()?),
+                "delivery" => {
+                    delivery = match d.text()? {
+                        "paper" => Delivery::Paper,
+                        "digital" => Delivery::Digital,
+                        _ => return Err(CborError),
+                    }
+                }
+                "vault_path" => vault_path = Some(d.bytes_max(4096)?.to_vec()),
                 _ => created = Some(d.uint()?),
             }
             Ok(())
@@ -981,7 +1066,25 @@ impl Entry for CardEntry {
             vault_id: vault.ok_or(CborError)?,
             created_at: created.ok_or(CborError)?,
             file: id.build()?,
+            delivery,
+            vault_path,
         })
+    }
+
+    fn valid_for(entries: &[Self], version: u64) -> bool {
+        match version {
+            // Version 1 knew only paper delivery and no vault path (the
+            // re-encoding rejects the keys; this rejects defaults that
+            // could not have been written).
+            1 => entries
+                .iter()
+                .all(|e| e.delivery == Delivery::Paper && e.vault_path.is_none()),
+            // A digital entry always names its vault folder.
+            _ => entries.iter().all(|e| {
+                e.delivery == Delivery::Paper
+                    || e.vault_path.as_ref().is_some_and(|p| !p.is_empty())
+            }),
+        }
     }
     fn sort_key(&self) -> Vec<u8> {
         let mut k = self.op_id.to_vec();

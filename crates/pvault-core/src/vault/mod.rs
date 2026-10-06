@@ -34,6 +34,7 @@ use crate::resources::{self, SystemMemory};
 use crate::secrets::{SecretBuf, SecretBytes};
 use crate::store::{self, JOURNAL, JOURNAL_TMP};
 
+pub mod discard;
 pub mod edit;
 pub mod export;
 pub mod init;

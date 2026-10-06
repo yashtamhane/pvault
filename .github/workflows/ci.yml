@@ -96,9 +96,22 @@ jobs:
           hdiutil create -quiet -size 64m -fs ExFAT -volname PVEXFAT -layout NONE "$RUNNER_TEMP/exfat.dmg"
           hdiutil attach -quiet -nobrowse -mountpoint "$RUNNER_TEMP/pvfat" "$RUNNER_TEMP/fat.dmg"
           hdiutil attach -quiet -nobrowse -mountpoint "$RUNNER_TEMP/pvexfat" "$RUNNER_TEMP/exfat.dmg"
-          mount | grep -E "pvfat|pvexfat"
+          # G1: APFS with ownership ignored (refused) and enforced (control).
+          mkdir -p "$RUNNER_TEMP/pvnoowners" "$RUNNER_TEMP/pvowners"
+          hdiutil create -quiet -size 64m -fs APFS -volname PVNOOWN "$RUNNER_TEMP/noowners.dmg"
+          hdiutil create -quiet -size 64m -fs APFS -volname PVOWN "$RUNNER_TEMP/owners.dmg"
+          hdiutil attach -quiet -nobrowse -owners off -mountpoint "$RUNNER_TEMP/pvnoowners" "$RUNNER_TEMP/noowners.dmg"
+          hdiutil attach -quiet -nobrowse -owners on -mountpoint "$RUNNER_TEMP/pvowners" "$RUNNER_TEMP/owners.dmg"
+          mount | grep -E "pvfat|pvexfat|pvnoowners|pvowners"
+          mount | grep pvnoowners | grep -q noowners
+          if mount | grep pvowners | grep -q noowners; then
+            echo "the control image is mounted with ownership ignored" >&2
+            exit 1
+          fi
           echo "PVAULT_TEST_FAT_DIR=$RUNNER_TEMP/pvfat" >> "$GITHUB_ENV"
           echo "PVAULT_TEST_EXFAT_DIR=$RUNNER_TEMP/pvexfat" >> "$GITHUB_ENV"
+          echo "PVAULT_TEST_NOOWNERS_DIR=$RUNNER_TEMP/pvnoowners" >> "$GITHUB_ENV"
+          echo "PVAULT_TEST_OWNERS_DIR=$RUNNER_TEMP/pvowners" >> "$GITHUB_ENV"
       - name: Mount disposable FAT and exFAT VHDs (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -129,7 +142,7 @@ jobs:
       - name: FAT and exFAT image scenarios
         env:
           PVAULT_TEST_REQUIRE_IMAGES: "1"
-        run: cargo test -p pvault-tests --locked --test failure_scenarios -- fat_exfat
+        run: cargo test -p pvault-tests --locked --test failure_scenarios -- fat_exfat ownership_ignored
       # Native (non-Unicode) file names, docs/M4_READINESS.md 17: on Linux
       # (byte 0xFF) and Windows (unpaired surrogate) these cases must run; a
       # skip, or a filter that matches no test, fails the step. macOS APFS
@@ -158,6 +171,8 @@ jobs:
         run: |
           hdiutil detach -quiet "$RUNNER_TEMP/pvfat" || true
           hdiutil detach -quiet "$RUNNER_TEMP/pvexfat" || true
+          hdiutil detach -quiet "$RUNNER_TEMP/pvnoowners" || true
+          hdiutil detach -quiet "$RUNNER_TEMP/pvowners" || true
 
   # Minimum supported Rust version (spec Section 12, SI-05). Must pass on all
   # three operating systems before a milestone is accepted.

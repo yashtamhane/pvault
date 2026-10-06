@@ -599,6 +599,12 @@ impl Dir {
         Ok(true)
     }
 
+    /// NTFS and ReFS enforce DACLs on every mount; FAT and exFAT, which have
+    /// none, are refused by type (O3).
+    pub(super) fn ownership_enforced(&self) -> io::Result<bool> {
+        Ok(true)
+    }
+
     /// Owner is the current user; the DACL is protected and allows only the
     /// user, SYSTEM and Administrators (`docs/M4_READINESS.md` 7.1).
     pub(super) fn is_private(&self) -> io::Result<bool> {

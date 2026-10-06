@@ -1,4 +1,4 @@
-# pvault formats (Milestones 1 to 3)
+# pvault formats (Milestones 1 to 4)
 
 Byte-level formats, written as the milestones that define them are built.
 Milestone 1 covers the key derivations of spec Section 5.1 and the chunked
@@ -6,7 +6,8 @@ stream of Section 7.7. Milestone 2 adds Shamir sharing (7.4), wraps (7.5) and
 passphrase generation and handling (7.3, SI-51). Milestone 3 adds the
 deterministic-CBOR profile (4.4), the header (4.1, 4.2), the key-table file
 (7.8), the journal and TPM-identity tokens (8.1), and the on-disk rules for
-artifacts, locks and commits (8.1 to 8.5). All known-answer values below come from
+artifacts, locks and commits (8.1 to 8.5). Milestone 4 adds the recovery-card
+payload (7.4a) and card-file format 1 (7.4b, 7.4d). All known-answer values below come from
 `crates/pvault-core/testdata/`, which `tools/vectors/gen_vectors.py` produces
 with independent implementations and published sources. pvault never
 generates its own expected results.
@@ -269,6 +270,55 @@ zero-padded only at the tail). Python `hashlib`, independent integer bit
 extraction and Python `qrcode` 8.2 generate the expected values; pvault code
 is not used.
 
+### Card-file format 1 (spec 7.4b, 7.4d; SI-52 Q4)
+
+A card file is the exact byte output below, for one payload and one creation
+date. ASCII only, LF line endings, no byte-order mark, no other content. Any
+change to these bytes is a new format number; readers keep every earlier
+format.
+
+With `w` the QR width in modules (from the QR rules above), `q = (w + 8) * 4`,
+`x = q + 24`, page width `W = x + 560` and page height `H = max(q, 330)`:
+
+```text
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="W" height="H" viewBox="0 0 W H">
+<rect width="W" height="H" fill="#fff"/>
+<path fill="#000" d="PATH"/>
+<text x="x" y="40" font-family="monospace" font-size="22">pvault recovery card: ROLE</text>
+<text x="x" y="72" font-family="monospace" font-size="14">Vault ID: VAULT</text>
+<text x="x" y="96" font-family="monospace" font-size="14">Card set: SET</text>
+<text x="x" y="120" font-family="monospace" font-size="14">Created: DATE</text>
+<text x="x" y="154" font-family="monospace" font-size="16">LINE 1</text>
+... one line per 32 Base32 symbols, y increasing by 26 ...
+</svg>
+```
+
+- Numbers are decimal without leading zeros or signs.
+- `PATH` has one `M{X} {Y}h4v4h-4z` for every dark module, in row-major
+  order (top row first, left to right), with `X = (column + 4) * 4` and
+  `Y = (row + 4) * 4`: a four-module quiet zone of four units each.
+- `ROLE` is `Card A` (`share_x` = 1), `Card B` (2) or `Bound card` (bound).
+  `VAULT` and `SET` are the payload's `vault_id` and `card_set_id` in
+  lowercase hex.
+- `DATE` is `YYYY-MM-DD` (ASCII digits). It is a label outside the payload:
+  it is not authenticated, and a file with another well-formed date is
+  another valid rendering of the same card.
+- The Base32 text of 7.4a (216 symbols) is split into lines of 32 symbols
+  (the last has 24), each written as groups of four separated by one space:
+  seven lines at `y` = 154, 180, 206, 232, 258, 284, 310.
+
+The reader (spec 7.4d) accepts a regular file of at most 65,536 bytes only
+if it is exactly this rendering of the payload its Base32 lines decode to.
+
+Vector: `testdata/pvault_card_a.svg` is the format 1 file of the
+`portable-card-a` payload in `testdata/pvault_card.txt` with the date
+`2026-01-02` (fields `file`, `file_created`, `file_len` = 19,569 and
+`file_sha256`). `tools/vectors/gen_vectors.py` writes it from this layout and
+the Python `qrcode` matrix; pvault code is not used. The Rust test renders the
+same payload and date and compares every byte, and reads the file back to the
+same payload.
+
 ## Custom-passphrase estimator protocol (SI-51)
 
 The parent re-executes the pvault binary with the single argument
@@ -486,6 +536,7 @@ Vectors: `testdata/pvault_tokens.txt` (one per scope).
 | `rfc9106_argon2id.txt` | RFC 9106 Section 5.3 | 1 |
 | `xchacha20_draft.txt` | draft-irtf-cfrg-xchacha-03 Appendix A.3.2.1 (XChaCha20, counter 0) | 1 |
 | `pvault_card.txt` | Independent Python payload/Base32 plus `qrcode` 8.2 byte-mode/M module matrix | 1 |
+| `pvault_card_a.svg` | Card-file format 1 of the `pvault_card.txt` payload, rendered by the same script from the documented layout | 1 file |
 | `unicode/NormalizationTest-17.0.0.txt` | Unicode 17.0.0 UCD, unchanged (SHA-256 `5019ffd5…87db`) | 19,000+ lines |
 
 The Wycheproof vectors are at commit `3fa63dd0344abb611f1fb1d77e119938603ea230`.

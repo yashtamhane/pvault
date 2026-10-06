@@ -50,6 +50,20 @@ fn main() -> ExitCode {
         ),
         ("fat_exfat_images", fat_exfat_images),
         (
+            "digital_cards_through_the_cli",
+            digital_cards_through_the_cli,
+        ),
+        ("digital_crash_at_each_step", digital_crash_at_each_step),
+        #[cfg(unix)]
+        (
+            "digital_card_check_after_commit",
+            digital_card_check_after_commit,
+        ),
+        (
+            "ownership_ignored_mounts_are_refused",
+            ownership_ignored_mounts_are_refused,
+        ),
+        (
             "unverifiable_destinations_are_refused",
             unverifiable_destinations_are_refused,
         ),
@@ -286,7 +300,20 @@ impl Env {
     }
 
     fn run(&self, args: &[OsString], stdin: &[u8], failpoint: Option<&str>) -> Out {
-        let mut child = self.command(args, failpoint).spawn().unwrap();
+        self.run_env(args, stdin, failpoint, &[])
+    }
+
+    /// As `run`, with extra environment variables for the child.
+    fn run_env(
+        &self,
+        args: &[OsString],
+        stdin: &[u8],
+        failpoint: Option<&str>,
+        vars: &[(&str, &OsStr)],
+    ) -> Out {
+        let mut cmd = self.command(args, failpoint);
+        cmd.envs(vars.iter().copied());
+        let mut child = cmd.spawn().unwrap();
         let mut input = child.stdin.take().unwrap();
         let _ = input.write_all(stdin);
         drop(input);
@@ -365,6 +392,8 @@ impl Env {
             arg(&self.vault()),
             arg("--mode"),
             arg("portable"),
+            arg("--cards"),
+            arg("paper"),
             arg("--cards-dir"),
             arg(&self.cards()),
             arg("--custom"),
@@ -434,6 +463,8 @@ impl Env {
             arg(&self.vault()),
             arg("--mode"),
             arg("portable"),
+            arg("--cards"),
+            arg("paper"),
             arg("--cards-dir"),
             arg(&self.cards()),
             arg("--custom"),
@@ -711,6 +742,8 @@ fn basic_commands_and_copied_vault() {
             arg(&env.root().join("v2")),
             arg("--mode"),
             arg("bound"),
+            arg("--cards"),
+            arg("paper"),
             arg("--cards-dir"),
             arg(&env.cards()),
         ],
@@ -736,6 +769,8 @@ fn basic_commands_and_copied_vault() {
             arg(&env.root().join("v3")),
             arg("--mode"),
             arg("portable"),
+            arg("--cards"),
+            arg("paper"),
             arg("--cards-dir"),
             arg(&env.cards()),
         ],
@@ -857,6 +892,8 @@ fn png_verification_waits_for_terminal_acknowledgment() {
             arg(&env.vault()),
             arg("--mode"),
             arg("portable"),
+            arg("--cards"),
+            arg("paper"),
             arg("--cards-dir"),
             arg(&env.cards()),
             arg("--custom"),
@@ -984,6 +1021,8 @@ fn image_vault_refused(label: &str, template: &Env, base: &Path, reads: bool) {
             arg(&env.vault()),
             arg("--mode"),
             arg("portable"),
+            arg("--cards"),
+            arg("paper"),
             arg("--cards-dir"),
             arg(&env.cards()),
             arg("--custom"),
@@ -1099,6 +1138,8 @@ fn image_cards(label: &str, base: &Path) {
             arg(&env.vault()),
             arg("--mode"),
             arg("portable"),
+            arg("--cards"),
+            arg("paper"),
             arg("--cards-dir"),
             arg(&cards),
             arg("--custom"),
@@ -1112,7 +1153,16 @@ fn image_cards(label: &str, base: &Path) {
     assert!(!env.vault().exists(), "{label}: no vault folder");
     env.run(&[arg("clean-partials")], b"", None)
         .expect(0, &format!("{label}: no card file recorded"));
-    println!("    {label}: card folder refused (exit 6), nothing created");
+    // Digital: a card folder on the image is refused the same way.
+    let env = Env::new();
+    let mut args = env.digital_args(&ACK);
+    let a = args.iter().position(|x| x == "--card-a-dir").unwrap();
+    args[a + 1] = arg(&cards);
+    let out = env.run(&args, &[PW, PW, PW].concat(), None);
+    out.expect(6, &format!("{label}: digital card folder on the image"));
+    assert!(out.says("only where it can confirm"), "{}", out.stderr);
+    assert!(visible_entries(&cards).is_empty() && !env.vault().exists());
+    println!("    {label}: card folder refused (exit 6), nothing created (paper and digital)");
 }
 
 /// O2 (2026-10-06), `docs/CLI.md` 3, on the real CLI with a terminal and no
@@ -1232,6 +1282,8 @@ fn unverifiable_destinations_are_refused() {
                 arg(&env.vault()),
                 arg("--mode"),
                 arg("portable"),
+                arg("--cards"),
+                arg("paper"),
                 arg("--cards-dir"),
                 arg(&dir),
                 arg("--custom"),
@@ -1257,6 +1309,493 @@ fn unverifiable_destinations_are_refused() {
     }
     // A vault on such a place is read-only by 8.5; that is F74 (images).
     // A Windows network vault is refused by 8.5 as well (Milestone 3, Q2).
+}
+
+/// G1 (decided 2026-10-06) on real macOS volumes: APFS images attached with
+/// ownership ignored (`PVAULT_TEST_NOOWNERS_DIR`) and enforced
+/// (`PVAULT_TEST_OWNERS_DIR`), each a writable folder on the image. On the
+/// first, exports and card folders are refused (exit 6) before any secret
+/// or file, and a settings folder there is not private; the second is the
+/// control and accepts an export. Required on macOS with
+/// `PVAULT_TEST_REQUIRE_IMAGES`; Linux and Windows have no such mounts.
+fn ownership_ignored_mounts_are_refused() {
+    let dirs = (
+        std::env::var_os("PVAULT_TEST_NOOWNERS_DIR").map(PathBuf::from),
+        std::env::var_os("PVAULT_TEST_OWNERS_DIR").map(PathBuf::from),
+    );
+    let (Some(noowners), Some(owners)) = dirs else {
+        if cfg!(target_os = "macos") && std::env::var_os("PVAULT_TEST_REQUIRE_IMAGES").is_some() {
+            panic!("PVAULT_TEST_NOOWNERS_DIR and PVAULT_TEST_OWNERS_DIR are required");
+        }
+        skip_all("no ownership-ignored image mounted (macOS only)");
+        return;
+    };
+    let template = Env::new();
+    template.init(None).expect(0, "template init");
+    template
+        .add(&template.source("a", b"x"), "a", &[], None)
+        .expect(0, "add");
+    let off = tempfile::Builder::new()
+        .prefix("pv-")
+        .tempdir_in(&noowners)
+        .unwrap();
+    let on = tempfile::Builder::new()
+        .prefix("pv-")
+        .tempdir_in(&owners)
+        .unwrap();
+    // Export to the ownership-ignored volume: refused before the unlock.
+    let env = Env::copy_vault_from(&template);
+    let dest = off.path().join("out.bin");
+    let out = env.run(
+        &[arg("get"), arg(&env.vault()), arg("a"), arg(&dest)],
+        b"",
+        None,
+    );
+    out.expect(6, "export to an ownership-ignored volume");
+    assert!(out.says("ownership ignored"), "{}", out.stderr);
+    assert!(
+        visible_entries(off.path()).is_empty(),
+        "no destination file"
+    );
+    // Card folder there: refused before anything is created.
+    let mut env = Env::new();
+    env.cards_at = Some(off.path().to_path_buf());
+    let out = env.run(
+        &[
+            arg("init"),
+            arg(&env.vault()),
+            arg("--mode"),
+            arg("portable"),
+            arg("--cards"),
+            arg("paper"),
+            arg("--cards-dir"),
+            arg(off.path()),
+            arg("--custom"),
+        ],
+        b"",
+        None,
+    );
+    out.expect(6, "card folder on an ownership-ignored volume");
+    assert!(out.says("ownership ignored"), "{}", out.stderr);
+    assert!(!env.vault().exists() && visible_entries(off.path()).is_empty());
+    // A digital card folder there: refused the same way.
+    let env = Env::new();
+    let mut args = env.digital_args(&ACK);
+    let a = args.iter().position(|x| x == "--card-a-dir").unwrap();
+    args[a + 1] = arg(off.path());
+    let out = env.run(&args, &[PW, PW, PW].concat(), None);
+    out.expect(6, "digital card folder on an ownership-ignored volume");
+    assert!(out.says("ownership ignored"), "{}", out.stderr);
+    assert!(!env.vault().exists() && visible_entries(off.path()).is_empty());
+    // A settings folder there is not private.
+    let env = Env::copy_vault_from(&template);
+    let ok = env.root().join("ok.bin");
+    let mut cmd = env.command(&[arg("get"), arg(&env.vault()), arg("a"), arg(&ok)], None);
+    cmd.env("PVAULT_CONFIG_DIR", off.path().join("settings"));
+    let child = cmd.spawn().unwrap();
+    let res = child.wait_with_output().unwrap();
+    assert_eq!(
+        res.status.code(),
+        Some(6),
+        "{}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    assert!(String::from_utf8_lossy(&res.stderr).contains("is not private to you"));
+    assert!(!ok.exists());
+    // Control: the same kind of volume with ownership enforced works.
+    let env = Env::copy_vault_from(&template);
+    let good = on.path().join("out.bin");
+    env.pv("get", &["a", good.to_str().unwrap()], None)
+        .expect(0, "export to an ownership-enforced APFS volume");
+    assert_eq!(std::fs::read(&good).unwrap(), b"x");
+    // Digital cards: Card A on the enforced image, Card B on the local
+    // volume. Two volumes: no same-volume acknowledgment is needed.
+    let env = Env::new();
+    let card_a = tempfile::Builder::new()
+        .prefix("pv-")
+        .tempdir_in(&owners)
+        .unwrap();
+    let mut args = env.digital_args(&["--accept-risk", "digital-cards"]);
+    let a = args.iter().position(|x| x == "--card-a-dir").unwrap();
+    args[a + 1] = arg(card_a.path());
+    let out = env.run(&args, &[PW, PW, PW].concat(), None);
+    out.expect(0, "digital cards on two volumes");
+    assert!(!out.says("same volume"), "{}", out.stderr);
+    assert_eq!(visible_entries(card_a.path()).len(), 1);
+    println!(
+        "    ownership ignored: export, card folders and settings refused; enforced: export and a digital card folder work"
+    );
+}
+
+impl Env {
+    /// Digital `init` arguments with Card A and Card B in `<root>/a` and
+    /// `<root>/b` (created), plus `extra`.
+    fn digital_args(&self, extra: &[&str]) -> Vec<OsString> {
+        for d in ["a", "b"] {
+            let _ = std::fs::create_dir(self.root().join(d));
+        }
+        let mut args = vec![
+            arg("init"),
+            arg(&self.vault()),
+            arg("--mode"),
+            arg("portable"),
+            arg("--cards"),
+            arg("digital"),
+            arg("--card-a-dir"),
+            arg(&self.root().join("a")),
+            arg("--card-b-dir"),
+            arg(&self.root().join("b")),
+            arg("--custom"),
+        ];
+        args.extend(FAST.iter().map(arg));
+        args.extend(extra.iter().map(arg));
+        args
+    }
+
+    /// The files in `<root>/a` and `<root>/b`.
+    fn digital_files(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = ["a", "b"]
+            .iter()
+            .flat_map(|d| {
+                std::fs::read_dir(self.root().join(d))
+                    .map(|r| r.map(|e| e.unwrap().path()).collect::<Vec<_>>())
+                    .unwrap_or_default()
+            })
+            .collect();
+        v.sort();
+        v
+    }
+}
+
+const ACK: [&str; 4] = [
+    "--accept-risk",
+    "digital-cards",
+    "--accept-risk",
+    "same-volume",
+];
+
+/// SI-52 F95 and F100 through the real CLI: digital `init` reads exactly
+/// three lines and asks for no printing acknowledgment; missing
+/// acknowledgments, the same folder and mixed options are refused before
+/// anything is read or created; everyday commands take no card files.
+fn digital_cards_through_the_cli() {
+    let env = Env::new();
+    let out = env.run(&env.digital_args(&[]), &[PW, PW, PW].concat(), None);
+    out.expect(4, "no acknowledgment without a terminal");
+    assert!(out.says("--accept-risk digital-cards"), "{}", out.stderr);
+    assert!(
+        out.says("together open this vault without the passphrase"),
+        "risk text always shown"
+    );
+    assert!(!env.vault().exists() && !env.root().join("settings").exists());
+    assert!(env.digital_files().is_empty());
+    // No environment variable gives an acknowledgment.
+    let yes = OsStr::new("digital-cards");
+    let out = env.run_env(
+        &env.digital_args(&[]),
+        &[PW, PW, PW].concat(),
+        None,
+        &[
+            ("PVAULT_ACCEPT_RISK", yes),
+            ("PVAULT_CARDS", OsStr::new("digital")),
+        ],
+    );
+    out.expect(4, "environment variables are not acknowledgments");
+    assert!(!env.vault().exists() && env.digital_files().is_empty());
+    let out = env.run(
+        &env.digital_args(&["--accept-risk", "digital-cards"]),
+        &[PW, PW, PW].concat(),
+        None,
+    );
+    out.expect(4, "same volume without its acknowledgment");
+    assert!(out.says("--accept-risk same-volume"), "{}", out.stderr);
+    assert!(!env.vault().exists() && env.digital_files().is_empty());
+    // The same folder twice.
+    let mut args = env.digital_args(&ACK);
+    let b = args.iter().position(|a| a == "--card-b-dir").unwrap();
+    args[b + 1] = arg(&env.root().join("a"));
+    env.run(&args, &[PW, PW, PW].concat(), None)
+        .expect(2, "same folder");
+    // Mixed or missing options.
+    let mut mixed = env.digital_args(&ACK);
+    mixed.extend([arg("--cards-dir"), arg(&env.cards())]);
+    env.run(&mixed, b"", None)
+        .expect(2, "digital with --cards-dir");
+    let paper_with_dirs = env.run(
+        &[
+            arg("init"),
+            arg(&env.vault()),
+            arg("--mode"),
+            arg("portable"),
+            arg("--cards"),
+            arg("paper"),
+            arg("--cards-dir"),
+            arg(&env.cards()),
+            arg("--card-a-dir"),
+            arg(&env.root().join("a")),
+        ],
+        b"",
+        None,
+    );
+    paper_with_dirs.expect(2, "paper with --card-a-dir");
+    env.run(
+        &[
+            arg("init"),
+            arg(&env.vault()),
+            arg("--mode"),
+            arg("portable"),
+            arg("--cards-dir"),
+            arg(&env.cards()),
+        ],
+        b"",
+        None,
+    )
+    .expect(2, "missing --cards");
+    assert!(!env.vault().exists());
+    // A resume takes no card options.
+    env.run(
+        &[
+            arg("init"),
+            arg(&env.vault()),
+            arg("--accept-risk"),
+            arg("digital-cards"),
+        ],
+        b"",
+        None,
+    )
+    .expect(2, "card options on a resume");
+    assert!(!env.vault().exists());
+    // Success: exactly three lines.
+    let out = env.run(&env.digital_args(&ACK), &[PW, PW, PW].concat(), None);
+    out.expect(0, "digital init");
+    assert!(!out.says("Press Enter"), "no printing acknowledgment");
+    assert!(
+        !out.says("Optional check"),
+        "R5 is not offered without a terminal"
+    );
+    let files = env.digital_files();
+    assert_eq!(files.len(), 2);
+    for f in &files {
+        pvault_core::card::parse_card_file(&std::fs::read(f).unwrap()).unwrap();
+    }
+    env.run(&[arg("clean-partials")], b"", None)
+        .expect(0, "records released");
+    // Everyday commands keep the passphrase: no card-file options.
+    let card_unlock = env.run(
+        &[
+            arg("list"),
+            arg(&env.vault()),
+            arg("--card-a-file"),
+            arg(&files[0]),
+            arg("--card-b-file"),
+            arg(&files[1]),
+        ],
+        b"",
+        None,
+    );
+    card_unlock.expect(2, "no card unlock for list");
+    env.list().expect(0, "list with the passphrase");
+    assert_eq!(env.digital_files(), files, "files kept");
+    // R4: a folder under a listed sync root is warned about.
+    let env = Env::new();
+    let synced = env.root().join("home").join("Dropbox").join("a");
+    std::fs::create_dir_all(&synced).unwrap();
+    let mut args = env.digital_args(&ACK);
+    let a = args.iter().position(|x| x == "--card-a-dir").unwrap();
+    args[a + 1] = arg(&synced);
+    let home = env.root().join("home");
+    let out = env.run_env(
+        &args,
+        &[PW, PW, PW].concat(),
+        None,
+        &[("HOME", home.as_os_str())],
+    );
+    out.expect(0, "digital init under a sync root");
+    assert!(
+        out.says("usually synced to a cloud account"),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        out.says("no warning does not mean not synced"),
+        "{}",
+        out.stderr
+    );
+}
+
+/// SI-52 R5 through the real CLI on a pseudo-terminal (Unix), interactive
+/// (no `--secrets-stdin`): after "Vault created", the optional check is
+/// offered with every handle released. Enter skips it; CHECK after the
+/// card folder was removed and recreated ("ejected and re-inserted") passes;
+/// CHECK after a card file changed fails with exit 1, and the vault and both
+/// files stay.
+#[cfg(unix)]
+fn digital_card_check_after_commit() {
+    let pw = std::str::from_utf8(PW).unwrap().trim_end();
+    type Before = Option<Box<dyn FnOnce()>>;
+    let run = |env: &Env, check: &str, before: Before| {
+        let args = env.digital_args(&ACK);
+        let tty = pty::open();
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(&args)
+            .env(CHILD_ENV, "1")
+            .env("PVAULT_CONFIG_DIR", env.root().join("settings"))
+            .env_remove("PVAULT_FAILPOINT")
+            .env_remove("PVAULT_TEST_NO_TERMINAL")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        pty::make_controlling(&mut cmd, &tty.slave);
+        let child = cmd.spawn().unwrap();
+        let screen = pty::Screen::start(&tty.master);
+        let mut before = before;
+        let mut seen = 0;
+        for (prompt, reply) in [
+            ("Enter the new passphrase: ", pw),
+            ("Enter it again: ", pw),
+            ("Type your passphrase from memory: ", pw),
+            ("Type CHECK after re-inserting", check),
+        ] {
+            let deadline = Instant::now() + Duration::from_secs(180);
+            while !screen.text().contains(prompt) {
+                assert!(
+                    Instant::now() < deadline,
+                    "no prompt {prompt:?}: {}",
+                    screen.text()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            seen += 1;
+            if seen == 4
+                && let Some(f) = before.take()
+            {
+                f();
+            }
+            (&tty.master)
+                .write_all(format!("{reply}\n").as_bytes())
+                .unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        drop(tty);
+        Out {
+            code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }
+    };
+    // Enter: skipped.
+    let env = Env::new();
+    let out = run(&env, "", None);
+    out.expect(0, "skipped");
+    assert!(
+        out.says("Vault created") && out.says("The vault has already been created"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.says("Card check skipped"), "{}", out.stderr);
+    // Ejected and re-inserted, then CHECK: passes.
+    let env = Env::new();
+    let a = env.root().join("a");
+    let out = run(
+        &env,
+        "CHECK",
+        Some(Box::new(move || {
+            let saved: Vec<_> = std::fs::read_dir(&a)
+                .unwrap()
+                .map(|e| {
+                    let p = e.unwrap().path();
+                    (p.clone(), std::fs::read(&p).unwrap())
+                })
+                .collect();
+            std::fs::remove_dir_all(&a).unwrap();
+            std::fs::create_dir(&a).unwrap();
+            for (p, b) in saved {
+                std::fs::write(p, b).unwrap();
+            }
+        })),
+    );
+    out.expect(0, "check passed");
+    assert!(out.says("Card check passed"), "{}", out.stderr);
+    // A changed card file: exit 1, nothing rolled back or deleted.
+    let env = Env::new();
+    let b = env.root().join("b");
+    let out = run(
+        &env,
+        "CHECK",
+        Some(Box::new(move || {
+            let p = std::fs::read_dir(&b)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path();
+            let mut bytes = std::fs::read(&p).unwrap();
+            bytes.push(b'\n');
+            std::fs::write(p, bytes).unwrap();
+        })),
+    );
+    out.expect(1, "check failed");
+    assert!(
+        out.says("The vault was created, but the card check failed"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(env.digital_files().len(), 2, "no card file deleted");
+    env.list().expect(0, "the vault stays");
+}
+
+/// SI-52 F98: a crash at every digital step, then `pvault init <vault>`:
+/// the card files are never deleted after the restart; current cards are
+/// released, others kept and named; `clean-partials` never deletes them.
+fn digital_crash_at_each_step() {
+    let committed = ["init.committed", "init.cards-released"];
+    for fp in [
+        "init.cards-created",
+        "init.cards-registered",
+        "init.cards-written",
+        "init.rehearsed",
+        "init.committing",
+        "init.committed",
+        "init.cards-released",
+    ] {
+        let env = Env::new();
+        let out = env.run(&env.digital_args(&ACK), &[PW, PW, PW].concat(), Some(fp));
+        assert!(out.crashed(), "{fp}: {:?} {}", out.code, out.stderr);
+        let before = env.digital_files();
+        assert_eq!(before.len(), 2, "{fp}");
+        let resume = env.run(&[arg("init"), arg(&env.vault())], PW, None);
+        resume.expect(0, fp);
+        if committed.contains(&fp) {
+            assert!(
+                resume.says("Your recovery card files are"),
+                "{fp}: {}",
+                resume.stderr
+            );
+        } else if fp != "init.cards-created" {
+            assert!(resume.says("probably invalid"), "{fp}: {}", resume.stderr);
+        }
+        assert_eq!(
+            env.digital_files(),
+            before,
+            "{fp}: nothing deleted by the resume"
+        );
+        let clean = env.run(&[arg("clean-partials")], b"", None);
+        if committed.contains(&fp) || fp == "init.cards-created" {
+            clean.expect(0, fp);
+        } else {
+            clean.expect(4, fp);
+            assert!(
+                clean.says("pvault never deletes these"),
+                "{fp}: {}",
+                clean.stderr
+            );
+        }
+        assert_eq!(
+            env.digital_files(),
+            before,
+            "{fp}: nothing deleted by clean-partials"
+        );
+    }
 }
 
 /// F26 (`init`), F78: a crash at each step, then `pvault init` resumes.

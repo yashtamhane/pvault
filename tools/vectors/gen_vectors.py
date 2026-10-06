@@ -966,7 +966,62 @@ def card_record():
     ]
 
 
+CARD_FILE_DATE = "2026-01-02"
+CARD_FILE_NAME = "pvault_card_a.svg"
+
+
+def card_file_svg(record):
+    """Card-file format 1 (docs/FORMAT.md), written from the documented
+    layout: 4-unit modules, a 4-module quiet zone, the text column 24 units
+    right of the code, one text line per field, then the Base32 text in
+    lines of 32 symbols, groups of four."""
+    fields = dict(record)
+    width = int(fields["qr_width"])
+    bits = bytes.fromhex(fields["qr_bits"])
+    module, quiet = 4, 4
+    qr_size = (width + 2 * quiet) * module
+    text_x = qr_size + 24
+    page_w, page_h = text_x + 560, max(qr_size, 330)
+    out = [
+        '<?xml version="1.0" encoding="UTF-8"?>\n',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{page_w}" height="{page_h}"'
+        f' viewBox="0 0 {page_w} {page_h}">\n',
+        f'<rect width="{page_w}" height="{page_h}" fill="#fff"/>\n',
+        '<path fill="#000" d="',
+    ]
+    for i in range(width * width):
+        if bits[i // 8] >> (7 - i % 8) & 1:
+            y, x = divmod(i, width)
+            out.append(f"M{(x + quiet) * module} {(y + quiet) * module}h{module}v{module}h-{module}z")
+    out.append('"/>\n')
+    role = "Card A" if fields["share_x"] == "1" else "Card B"
+    symbols = fields["base32"]
+    lines = [(22, f"pvault recovery card: {role}"),
+             (14, f"Vault ID: {fields['vault_id']}"),
+             (14, f"Card set: {fields['set_id']}"),
+             (14, f"Created: {CARD_FILE_DATE}")]
+    base32 = [" ".join(symbols[j:j + 4] for j in range(i, min(i + 32, len(symbols)), 4))
+              for i in range(0, len(symbols), 32)]
+    y = 40
+    for n, (size, text) in enumerate(lines + [(16, b) for b in base32]):
+        if n == len(lines):
+            y += 10
+        out.append(f'<text x="{text_x}" y="{y}" font-family="monospace" font-size="{size}">{text}</text>\n')
+        y += size + 10
+    out.append("</svg>\n")
+    return "".join(out).encode("ascii")
+
+
 def write_card_vectors(out):
+    record = card_record()
+    svg = card_file_svg(record)
+    (out / CARD_FILE_NAME).write_bytes(svg)
+    record += [
+        ("file", CARD_FILE_NAME),
+        ("file_created", CARD_FILE_DATE),
+        ("file_len", str(len(svg))),
+        ("file_sha256", hashlib.sha256(svg).hexdigest()),
+    ]
     write_records(
         out / "pvault_card.txt",
         [
@@ -975,8 +1030,11 @@ def write_card_vectors(out):
             "QR byte mode, error correction M, smallest fitting version and automatic",
             "mask selection, computed independently with Python qrcode (MIT). qr_bits",
             "packs the row-major module matrix MSB-first, with zero tail padding.",
+            f"Card-file format 1 (SI-52): {CARD_FILE_NAME}, rendered by this script",
+            "from the documented layout and the qrcode matrix; file_len and",
+            "file_sha256 describe its exact bytes.",
         ],
-        [card_record()],
+        [record],
         packages=["qrcode"],
     )
 

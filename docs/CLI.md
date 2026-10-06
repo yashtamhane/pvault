@@ -64,6 +64,12 @@ is never taken as proof.
 | macOS | `apfs`, `hfs` | Local file systems that store and enforce owner and mode bits |
 | Windows | `NTFS`, `ReFS` on a local volume (8.5 Q1 to Q4) | Store and enforce the owner-only DACL pvault sets |
 
+On macOS the volume must also be mounted with ownership enforced: a volume
+with "Ignore ownership on this volume" turned on (the `noowners` mount option,
+common for external drives) reports `apfs` or `hfs` but enforces nothing, so it
+is refused like an unsupported type (decided 2026-10-06, G1). To use such a
+drive, turn the setting off in Finder (Get Info, Sharing & Permissions).
+
 Refused: FAT and exFAT (no owner or permission storage; the mount or nothing
 decides), FUSE (`fuseblk`, `fuse.*`: a user-space server decides), network
 file systems (`nfs`, `cifs`, `smbfs`, `afpfs`, `webdav`, Windows shares: the
@@ -71,6 +77,24 @@ server decides), any other or unknown type (for example `zfs`, `overlay`,
 `9p`), and any folder whose file system cannot be identified. The refusal is
 exit 6 and comes before any secret is read and before any destination file
 or record entry exists.
+
+### 1.4 Vaults on unsupported file systems (O4)
+
+A vault on a file system that pvault does not support for changes (8.5) can
+still be read (`list`, `get` to a supported destination, `status`) **only if**
+the stable file identity that the locking protocol needs is available
+(Unix: device, inode and birth time; Windows: `FILE_ID_INFO`; spec 8.1, 8.4).
+The identity and locking rules are not relaxed for reading (decided
+2026-10-06, O4).
+
+| File system holding the vault | Read-only commands | Changes |
+| --- | --- | --- |
+| macOS FAT/exFAT; Linux in-kernel `vfat`/`exfat` (birth time available) | Work | Refused (exit 6) |
+| Windows FAT/exFAT (no `FILE_ID_INFO`); FUSE such as `fuseblk` (no birth time) | Refused (exit 6), nothing changed | Refused (exit 6) |
+
+The refusal reads "This file system cannot safely store vault changes (no
+stable file identity). Copy the vault to a supported drive to change it."
+**Workaround:** copy the entire vault folder (every file, including `objects/`) to a supported local file system, then open that copy. The original folder is left unchanged.
 
 ## 2. Secrets, confirmations and the terminal
 
@@ -126,6 +150,14 @@ unread lines stay unread.
 device when one exists, also under `--secrets-stdin`. Without a terminal they
 are skipped; they are never read from standard input.
 
+**Risk acknowledgments** (digital recovery cards, SI-52; 6.1) are consent, not
+secrets. Each is given by `--accept-risk <token>` (accepted with or without a
+terminal) or by its typed phrase (`STORE CARDS DIGITALLY`, `SAME DRIVE`) on
+the terminal device. No environment variable gives one. Unlike the printing
+acknowledgment, a missing risk acknowledgment is never skipped: without the
+option and without a terminal, `init` stops (exit 4) before any secret is read
+or anything is created.
+
 **Confirmations** (typed phrases such as `ACCEPT MEDIUM PASSPHRASE` or
 `DELETE INIT LEFTOVERS 1a2b3c4d`) are not secrets, but they authorize risky
 actions. They are read **only from the terminal device**, never from standard
@@ -148,7 +180,7 @@ hidden, for verification.
 | 1 | The operation failed. Includes `Unlock failed.`, damaged data and I/O errors |
 | 2 | Usage error (unknown command or option, bad argument) |
 | 3 | The vault is in use by another pvault process |
-| 4 | Blocked until the owner acts: a pending journal, unowned leftovers, a stale export, a declined confirmation |
+| 4 | Blocked until the owner acts: a pending journal, unowned leftovers, a stale export, a declined confirmation, a missing risk acknowledgment (6.1), a `discard-card` without a terminal |
 | 5 | The outcome is uncertain: for a vault, run `fsck` (outcome unknown, durability unknown, indeterminate state, unresolved cleanup); for an export, the file was published but its durability is unconfirmed |
 | 6 | Refused by the environment: unsupported file system (for a vault change, or an export or card destination without owner-only permissions), memory policy or resource limit, no terminal for a required prompt, unusable settings folder |
 | 7 | Cancelled by the owner inside pvault: declining at a prompt that cancels (for example `ACCEPT MEDIUM PASSPHRASE`), or end of input at a hidden terminal prompt (Unix: Ctrl-D on an empty line). The Windows console delivers Ctrl-Z as the character U+001A, which is input (refused as a control character), not cancellation |
@@ -185,6 +217,15 @@ than the message.
 | `list`, `get` | ordinary unlock | yes | exclusive for the unlock, then shared |
 | `status` | none | no | shared |
 | `clean-partials` | none | no | none (7.9) |
+| `discard-card` | none; unlocks nothing (6.8) | no | shared, only with `--vault` |
+
+**Card files never unlock a vault in Milestone 4** (decided 2026-10-06, SI-52
+L1). `list`, `get`, `add` and `rm` need the passphrase as above and have no
+card-file options (`--card-a-file` and similar are usage errors, exit 2).
+Card files are read only by digital `init` (delivery and rehearsal) and by
+`discard-card` (public fields only). Passphrase-free recovery is the
+Milestone 6 `recover` command; `verify-card`, `recover` and `convert` accept
+card files from Milestone 6 (`docs/RECOVERY_DELIVERY_PROPOSAL.md` 6.2, 6.3).
 
 Not available in Milestone 4 (spec 5.7 commands of later milestones, which
 the parser does not accept yet): `recover`, `verify-card`, `convert`,
@@ -195,23 +236,34 @@ the parser does not accept yet): `recover`, `verify-card`, `convert`,
 ### 6.1 `pvault init`
 
 ```text
-pvault init <vault-dir> --mode portable --cards-dir <dir>
+pvault init <vault-dir> --mode portable --cards paper --cards-dir <dir>
+            [--card-a-png <file>] [--card-b-png <file>]
             [--words <10-16> | --custom]
             [--kdf-memory <MiB>] [--kdf-iterations <n>] [--kdf-parallelism <n>]
-            [--card-a-png <file>] [--card-b-png <file>]
+
+pvault init <vault-dir> --mode portable --cards digital
+            --card-a-dir <dir> --card-b-dir <dir>
+            [--accept-risk digital-cards] [--accept-risk same-volume]
+            [--words <10-16> | --custom]
+            [--kdf-memory <MiB>] [--kdf-iterations <n>] [--kdf-parallelism <n>]
+
+pvault init <vault-dir>          (resume; no other options)
 ```
 
 | Argument or option | Meaning |
 | --- | --- |
 | `<vault-dir>` | The vault folder. Created if absent (8.3 bootstrap); if it exists it must be empty apart from zero-length `vault.gate` / `vault.lock` |
 | `--mode portable` | Required. Milestone 4 builds portable mode only; `--mode bound` gives "Bound mode is not available in this version." (section 9, K1) |
-| `--cards-dir <dir>` | Required. An existing folder **outside** the vault for the two card files (7.4b). No default. It must be on a supported destination file system (1.3); otherwise `init` refuses (exit 6) before anything is created, the vault folder included, and before any secret is read (O3) |
+| `--cards paper\|digital` | Required for a new vault (decided 2026-10-06, SI-52 R1); no default. Missing: "--cards paper or --cards digital is required." (exit 2). **Paper:** printed cards; the card files are temporary and deleted after the commit. **Digital:** the card files are the recovery cards and are kept (below) |
+| `--cards-dir <dir>` | Paper only, required there. An existing folder **outside** the vault for the two card files (7.4b). No default. It must be on a supported destination file system (1.3); otherwise `init` refuses (exit 6) before anything is created, the vault folder included, and before any secret is read (O3) |
 | `--words <n>` | Generated passphrase of `n` words, 10 to 16. Default 12 |
 | `--custom` | The owner writes the passphrase (estimated at creation only, SI-51) |
 | `--kdf-memory <MiB>` | Argon2id memory, 256 to 4096; default 1024. Must also pass this computer's policy (≤ 50 % of RAM) and resource checks (4.3). Below 1024 prints "Lower memory makes passphrase guessing cheaper." |
 | `--kdf-iterations <n>` | Argon2id `t`, 3 to 16; default 4 |
 | `--kdf-parallelism <n>` | Argon2id `p`, 1 to 8; default 4 |
-| `--card-a-png <file>`, `--card-b-png <file>` | Verify a printed card from a PNG photo instead of typing its text. File paths are not secrets. **Needs the terminal device, also with `--secrets-stdin`** (decided 2026-10-06, O1): the photo is opened only after the printing acknowledgment on the terminal. Without a terminal: "Verifying a card from a PNG photo needs a terminal for the printing acknowledgment, also with --secrets-stdin. Nothing was written." (exit 6), before anything is created |
+| `--card-a-dir <dir>`, `--card-b-dir <dir>` | Digital only, both required. Existing folders outside the vault, not links, on supported destination file systems (1.3, O3, G1; exit 6 otherwise, before anything is created and before any secret is read), and not the same folder ("Card A and Card B cannot be saved in the same folder.", exit 2). Card A is saved in the first, Card B in the second |
+| `--accept-risk <token>` | Digital only; repeatable. `digital-cards` acknowledges the risks of digital cards; `same-volume` acknowledges both folders on one volume. Either may instead be typed on the terminal (`STORE CARDS DIGITALLY`, `SAME DRIVE`) when the option is absent. Not a secret (section 2) |
+| `--card-a-png <file>`, `--card-b-png <file>` | Paper only. Verify a printed card from a PNG photo instead of typing its text. File paths are not secrets. **Needs the terminal device, also with `--secrets-stdin`** (decided 2026-10-06, O1): the photo is opened only after the printing acknowledgment on the terminal. Without a terminal: "Verifying a card from a PNG photo needs a terminal for the printing acknowledgment, also with --secrets-stdin. Nothing was written." (exit 6), before anything is created |
 
 **Flow (new vault):**
 1. Bootstrap and preflight (8.3 steps 1 to 7): open the parent, create the folder if absent, identify the file system, create the lock files, take the lock, re-check emptiness, run the preflight. Refusals use the 8.5 and 8.4 messages. The settings folder must allow durable registration (`docs/M4_READINESS.md` 7.1); otherwise `init` refuses here, before writing anything.
@@ -227,9 +279,89 @@ pvault init <vault-dir> --mode portable --cards-dir <dir>
    - otherwise (`--secrets-stdin`): the next standard-input line is the card text.
 
    A mismatch gives "Card A does not match what was printed." Interactive verification allows **three** attempts per card (each attempt asks for the method again). Under `--secrets-stdin`, and for a `--card-*-png` file, there is exactly **one** attempt: a mismatch ends the setup, because a retry would desynchronize the input. Ending the setup rolls it back; the cards are invalid.
+6a. Recovery rehearsal (both modes, SI-52 Q1): the two delivered cards (the
+   photos or typed text of step 6; digital: the saved files) are combined
+   through the recovery path, and the header and key table about to be
+   committed must authenticate and decrypt under the recovered keys. The
+   in-memory originals are not used. A failure: "Recovering this vault from
+   the delivered cards failed, so the setup was rolled back; the cards are
+   invalid." (exit 1). Nothing is read for it.
 7. Type-back: "Type your passphrase from memory:" (hidden). Interactive: three attempts. Under `--secrets-stdin`: one line, one attempt; a mismatch rolls the setup back.
 8. Commit (8.3), then the card files are deleted through the handles kept open since they were created (`docs/M4_READINESS.md` 11), then the journal is removed.
-9. "Vault created: <vault-dir> (portable, vault ID <32 hex>). Keep Card A and Card B apart; together they can open the vault without the passphrase."
+9. "Vault created: <vault-dir> (portable, vault ID <32 hex>). Keep Card A and Card B apart; together they can recover the vault without the passphrase."
+
+**Mixing mode options** (`--cards-dir` or `--card-*-png` with `--cards
+digital`; `--card-*-dir` or `--accept-risk` with `--cards paper`; card options on
+a resume) is a usage error (exit 2) before anything is read or created.
+
+**Digital flow** (decided 2026-10-06, SI-52; `docs/RECOVERY_DELIVERY_PROPOSAL.md`).
+Before bootstrap and before any secret is read:
+1. Both folders are checked (above). The risk text is printed to standard
+   error ("Digital recovery cards: Card A and Card B together open this vault
+   without the passphrase. …"), in every case.
+2. `digital-cards`: from `--accept-risk digital-cards`, or, with a terminal,
+   the typed phrase `STORE CARDS DIGITALLY`. Otherwise: "Digital recovery
+   cards need your acknowledgment: give --accept-risk digital-cards, or type
+   STORE CARDS DIGITALLY on a terminal. Nothing was written." (exit 4).
+3. Both folders on one volume: "Card A and Card B are on the same volume
+   (<type>). … Different volumes are not proof of different devices either:
+   keep the cards on separate drives in separate places." Then
+   `same-volume`: `--accept-risk same-volume` or the typed phrase `SAME
+   DRIVE`; otherwise "Both cards on one volume need your acknowledgment: give
+   --accept-risk same-volume, or type SAME DRIVE on a terminal. Nothing was
+   written." (exit 4).
+4. Warnings without an acknowledgment: "Warning: Card A is on the same drive
+   as the vault."; for a folder under a well-known sync root (iCloud Drive,
+   `~/Library/CloudStorage`, `~/Dropbox`, the OneDrive folders): "Warning:
+   Card A's folder is inside <root>, which is usually synced to a cloud
+   account: … pvault cannot detect every synced or backed-up folder, so no
+   warning does not mean not synced."
+
+Then steps 1 to 3 of the flow below. Step 4 saves Card A in `--card-a-dir` and
+Card B in `--card-b-dir` (same file names): "Card files saved: <path A> (Card
+A), <path B> (Card B). Checking them now." There is **no printing
+acknowledgment** (step 5). Step 6 (delivery) reopens each saved file by name
+without following links, requires the file pvault created, and reads it
+through the card-file reader ("This is not an unmodified pvault card file
+(format 1)."; a changed file: "The saved Card A file changed after it was
+written; the setup was rolled back."). The recovery rehearsal and the type-back
+follow as in steps 6a and 7. After the commit (step 8) the files are **kept**
+and their records released: "Your recovery card files: <path A> (Card A) and
+<path B> (Card B). Keep them on different drives in different places; pvault
+will not delete them."
+
+**Optional card check after the commit** (decided 2026-10-06, SI-52 R5;
+proposal 6.5). Only for an **interactive** digital `init` (a terminal and no
+`--secrets-stdin`; a non-interactive `init` omits it), after "Vault created:
+…" is printed and every card-file handle, the card-operation lock and the
+vault lock are released:
+
+1. "The vault has already been created. Optional check: pvault has closed
+   the card files, so you can now eject the drives that hold them, insert
+   them again, and let pvault check that both cards read back and recover
+   the vault. A failed check changes nothing: the vault stays, and no card
+   file is deleted."
+2. On the terminal device: "Type CHECK after re-inserting the drives to
+   check the card files, or press Enter to skip:". Anything but `CHECK`:
+   "Card check skipped." (exit 0).
+3. With `CHECK`, each saved path is opened again without following links and
+   read through the card-file reader, and the two cards go through the
+   recovery rehearsal against the stored header and key table (shared vault
+   lock). Passed: "Card check passed: <path A> (Card A) and <path B> (Card B)
+   read back and recover this vault." (exit 0). Failed: "The vault was
+   created, but the card check failed: <reason> The vault is unchanged and no
+   card file was deleted. Check the drives and the card files before relying
+   on them." (**exit 1, although the vault was created**). Nothing is rolled
+   back, deleted or unregistered.
+
+A digital setup that fails **before** the commit starts is rolled back and
+both files are deleted through their handles: "The setup was rolled back;
+the card files were deleted. If you copied them anywhere, delete those
+copies: they are invalid." A failure **after** the commit started keeps both
+files: "The setup was rolled back. The card files <paths> were kept; they are
+probably invalid. pvault does not delete them now; check them with pvault
+discard-card." After a restart no command deletes a digital card file (resume
+below, 6.7, 6.8).
 
 **Non-interactive `init`** (`--secrets-stdin`; custom passphrases only). Every
 branch, with the exact lines consumed:
@@ -245,7 +377,9 @@ branch, with the exact lines consumed:
 | Type-back | The next line. One attempt | 1 |
 | End | Nothing more is read; remaining input is left unread | |
 
-Total: 3 to 5 lines. The card lines **cannot be prepared in advance**: the cards
+Total: 3 to 5 lines (paper). **Digital: exactly 3 lines** (passphrase, again,
+type-back); no card line is ever read, and there is no printing
+acknowledgment. Paper card lines **cannot be prepared in advance**: the cards
 are generated during the run. The supplier of standard input must wait for
 the "Card files written" line on standard error (or for the files), read the
 card text from the SVG files or the printouts, and only then write lines 3
@@ -257,6 +391,7 @@ back if it had started.
 committed header, 8.3 restart table):
 - With a header that matches the journal: "This vault's setup was interrupted after it was saved. Enter the passphrase to finish:" (Path A; no duress check). Then the post-commit completion.
 - Without a header: "This folder holds an interrupted setup. Enter the passphrase used for it:" (the journal's `passphrase_kind` selects the handling). Authenticated artifacts are removed, and the setup is rolled back: "The interrupted setup was removed. Run pvault init again." Unowned candidates are listed with name, file identity and size; removing them needs the terminal confirmation `DELETE INIT LEFTOVERS <first 8 hex of setup_id>`.
+- **Digital card files after a restart are never deleted.** On resume, records whose card set is the vault's current card set (authenticated header) are released: "Your recovery card files are: <paths>. Keep them on different drives in different places." Others are kept and named: "Card files of the interrupted setup (card set <16 hex>) were kept: <paths>. They are probably invalid, but pvault does not delete them after a restart; check them with pvault discard-card."
 - `--secrets-stdin` on resume: exactly one line, the passphrase. Confirmations (residue removal, stale card files) come only from the terminal device; without one they are declined and the command reports what blocks it (exit 4).
 
 ### 6.2 `pvault add`
@@ -359,6 +494,53 @@ birth time. Entries without a recorded birth time are never deleted: they are
 reported for the owner to handle, and dropped from the record only after
 confirmation. Without a terminal it only lists (exit 4 if anything is stale).
 
+**Digital card records** (SI-52 L2) are listed separately and their files are
+**never deleted**: "Digital recovery card files of interrupted setups (pvault
+never deletes these; they may be valid current cards):", one line per file
+with its role, path, card set and vault folder, then "Compare the card set with
+pvault status for that vault, or run pvault init on the vault folder.
+Forgetting the records keeps every file." The terminal confirmation `FORGET <n>
+CARD RECORDS` removes only the records. To delete a file, use `discard-card`
+(6.8).
+
+### 6.8 `pvault discard-card`
+
+```text
+pvault discard-card <card-file> [--vault <vault-dir>]
+```
+
+Deletes one recovery card file that the owner names (SI-52 8.3). pvault never
+chooses the file and unlocks nothing.
+
+1. The file is opened without following links and read through the card-file
+   reader (format 1, at most 64 KiB). Anything else is refused and nothing is
+   deleted: "This is not an unmodified pvault card file (format 1)." (exit 1).
+2. "<path> is Card A of vault <32 hex>, card set <16 hex>."
+3. With `--vault`: the vault's **public** header is read under a shared lock,
+   without any secret, and compared. The result is always labeled as not
+   verified: "Not verified: the header of <vault-dir> names this card's set as
+   its current card set." (or "names a different card set as current (this
+   card may be old)", or "names a different vault"), followed by "These header
+   fields were read without any secret; anyone who can write that folder could
+   have changed them." An unreadable header: "The header of <vault-dir> could
+   not be read; nothing is known about this card's status."
+4. Always: "pvault cannot verify whether this is a current card. Destroying a
+   current card leaves the vault recoverable only with the passphrase or with
+   another copy of this card."
+5. Confirmation on the terminal device only: `DISCARD RECOVERY CARD <first 8
+   hex of the card set>`. No option replaces it. Without a terminal: "Discarding
+   a card file needs the typed confirmation on a terminal. Nothing was
+   deleted." (exit 4); declined: "Not confirmed. Nothing was deleted." (exit 4).
+6. The file opened in step 1 is deleted through that handle; if the path now
+   names another file: "The file changed after it was read; nothing was
+   deleted." Any matching `cards.cbor` record is removed.
+7. "Deleted. Deleting a card file does not erase it from flash storage,
+   snapshots, backups, cloud history or thumbnail caches; destroy a drive that
+   held it, or replace the card set."
+
+Verified current membership needs both cards and Path B (`verify-card`,
+Milestone 6); `discard-card` does not attempt it.
+
 ## 7. Messages
 
 Existing, unchanged: every message of spec 4.3, 5.8, 7.3, 7.8, 8.4, 8.5 and the
@@ -386,10 +568,11 @@ New in Milestone 4 (wording for approval):
 | Pending journal of another kind | `This vault has an unfinished <operation>. Run fsck to finish it.` |
 | Unresolved `update` cleanup | `This vault's last change was saved, but its cleanup could not be finished because a file it needs is missing. Nothing was deleted. Run fsck.` (followed by the files not referenced by the current key table) / `Type CLOSE UNFINISHED CLEANUP <8 hex> to stop tracking it (no file is deleted):` |
 | Unowned leftovers block | `Files pvault cannot prove it created block this change: <names>. Nothing was deleted.` |
-| Card structure | `This is not a pvault recovery card.` / `This card belongs to another vault.` / `This is an old card.` / `These two cards are both Card A.` / `These two cards are both Card B.` / `The card text must have 216 characters; <n> were entered.` / `The card text contains an invalid character at position <n>.` |
+| Card structure | `This is not a pvault recovery card.` / `This card belongs to another vault.` / `This is an old card.` / `This card is for a vault of the other mode.` / `These two cards are both Card A.` / `These two cards are both Card B.` / `These two cards belong to different vaults.` / `These two cards are from different card sets.` / `This is Card B, not Card A.` / `This is Card A, not Card B.` / `The card text must have 216 characters; <n> were entered.` / `The card text contains an invalid character at position <n>.` |
 | PNG | `The image is not a PNG file.` / `The image is too large.` / `Animated PNG images are not supported.` / `No QR code was found in the image.` / `More than one QR code was found in the image.` |
 | Card destination | `Card files cannot be written inside the vault folder.` / `A file named <name> already exists in <dir>; nothing was written.` |
 | Private destinations (O3) | `pvault writes exported files and recovery cards only where it can confirm that the file system keeps them private to you (owner-only access). This destination is on <type>, which it cannot confirm. Nothing was written. Choose a folder on <suggestion>.` (exit 6; `<type>` is the reported type, or "unidentified or network file system"; the suggestion names the supported local types of 1.3) |
+| Digital cards (SI-52) | `--cards paper or --cards digital is required.` (exit 2) / `Card A and Card B cannot be saved in the same folder.` (exit 2) / `This is not an unmodified pvault card file (format 1).` / `This file is too large to be a pvault card file.` / `The saved <Card A\|Card B> file changed after it was written; the setup was rolled back.` / `Recovering this vault from the delivered cards failed, so the setup was rolled back; the cards are invalid.` / the acknowledgment, warning, rollback, resume, card check, `clean-partials` and `discard-card` texts of 6.1, 6.7 and 6.8 |
 | Card photos (O1) | `Verifying a card from a PNG photo needs a terminal for the printing acknowledgment, also with --secrets-stdin. Nothing was written.` (exit 6) |
 | Path input (`<path>` is the owner's typed path, normalized) | `<path> already exists in the vault. Use --replace to replace it.` / `<path> collides with an existing entry that differs only by letter case or Unicode form. Use pvault list to see it.` / `--replace must name the stored path exactly. Use pvault list to see it.` / `This path is not allowed in a vault: <reason>.` / `<path> contains a character this version of pvault does not support.` |
 | Source | `The source is not a regular file.` / `The source is a symbolic link or reparse point; give the file itself.` / `The source file changed while it was being added; the vault was not changed.` |
@@ -423,4 +606,5 @@ New in Milestone 4 (wording for approval):
 | K8 | none | Exit codes are not in the spec | Section 3 |
 | K11 | 7.4c, 6.4 | A photo of a newly printed card cannot exist before the cards are written; without an acknowledgment pause a non-interactive run would read it too early | Decided 2026-10-06 (O1): `--card-*-png` needs the terminal device; the photo is read after the terminal acknowledgment (6.1) |
 | K13 | 7.9, 7.4b (owner-only files) | Owner-only access can be relied on only where the local kernel enforces it; FAT/exFAT have none, FUSE and network servers decide for themselves, and an unidentified file system proves nothing | Decided 2026-10-06 (O3, fail closed): only the types of 1.3 are export and card destinations; everything else is refused (exit 6) before any secret, file or record; vaults elsewhere stay readable |
+| K14 | 7.4b (card files are temporary print artifacts) | Owners without a printer need the card files as the deliverable | Decided 2026-10-06 (SI-52, revision 4): `--cards paper\|digital` (6.1, 6.7, 6.8; spec 7.4d) |
 | K12 | 7.6a (restore on signals) | Ctrl-C was listed under exit 7, but the accepted handlers restore the terminal and then end the process natively | Decided 2026-10-06 (O2): handlers unchanged; section 3 separates native termination from cancellation (exit 7) |

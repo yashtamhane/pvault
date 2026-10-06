@@ -57,7 +57,7 @@ timing (7), every `destructive/` feature (9), K2 (10), mount (11).
 | F64 | Fresh IDs and keys; `--replace` |
 | F70 | `clean-partials` during an export and after a kill; the card half after SI-10 approval |
 | F73 | Input part (section 8) |
-| F74 | Mutations refused on an unsupported file system; read-only commands work; a portable duress match modifies nothing |
+| F74 | Mutations refused on an unsupported file system; read-only commands work where the stable identity required by the locking protocol is available, otherwise refused with exit 6 and nothing changed (narrowed, O4, 2026-10-06); a portable duress match modifies nothing |
 | F75 | Normalization and word hint with no Argon2id run |
 | F78 | Card files (section 11) |
 | F79 | Secret input rules |
@@ -221,6 +221,7 @@ Scenario tests create vaults with `--kdf-memory 256 --kdf-iterations 3
   exactly that DACL; extra entries for `SYSTEM` and `Administrators` are
   tolerated, because they can read everything anyway). Otherwise:
   "The pvault settings folder <path> is not private to you." (exit 6).
+  On macOS the folder's volume must also be mounted with ownership enforced: a mount with ownership ignored (`MNT_IGNORE_OWNERSHIP`, `noowners`) reports the current user as owner and `0700`, but enforces nothing, so the folder is not private (decided 2026-10-06, G1).
 - **Names inside the settings folder.** The folder is pvault-private (checked
   above). Inside it, pvault manages its own fixed-name record, lock and temp
   files by name, under the record lock. This is the only place where a name is
@@ -385,7 +386,18 @@ role ∈ { "card-a", "card-b", "bound" }      ("bound" reserved for Milestone 5)
 caps: ≤ 256 entries; file ≤ 2 MiB
 ```
 
-Lifecycle, stale and damaged handling: section 11.
+**Version 2 (SI-52 R7, decided 2026-10-06).** Each entry gains
+`"delivery": text` (`"paper"` or `"digital"`) and `"vault_path"?: bytes` (the
+vault folder's native path, 7.2 encoding). Version 1 entries carry neither
+and are read as paper entries. In version 2, a digital entry must carry a
+non-empty `vault_path`; paper entries written by version 2 carry it, paper
+entries migrated from version 1 do not. A record claiming version 1 with
+version 2 keys, or a digital entry without `vault_path`, fails the schema
+check (damaged, 7.2). Reading never rewrites; the first update under R writes
+the whole record as version 2 with the 7.3 atomic replacement. A newer
+version is refused unchanged (7.2). The other records keep version 1.
+
+Lifecycle, stale and damaged handling: section 11 (digital: 11.5).
 
 ### 7.7 Record tests
 
@@ -650,10 +662,54 @@ pattern.
 `init` resume offers this cleanup for entries whose `vault_id` is the
 interrupted setup's (the cards of a rolled-back setup are invalid; 7.4a).
 
+Steps 4 to 6 apply to **paper** entries only. Digital entries are listed and
+never deleted (11.5).
+
 ### 11.4 Card-record limits
 
 The 7.6 caps apply. A full record refuses a new card-writing operation before
 W1: "Too many unfinished card files are recorded. Run pvault clean-partials."
+
+### 11.5 Digital cards (SI-52, decided 2026-10-06; revision 4)
+
+`--cards digital` uses the same files, names, identity rules, locks and
+records as 11.1 to 11.4, with these differences
+(`docs/RECOVERY_DELIVERY_PROPOSAL.md` 4 to 11):
+
+- **Destinations:** Card A in `--card-a-dir`, Card B in `--card-b-dir`, each
+  opened and checked like 11.1 (not a link, outside the vault, O3 and G1),
+  not the same folder. Checked before any secret is read and again on the
+  handles after the bootstrap.
+- **W5:** no printing acknowledgment. Delivery reopens each file by name
+  without following links, requires the identity of the handle created in W2,
+  reads at most 64 KiB and parses it with the card-file reader (format 1;
+  `docs/FORMAT.md`); the payload must equal the card written. Then the
+  recovery rehearsal (proposal 6.4), then the type-back.
+- **Before the `committing` record** (any failure in W1 to W5, or a failure
+  creating the header temp): W7 and W8 run as for paper; the files are
+  deleted through their handles.
+- **From the `committing` attempt on** (a failure writing that record or
+  later): files and entries are **kept**; the setup is rolled back where it
+  can be; the message names the files as probably invalid.
+- **W7 and W8 after the commit:** no deletion. The handles are closed, the
+  entries removed, C released ("pvault will not delete them").
+- **After the commit, optional (R5, decided 2026-10-06):** an interactive
+  `init` offers the card check of proposal 6.5 once every handle and lock is
+  released; it reads only and changes nothing (`docs/CLI.md` 6.1).
+- **After a restart:** `init` resume releases digital entries whose `set_id`
+  equals the authenticated header's `card_set_id` ("Your recovery card files
+  are …") and names the others as probably invalid. Without a header,
+  nothing is released. The cleaner (11.3) lists digital entries with role,
+  path, card set and vault folder; `FORGET <n> CARD RECORDS` removes only the
+  entries. Nothing deletes a digital card file after its `init` process
+  ended except `pvault discard-card` (`docs/CLI.md` 6.8), which deletes only
+  the file the owner names, through the handle it opened and read.
+
+Failpoints for the digital steps: `init.cards-created` (W2),
+`init.cards-registered` (W3), `init.cards-written` (W4), `init.rehearsed`
+(W5), `init.committing`, `init.committed` (W6), `init.cards-released` (W7).
+`digital_crash_at_each_step` crashes the real CLI at each, then resumes and
+runs `clean-partials`: the files are never deleted.
 
 ## 12. Dependencies (for approval; nothing changed yet)
 
@@ -775,6 +831,19 @@ scratch folder. Record the Windows version, terminal and result of each step.
 | 14 | Run step 13's command where no console exists: a scheduled task running as you, with standard input from a file and output to files | Refused with "Verifying a card from a PNG photo needs a terminal …" (exit 6); neither the vault folder nor the settings folder was created |
 | 15 | Run `pvault list <vault>` in the console (no `--secrets-stdin`); at the hidden passphrase prompt press Ctrl-Z then Enter | Not a cancellation: the console delivers U+001A as a character, which is refused as input (exit 1, not 7); echo is restored. (Exit 7 at a hidden prompt is Unix end of input, Ctrl-D, tested in CI.) |
 
+Digital recovery cards (SI-52; added 2026-10-06). Use two scratch folders on
+local NTFS for Card A and Card B.
+
+| # | Step | Expected |
+| --- | --- | --- |
+| 16 | `pvault init <vault> --mode portable --cards digital --card-a-dir <a> --card-b-dir <b>` in the console, without `--accept-risk`; at "Type STORE CARDS DIGITALLY to continue:" type the phrase; at "Type SAME DRIVE …" type it | The risk text and the same-volume warning are shown; the phrases echo as typed; generated passphrase as step 1; no printing pause; the vault is created; "Your recovery card files: …"; both files remain |
+| 17 | As step 16, but type a wrong phrase at "Type STORE CARDS DIGITALLY" | Refused (exit 4); no vault folder; no card file |
+| 18 | As step 16 with `--custom`, `--secrets-stdin` and `--accept-risk digital-cards --accept-risk same-volume`, standard input from a file of exactly three lines (passphrase, again, type-back) | No phrase is asked; the vault is created; nothing else is read |
+| 19 | As step 18 without `--accept-risk`, where no console exists (a scheduled task, as step 14) | Refused (exit 4) before anything is created; no vault, settings or card file |
+| 20 | `pvault discard-card <a>\<card-a file> --vault <vault>`; read the output; type `DISCARD RECOVERY CARD <8 hex>` | "Not verified: the header of …" and "pvault cannot verify whether this is a current card …" are shown; the file is deleted; the remnants warning is shown |
+| 20a | As step 16 (interactive), with a new vault folder and `--card-a-dir` on an NTFS USB drive. After "Vault created", eject that drive ("Safely Remove"), insert it again, then type `CHECK` | The text says the vault has already been created; the drive ejects (pvault holds no handle); "Card check passed" |
+| 20b | As step 20a, but before typing `CHECK` change one byte of a card file in Notepad and save | "The vault was created, but the card check failed …" (exit 1); the vault opens with `pvault list`; no card file was deleted |
+
 The gate passes only when you record every step as expected. Until then,
 `docs/SPEC_ISSUES.md` keeps the Windows console marked unvalidated.
 
@@ -783,16 +852,26 @@ pvault-cli` (never with `fault-injection`). Use a scratch settings folder by
 setting `PVAULT_CONFIG_DIR` to an empty folder, and a scratch card folder.
 Record for each step: Windows build number, terminal (`conhost` or Windows
 Terminal), what you typed or pasted, what was shown, and the exit code.
+Every new-vault `init` in steps 1 to 15 needs `--mode portable --cards paper
+--cards-dir <scratch>\cards` (SI-52 R1; `--cards` has no default).
 
-### 14a. Printed-card photo check (manual acceptance gate; prepared, not performed)
+### 14a. Printed-card photo check (manual acceptance gate for paper cards; prepared, not performed)
+
+This gate covers paper cards only: it shows that printed cards scan from
+real photos. It is not evidence for digital cards
+(`docs/RECOVERY_DELIVERY_PROPOSAL.md`, SI-52; 11.5), whose delivery is the
+read-back of the saved files. A first attempt on 2026-10-06
+(macOS) was cancelled with Ctrl+C at the printing acknowledgment; its
+disposable folder was inspected (uncommitted setup: init journal, key table,
+two registered card files, no photos) and removed. No result was recorded.
 
 Synthetic distortions are tested in CI (section 6.1); this gate checks real
 prints and real cameras. One platform suffices.
 
 1. Build a release binary (`cargo build --release --locked -p pvault-cli`)
    and set `PVAULT_CONFIG_DIR` to an empty scratch folder.
-2. Run `pvault init <scratch>/vault --mode portable --cards-dir
-   <scratch>/cards` in a terminal (generated passphrase; interactive, so the
+2. Run `pvault init <scratch>/vault --mode portable --cards paper
+   --cards-dir <scratch>/cards` in a terminal (generated passphrase; interactive, so the
    printing acknowledgment pauses the run). The cards are generated during the
    run: do not press Enter at "Press Enter after printing." until step 4 is
    done.
@@ -950,21 +1029,109 @@ variable set it fails there, as verified locally.
   (`source_writers_are_blocked_on_windows`); Unix keeps the detection tests.
 - Linux CI: the in-kernel exFAT driver comes from `linux-modules-extra`.
 
-**Vaults without a stable file identity (open item O4).** The accepted
-vault-artifact identity (8.1) needs a birth time on Unix and `FILE_ID_INFO`
-on Windows. FUSE (`fuseblk`) has no birth time; Windows FAT and exFAT have no
+**Vaults without a stable file identity (decided 2026-10-06, O4, option 1).**
+The accepted identity and locking rules (8.1, 8.4) stay unchanged. The
+vault-artifact identity needs a birth time on Unix and `FILE_ID_INFO` on
+Windows. FUSE (`fuseblk`) has no birth time; Windows FAT and exFAT have no
 `FILE_ID_INFO` (their fallback file index is not stable across renames). No
-vault there can be locked, so none opens: every command, read-only included,
-is refused with exit 6 ("This file system cannot safely store vault changes
-(no stable file identity) …") and nothing is changed. This predates
-Milestone 4. In-kernel FAT and exFAT on Linux and macOS provide birth times,
-so read-only access to vaults there works, as F74 requires. On Windows
-FAT/exFAT and Linux FUSE, **F74's "read-only commands work" part is not
-met**; the real-image test asserts the fail-closed behavior instead.
+vault there can be locked, so every command, read-only included, is refused
+with exit 6 ("This file system cannot safely store vault changes (no stable
+file identity) …") and nothing is changed. F74 is narrowed accordingly:
+read-only commands work on otherwise unsupported file systems only where that
+identity is available (macOS FAT/exFAT and Linux in-kernel `vfat`/`exfat`,
+tested on real images). **Workaround:** copy the entire vault folder (every
+file, including `objects/`) to a supported local file system, then open that
+copy. The refusal tests on real images stay as they are (Windows FAT/exFAT
+VHDs, Linux `fuseblk`).
 
-| # | Item | Options |
+**Native CI evidence (run 37466829422, commit `4ae2254`, 2026-10-06: all 12
+jobs succeeded).** Distinct tests are counted once per platform, from the
+main `cargo test --workspace --locked` step; the "clippy + test" jobs also
+rerun tests in later steps, so their job totals are larger and are not
+distinct counts.
+
+| Platform | Distinct libtest tests: passed / failed / ignored | Distinct scenario suites (`tests/failure_scenarios.rs`) |
 | --- | --- | --- |
-| O4 | Read-only access to a vault on a file system without a stable identity (Windows FAT/exFAT, FUSE) | (a) accept as a documented limitation and narrow F74's read-only part to file systems with a stable identity; (b) allow read-only commands there without the vault lock's identity registry (a change to the accepted 8.4 lock rules) |
+| Linux (ubuntu-latest) | 227 / 0 / 6 | 12: 11 in the main step, plus `fat_exfat_images` in the image step (FAT, exFAT, `fuseblk`) |
+| macOS (macos-latest) | 226 / 0 / 6 | 12: 11, plus `fat_exfat_images` (FAT, exFAT) |
+| Windows (windows-latest) | 213 / 0 / 6 | 11: 10 (no Unix pseudo-terminal suite), plus `fat_exfat_images` (FAT32 and exFAT VHDs) |
+
+The same distinct counts passed with Rust 1.89 on all three platforms. The
+platforms differ because some tests exist only on one of them (for example
+the Unix pseudo-terminal tests, the Linux `/proc/meminfo` parser and the
+Windows DACL and locality tests).
+
+Reruns included in the "clippy + test" job totals (Linux 416, macOS 413,
+Windows 393 passed; 11 ignored each), which are **not** distinct counts:
+
+| Step | Linux | macOS | Windows | What it is |
+| --- | --- | --- | --- | --- |
+| `cargo test --workspace --locked` | 227 | 226 | 213 | The distinct tests above |
+| `cargo test --workspace --benches --locked` | 188 | 187 | 177 | Reruns `pvault-core`'s unit tests while building the benchmarks; the 8 Criterion benchmarks themselves run once in test mode and are not libtest results |
+| Windows locality probe | n/a | n/a | 2 | The two ignored-by-default probe tests, run with `--include-ignored` |
+| Native-name coverage (no skips) | 1 | n/a | 1 | A rerun of `non_unicode_native_names_export_record_and_cleanup`, plus one rerun of the `native_paths_are_rendered_safely` suite |
+
+The "skipped" entry in each main scenario step is `fat_exfat_images`, which
+needs the images mounted in a later step; that step requires them
+(`PVAULT_TEST_REQUIRE_IMAGES`) and passed on all three platforms.
+
+**G1 (decided and implemented 2026-10-06): mounts with ownership ignored.**
+On macOS a volume mounted with ownership ignored (`MNT_IGNORE_OWNERSHIP`;
+Finder's "Ignore ownership on this volume"; the `noowners` option, common for
+external drives) reports `apfs` or `hfs`, and files on it show the current
+user as owner and mode `0700`, yet nothing is enforced. Export destinations
+and card folders there are refused (exit 6) before any secret is read or
+written, and a settings folder there is not private (exit 6). Linux and
+Windows have no per-mount switch of this kind for the accepted types.
+`Dir::ownership_enforced` reads the mount flags (`fstatfs`). Tests:
+`ownership_ignored_mounts_are_refused` in `pvault-core` (mocked flag) and in
+`tests/failure_scenarios.rs` on real APFS images attached with `-owners off`
+(refused) and `-owners on` (accepted, control). The real test passed locally
+and was confirmed to fail with the check disabled; macOS CI attaches the same
+images and requires the test.
+
+**SI-52, paper or digital recovery cards (revision 4; implemented in
+Milestone 4, 2026-10-06; native CI not yet run).** Design:
+`docs/RECOVERY_DELIVERY_PROPOSAL.md`; summary: spec 7.4d; commands:
+`docs/CLI.md` 6.1, 6.7, 6.8; lifecycle: 11.5; record: 7.6.
+
+| Decision | Implementation | Tests (F93 to F101) |
+| --- | --- | --- |
+| R1 explicit mode | `--cards paper\|digital` required for a new vault; mixed and resume card options are usage errors | `digital_cards_through_the_cli` (scenario) |
+| R2, R3, R4 destinations | Same folder exit 2; same volume needs `same-volume`; vault-volume and non-exhaustive sync warnings; O3 and G1 for both folders | `digital_acknowledgments_and_folders`; scenario: same folder, sync root (`HOME`), digital folders on FAT/exFAT/`fuseblk` and `-owners off` APFS images refused, a `-owners on` image accepted as a second volume |
+| Acknowledgments (5, Q3) | Option or typed phrase; option also with a terminal; exit 4 without either and without a terminal, before anything; no environment variable | In process (phrases, options with a terminal); scenario (exit 4 with nothing created, environment variables ignored) |
+| Q4 reader | `card::parse_card_file`: 64 KiB bound, fixed patterns, `Card::parse`, byte-exact re-rendering | `card_file_reader_format_1`, `independent_card_file_vector` (Python-generated `testdata/pvault_card_a.svg`); the `card_parse` fuzz target now also runs the reader (an accepted file must equal the rendering of its payload and date), seeded with a card file |
+| Pair validation | `card::check_pair` (duplicate, vaults, sets, mode) and `check_portable_roles` | `pair_validation`, `rehearsal_uses_the_delivered_cards` |
+| Q1 rehearsal | `init::rehearse` from the delivered payloads (paper: photos or typed text; digital: read-back) against the candidate header MACs and `keytable.1.pv` | `rehearsal_uses_the_delivered_cards` (both modes; changed key table, replaced file, swapped roles, another vault's card) |
+| L1 revised | No card-file options on `list`, `get`, `add`, `rm` | Scenario: `list --card-a-file` exit 2 |
+| L2 retention | Deletion only in process before `committing`; kept afterwards; resume releases or labels; `clean-partials` forgets records only; `discard-card` | `digital_files_retained_after_committing`, `digital_crash_at_each_step` (7 failpoints), `discard_card_is_owner_directed` |
+| R7 records | `cards.cbor` v2, v1 read and migrated, newer refused | `card_record_versions` |
+| R5 (decided 2026-10-06) | Optional check after the commit: `init` returns the saved paths; the CLI prints "Vault created", then `init::card_check_after_commit` (interactive only; `CHECK` or Enter) reopens both files by path, reads them through the strict reader and rehearses against the stored header and key table under a shared lock. A failure is `CardCheckFailed` (exit 1): nothing rolled back, deleted or unregistered | F102: `card_check_after_commit` (in process: not offered, skipped, folder removed and recreated then passed, changed, swapped and missing files failed with the vault unchanged); `digital_card_check_after_commit` (real CLI on a pseudo-terminal, Unix: skip, pass after re-creation, fail with exit 1 and the vault still opening). Both fail when the check is disabled (mutation run) |
+| Q2 (decided 2026-10-06) | Superseded: the init-journal schema and its published vectors are unchanged | Existing journal vectors unchanged |
+
+**Not implemented:** R6, the optional real-drive measurement (not a gate).
+
+The native CI evidence above is for commit `4ae2254`, before the SI-52
+implementation. Before its commit, the digital mode was validated locally
+(macOS) only, as follows.
+
+**Local validation of the SI-52 implementation (macOS 27, 2026-10-06,
+uncommitted tree):** `cargo fmt --check`; `cargo clippy --workspace
+--all-targets -D warnings` (native), and for `x86_64-pc-windows-msvc` and
+`x86_64-unknown-linux-gnu` (library and binaries, and all targets in a copy
+without the Criterion benchmark): clean. `cargo test --workspace` with Rust
+stable and 1.89 (after R5): 237 libtest tests passed, 0 failed, 6 ignored,
+plus 14 scenario suites passed and 2 skipped (they need mounted images). The
+`--benches` run (before R5) passed (197 / 0 / 5; 8 benchmarks). Real disposable images
+(`hdiutil`): FAT32, exFAT, and APFS with ownership ignored and enforced.
+`fat_exfat_images` and `ownership_ignored_mounts_are_refused` passed with
+`PVAULT_TEST_REQUIRE_IMAGES` (paper and digital card folders refused, a
+digital card folder on the enforced image accepted); `fuseblk` is Linux-only.
+`cargo deny` (product and fuzz): passed. Lockfiles unchanged. Rustdoc with
+`-D warnings`: clean. A release build with `fault-injection` is refused, and
+no failpoint name appears in the release artifacts. Fuzz smoke: 60 s per
+target, all five clean. Linux-only and Windows-only tests were type-checked
+only.
 
 **Validation not performed locally:**
 

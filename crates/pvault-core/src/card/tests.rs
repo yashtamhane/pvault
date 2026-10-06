@@ -83,6 +83,26 @@ fn independent_payload_base32_and_qr_vector() {
     assert_eq!(packed, hex_field(vector, "qr_bits"));
 }
 
+/// F93: card-file format 1 against the independent Python rendering, byte
+/// for byte; the reader returns the vector's payload.
+#[test]
+fn independent_card_file_vector() {
+    use sha2::{Digest, Sha256};
+    let vector = &records(include_str!("../../testdata/pvault_card.txt"))[0];
+    let file: &[u8] = include_bytes!("../../testdata/pvault_card_a.svg");
+    assert_eq!(field(vector, "file"), "pvault_card_a.svg");
+    assert_eq!(file.len().to_string(), field(vector, "file_len"));
+    assert_eq!(
+        Sha256::digest(file).as_slice(),
+        hex_field(vector, "file_sha256")
+    );
+    let payload = hex_field(vector, "payload");
+    let card = Card::parse(SecretBytes::take_from(&mut payload.clone()).unwrap()).unwrap();
+    let rendered = render_svg(&card, field(vector, "file_created")).unwrap();
+    assert_eq!(rendered.as_bytes(), file);
+    assert_eq!(parse_card_file(file).unwrap().payload().as_slice(), payload);
+}
+
 /// F61: invalid payloads are refused; substitutions decode.
 #[test]
 fn invalid_payloads_and_substitutions() {
@@ -168,7 +188,7 @@ fn pair_checks() {
     let secret = SecretBytes::take_from(&mut [1; SECRET_LEN]).unwrap();
     let other = shamir::split_2_of_2(&secret).unwrap();
     let foreign_set = Card::new(&[0xa1; 16], CardMode::Portable, &[0xc6; 8], &other[1]).unwrap();
-    assert_eq!(check_pair(&a, &foreign_set), Err(CardError::OldCard));
+    assert_eq!(check_pair(&a, &foreign_set), Err(CardError::DifferentSets));
 }
 
 fn lines_reader(input: &str) -> Result<SecretBytes<PAYLOAD_LEN>, CardTextError> {
@@ -530,4 +550,99 @@ fn svg_contains_labels_and_text_but_no_passphrase() {
     for line in a.base32_lines().iter() {
         assert!(svg.contains(line.as_str()));
     }
+}
+
+/// F93: the card-file reader accepts only unmodified format 1 files.
+#[test]
+fn card_file_reader_format_1() {
+    let (a, b) = sample_cards();
+    let file = render_svg(&a, "2026-10-06").unwrap();
+    let bytes = file.as_bytes();
+    let read = parse_card_file(bytes).unwrap();
+    assert_eq!(read.payload(), a.payload());
+    let other = render_svg(&b, "2026-10-06").unwrap();
+    assert_eq!(parse_card_file(other.as_bytes()).unwrap().x(), 2);
+    let not = Err(CardFileError::NotFormat1);
+    // One changed byte anywhere: in the text, the QR path, a label, the date.
+    let text_at = bytes
+        .windows(15)
+        .position(|w| w == b"font-size=\"16\">")
+        .unwrap()
+        + 16;
+    let path_at = bytes.windows(3).position(|w| w == b"d=\"").unwrap() + 10;
+    let label_at = bytes.windows(10).position(|w| w == b"Vault ID: ").unwrap() + 10;
+    let date_at = bytes.windows(9).position(|w| w == b"Created: ").unwrap() + 9;
+    for at in [text_at, path_at, label_at, 0, bytes.len() - 1] {
+        let mut changed = bytes.to_vec();
+        changed[at] = if changed[at] == b'1' { b'2' } else { b'1' };
+        assert_eq!(parse_card_file(&changed).map(|_| ()), not, "byte {at}");
+    }
+    // The creation date is a label outside the payload: a malformed date is
+    // rejected; another well-formed date is simply another valid rendering.
+    let mut bad_date = bytes.to_vec();
+    bad_date[date_at] = b'X';
+    assert_eq!(parse_card_file(&bad_date).map(|_| ()), not);
+    // A second card appended; a missing Base32 line; CRLF; a BOM; a DOCTYPE.
+    let two = [bytes, other.as_bytes()].concat();
+    assert_eq!(parse_card_file(&two).map(|_| ()), not);
+    let first_line = text_at - 16;
+    let line_end = first_line
+        + bytes[first_line..]
+            .windows(8)
+            .position(|w| w == b"</text>\n")
+            .unwrap()
+        + 8;
+    let missing = [&bytes[..first_line], &bytes[line_end..]].concat();
+    assert_eq!(parse_card_file(&missing).map(|_| ()), not);
+    let crlf = String::from_utf8(bytes.to_vec())
+        .unwrap()
+        .replace('\n', "\r\n");
+    assert_eq!(parse_card_file(crlf.as_bytes()).map(|_| ()), not);
+    let bom = [&[0xEF, 0xBB, 0xBF][..], bytes].concat();
+    assert_eq!(parse_card_file(&bom).map(|_| ()), not);
+    let decl_end = bytes.iter().position(|&c| c == b'\n').unwrap() + 1;
+    let doctype = [
+        &bytes[..decl_end],
+        b"<!DOCTYPE svg [<!ENTITY x \"y\">]>\n",
+        &bytes[decl_end..],
+    ]
+    .concat();
+    assert_eq!(parse_card_file(&doctype).map(|_| ()), not);
+    // Size limit, checked before anything else.
+    let big = vec![b' '; MAX_CARD_FILE as usize + 1];
+    assert_eq!(
+        parse_card_file(&big).map(|_| ()),
+        Err(CardFileError::TooLarge)
+    );
+    // A valid file with another date is a different, equally valid file.
+    let dated = render_svg(&a, "2027-01-02").unwrap();
+    assert!(parse_card_file(dated.as_bytes()).is_ok());
+}
+
+/// F94: pair validation, separate from the per-file check.
+#[test]
+fn pair_validation() {
+    let (a, b) = sample_cards();
+    assert!(check_pair(&a, &b).is_ok());
+    assert!(check_portable_roles(&a, &b).is_ok());
+    // The same card twice; two Card A; two Card B.
+    assert_eq!(check_pair(&a, &a), Err(CardError::Duplicate(1)));
+    assert_eq!(check_pair(&b, &b), Err(CardError::Duplicate(2)));
+    let a2 = fixed_card(1, 0x11);
+    assert_eq!(check_pair(&a, &a2), Err(CardError::Duplicate(1)));
+    // Roles in the named positions.
+    assert_eq!(check_portable_roles(&b, &a), Err(CardError::WrongRole(1)));
+    // Different vaults; different card sets.
+    let share = b.share().unwrap();
+    let other_vault = Card::new(&[0xb2; 16], CardMode::Portable, &[0xc5; 8], &share).unwrap();
+    assert_eq!(
+        check_pair(&a, &other_vault),
+        Err(CardError::DifferentVaults)
+    );
+    let other_set = Card::new(&[0xa1; 16], CardMode::Portable, &[0xd6; 8], &share).unwrap();
+    assert_eq!(check_pair(&a, &other_set), Err(CardError::DifferentSets));
+    assert_eq!(
+        CardError::DifferentSets.to_string(),
+        "These two cards are from different card sets."
+    );
 }

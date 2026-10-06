@@ -318,6 +318,27 @@ impl Dir {
         Ok(true)
     }
 
+    /// Whether the mount enforces file ownership and permissions. macOS can
+    /// mount a volume with ownership ignored (`MNT_IGNORE_OWNERSHIP`, Finder's
+    /// "Ignore ownership on this volume", the `noowners` option); every file
+    /// then appears to belong to the viewer and modes are not enforced.
+    /// Linux has no such per-mount switch for the accepted types.
+    pub(super) fn ownership_enforced(&self) -> io::Result<bool> {
+        #[cfg(target_os = "macos")]
+        {
+            let mut sf = core::mem::MaybeUninit::<libc::statfs>::uninit();
+            // SAFETY: valid fd and writable statfs buffer.
+            check(unsafe { libc::fstatfs(self.raw(), sf.as_mut_ptr()) })?;
+            // SAFETY: fstatfs succeeded.
+            let flags = unsafe { sf.assume_init() }.f_flags;
+            Ok(flags & (libc::MNT_IGNORE_OWNERSHIP as u32) == 0)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(true)
+        }
+    }
+
     /// Owned by the effective user, and no group or other permission.
     pub(super) fn is_private(&self) -> io::Result<bool> {
         let mut st = core::mem::MaybeUninit::<libc::stat>::uninit();

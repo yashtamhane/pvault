@@ -270,7 +270,19 @@ impl Dir {
     /// Whether this directory is private to the current user
     /// (`docs/M4_READINESS.md` 7.1).
     pub fn is_private(&self) -> io::Result<bool> {
-        self.inner.is_private()
+        // G1 (2026-10-06): a mount with ownership ignored keeps nothing
+        // private, whatever the reported owner and mode.
+        Ok(self.inner.is_private()? && self.ownership_enforced()?)
+    }
+
+    /// Whether the mount enforces ownership and permissions (G1). `false` on
+    /// a macOS volume mounted with ownership ignored.
+    pub fn ownership_enforced(&self) -> io::Result<bool> {
+        #[cfg(test)]
+        if tests::mocked_ownership_ignored() {
+            return Ok(false);
+        }
+        self.inner.ownership_enforced()
     }
 }
 
@@ -316,7 +328,15 @@ pub fn check_private_destination(dir: &Dir) -> Result<(), crate::Error> {
     #[cfg(test)]
     let volume = tests::mocked_volume(volume);
     match volume {
-        Ok(v) if is_private_destination_type(&v.fs_type) => Ok(()),
+        // G1 (decided 2026-10-06): an accepted type mounted with ownership
+        // ignored enforces nothing; refused before any secret is written.
+        Ok(v) if is_private_destination_type(&v.fs_type) => match dir.ownership_enforced() {
+            Ok(true) => Ok(()),
+            _ => Err(crate::Error::DestinationNotPrivate(format!(
+                "{} with ownership ignored (\"Ignore ownership on this volume\")",
+                v.fs_type
+            ))),
+        },
         Ok(v) => Err(crate::Error::DestinationNotPrivate(v.fs_type)),
         Err(_) => Err(crate::Error::DestinationNotPrivate(
             UNIDENTIFIED_FS.to_owned(),
@@ -527,6 +547,20 @@ pub(crate) mod tests {
             return Err(std::io::Error::other("mocked: unidentified"));
         }
         v.map(mocked)
+    }
+
+    thread_local! {
+        static MOCK_NO_OWNERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Makes every mount on this thread look like one with ownership ignored
+    /// (G1). `false` restores the real answer.
+    pub(crate) fn mock_ownership_ignored(on: bool) {
+        MOCK_NO_OWNERS.with(|m| m.set(on));
+    }
+
+    pub(super) fn mocked_ownership_ignored() -> bool {
+        MOCK_NO_OWNERS.with(|m| m.get())
     }
 
     pub(super) fn mocked(mut v: super::Volume) -> super::Volume {

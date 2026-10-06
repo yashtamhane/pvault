@@ -79,6 +79,12 @@ pub enum CardError {
     WrongShare,
     /// Two cards with the same x-coordinate.
     Duplicate(u8),
+    /// The two cards of a pair name different vaults.
+    DifferentVaults,
+    /// The two cards of a pair come from different card sets.
+    DifferentSets,
+    /// A card in the other role's position (the x that was expected).
+    WrongRole(u8),
 }
 
 impl fmt::Display for CardError {
@@ -92,6 +98,11 @@ impl fmt::Display for CardError {
             Self::Duplicate(1) => "These two cards are both Card A.",
             Self::Duplicate(2) => "These two cards are both Card B.",
             Self::Duplicate(_) => "These two cards are the same card.",
+            Self::DifferentVaults => "These two cards belong to different vaults.",
+            Self::DifferentSets => "These two cards are from different card sets.",
+            Self::WrongRole(1) => "This is Card B, not Card A.",
+            Self::WrongRole(2) => "This is Card A, not Card B.",
+            Self::WrongRole(_) => "This card is in the wrong role.",
         })
     }
 }
@@ -281,16 +292,128 @@ impl Card {
     }
 }
 
-/// Checks a pair of cards before any combination (7.4a): both valid for the
-/// vault, and different x-coordinates.
+/// Pair validation (SI-52 6.2a), after each card passed its own check and
+/// before any Shamir operation: no duplicate share (the same `share_x`, also
+/// one card given twice), the same vault, the same card set, the same mode.
+/// Specific messages are allowed: these are public fields (5.8).
 pub fn check_pair(a: &Card, b: &Card) -> Result<(), CardError> {
     if a.x() == b.x() {
         return Err(CardError::Duplicate(a.x()));
     }
-    if a.vault_id() != b.vault_id() || a.set_id() != b.set_id() || a.mode() != b.mode() {
-        return Err(CardError::OldCard);
+    if a.vault_id() != b.vault_id() {
+        return Err(CardError::DifferentVaults);
+    }
+    if a.set_id() != b.set_id() {
+        return Err(CardError::DifferentSets);
+    }
+    if a.mode() != b.mode() {
+        return Err(CardError::WrongMode);
     }
     Ok(())
+}
+
+/// Portable pair in named positions (Card A first, Card B second): the
+/// pair rules of [`check_pair`], then each card in its role.
+pub fn check_portable_roles(a: &Card, b: &Card) -> Result<(), CardError> {
+    check_pair(a, b)?;
+    if a.mode() != CardMode::Portable {
+        return Err(CardError::WrongMode);
+    }
+    if a.x() != 1 {
+        return Err(CardError::WrongRole(1));
+    }
+    if b.x() != 2 {
+        return Err(CardError::WrongRole(2));
+    }
+    Ok(())
+}
+
+/// Largest card file the reader accepts (format 1 files are about 20 KiB).
+pub const MAX_CARD_FILE: u64 = 64 << 10;
+
+/// Card-file reader failures (SI-52 6.1). Messages name no card content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardFileError {
+    /// Anything but an unmodified format 1 file.
+    NotFormat1,
+    /// Larger than [`MAX_CARD_FILE`].
+    TooLarge,
+}
+
+impl fmt::Display for CardFileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotFormat1 => "This is not an unmodified pvault card file (format 1).",
+            Self::TooLarge => "This file is too large to be a pvault card file.",
+        })
+    }
+}
+
+/// The creation-date label of a format 1 card file (`YYYY-MM-DD`): exactly
+/// one, well formed. A label outside the payload, never authenticated
+/// (SI-52 6.1); [`parse_card_file`] still requires the whole file to match.
+pub fn card_file_date(text: &str) -> Option<&str> {
+    const DATE: &str = "font-size=\"14\">Created: ";
+    let mut dates = text.match_indices(DATE);
+    let (at, _) = dates.next()?;
+    if dates.next().is_some() {
+        return None;
+    }
+    let date = text.get(at + DATE.len()..at + DATE.len() + 10)?;
+    let ok = date.bytes().enumerate().all(|(i, c)| {
+        if i == 4 || i == 7 {
+            c == b'-'
+        } else {
+            c.is_ascii_digit()
+        }
+    });
+    (ok && text[at + DATE.len() + 10..].starts_with("</text>")).then_some(date)
+}
+
+/// Reads one card file of format 1 (SI-52 6.1): the exact output of
+/// [`render_svg`]. Bounded scans locate the creation date and the Base32
+/// lines; nothing is rendered, no QR code is decoded, no XML is parsed and
+/// nothing external is loaded. The payload is parsed, the file is rendered
+/// again from it, and the whole file must equal that rendering byte for
+/// byte, which rejects any second card, extra or missing content, a QR code
+/// or label that disagrees with the text, CRLF, a byte-order mark and any
+/// re-save. This validates one file; pairs are [`check_pair`].
+pub fn parse_card_file(bytes: &[u8]) -> Result<Card, CardFileError> {
+    const LINE: &str = "font-size=\"16\">";
+    const END: &str = "</text>";
+    let not = CardFileError::NotFormat1;
+    if bytes.len() as u64 > MAX_CARD_FILE {
+        return Err(CardFileError::TooLarge);
+    }
+    let text = core::str::from_utf8(bytes).map_err(|_| not)?;
+    let date = card_file_date(text).ok_or(not)?;
+    let mut joined = Zeroizing::new(String::with_capacity(SYMBOLS + 64));
+    for (n, (at, _)) in text.match_indices(LINE).enumerate() {
+        if n >= MAX_TEXT_LINES {
+            return Err(not);
+        }
+        let rest = &text[at + LINE.len()..];
+        let end = rest.find(END).ok_or(not)?;
+        let content = &rest[..end];
+        if !content
+            .bytes()
+            .all(|c| c == b' ' || c.is_ascii_digit() || c.is_ascii_uppercase())
+        {
+            return Err(not);
+        }
+        if n > 0 {
+            joined.push(' ');
+        }
+        joined.push_str(content);
+    }
+    let payload = decode_base32(joined.as_bytes()).map_err(|_| not)?;
+    drop(joined);
+    let card = Card::parse(payload).map_err(|_| not)?;
+    let expected = render_svg(&card, date).map_err(|_| not)?;
+    if !bool::from(expected.as_bytes().ct_eq(bytes)) {
+        return Err(not);
+    }
+    Ok(card)
 }
 
 /// Maps one input byte to a Base32 value (`None`: a separator).
