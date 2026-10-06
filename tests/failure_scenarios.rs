@@ -960,7 +960,10 @@ fn fat_exfat_images() {
             .tempdir_in(&root)
             .unwrap();
         println!("    {label} image at {}", root.display());
-        image_vault_refused(label, &template, base.path());
+        // FUSE gives no birth time, which the accepted vault-artifact
+        // identity (8.1) needs for the lock files, so no vault there opens.
+        let reads = !label.contains("fuseblk");
+        image_vault_refused(label, &template, base.path(), reads);
         image_export(label, &template, base.path());
         image_cards(label, base.path());
     }
@@ -969,7 +972,7 @@ fn fat_exfat_images() {
 /// F74: a vault on the image: `init` refused before creating its folder; a
 /// copied vault opens read-only (list, get, status) and refuses add and rm
 /// with nothing changed.
-fn image_vault_refused(label: &str, template: &Env, base: &Path) {
+fn image_vault_refused(label: &str, template: &Env, base: &Path, reads: bool) {
     let mut env = Env::new();
     env.vault_at = Some(base.join("new-vault"));
     let out = env.run(
@@ -996,6 +999,23 @@ fn image_vault_refused(label: &str, template: &Env, base: &Path) {
     env.vault_at = Some(base.join("copied-vault"));
     copy_tree(&template.vault(), &env.vault());
     let before = tree_bytes(&env.vault());
+    if !reads {
+        // Fails closed before anything: the vault lock cannot be taken
+        // without a birth-time identity (8.1). Nothing is changed.
+        for out in [
+            env.list(),
+            env.add(&env.source("b", b"b"), "b", &[], None),
+            env.pv("rm", &["a"], None),
+        ] {
+            assert_ne!(out.code, Some(0), "{label}: {}", out.stderr);
+            assert!(!out.crashed());
+        }
+        assert_eq!(tree_bytes(&env.vault()), before, "{label}: vault unchanged");
+        println!(
+            "    {label}: vault refused; reads unsupported (no birth time for the lock identity, 8.1)"
+        );
+        return;
+    }
     let list = env.list();
     list.expect(0, &format!("{label}: list on the image"));
     assert!(list.stdout.ends_with("\ta\n"));

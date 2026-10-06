@@ -187,34 +187,50 @@ fn settings_folder_must_be_private() {
 /// 7.7: concurrent writers, each with its own handles, never lose an entry.
 #[test]
 fn concurrent_writers_never_lose_an_entry() {
+    // No lost updates: every write either completes or fails visibly with
+    // the bounded-wait refusal (7.3: a record is never waited on for more
+    // than 2 s, which heavy contention on slow flushes can exceed); every
+    // completed entry is in the record, and nothing else is.
     let (tmp, s) = settings();
     let (file, _f) = recorded(&tmp, "c.pvpartial");
     let path = s.path().to_path_buf();
+    let done = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
         for t in 0..8u8 {
-            let (path, file) = (path.clone(), file.clone());
+            let (path, file, done) = (path.clone(), file.clone(), &done);
             scope.spawn(move || {
                 let own = Settings::open_at(&path).unwrap();
                 for i in 0..10u8 {
                     let mut transfer_id = [0u8; 16];
                     transfer_id[0] = t;
                     transfer_id[1] = i;
-                    own.register_partial(PartialEntry {
+                    match own.register_partial(PartialEntry {
                         transfer_id,
                         vault_id: [4; 16],
                         created_at: 1,
                         file: file.clone(),
-                    })
-                    .unwrap();
+                    }) {
+                        Ok(()) => done.lock().unwrap().push(transfer_id),
+                        Err(Error::SettingsUnavailable(m)) if m.contains("busy") => {}
+                        Err(e) => panic!("{e:?}"),
+                    }
                 }
             });
         }
     });
-    let all = {
+    let mut done = done.into_inner().unwrap();
+    let mut all: Vec<[u8; 16]> = {
         let _r = s.record_lock(RecordKind::Partials.lock(), false).unwrap();
-        s.load::<PartialEntry>(RecordKind::Partials).unwrap()
+        s.load::<PartialEntry>(RecordKind::Partials)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.transfer_id)
+            .collect()
     };
-    assert_eq!(all.len(), 80);
+    done.sort();
+    all.sort();
+    assert!(!done.is_empty());
+    assert_eq!(all, done, "exactly the completed writes are recorded");
     std::fs::remove_dir_all(&tmp).unwrap();
 }
 

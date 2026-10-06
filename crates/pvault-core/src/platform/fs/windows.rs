@@ -786,7 +786,9 @@ pub(super) fn probe(h: HANDLE) -> Probe {
     } else if n >= buf.len() {
         Err(u32::MAX) // truncated
     } else {
-        String::from_utf16(&buf[..n]).map_err(|_| u32::MAX - 1)
+        // Native names may hold unpaired surrogates; only the ASCII
+        // `\\?\Volume{GUID}\` prefix is used, which lossy decoding keeps exact.
+        Ok(String::from_utf16_lossy(&buf[..n]))
     };
 
     // Q3: the drive type of the volume root from Q2.
@@ -967,7 +969,10 @@ fn final_path(h: HANDLE) -> io::Result<String> {
     if n == 0 || n >= buf.len() {
         return Err(io::Error::last_os_error());
     }
-    String::from_utf16(&buf[..n]).map_err(|_| io::Error::other("path is not valid UTF-16"))
+    // Native names may hold unpaired surrogates (replaced here). `contains`
+    // compares these paths: a replacement can only make two different paths
+    // look equal, which refuses (fails safe), never the reverse.
+    Ok(String::from_utf16_lossy(&buf[..n]))
 }
 
 /// FILETIME (100 ns since 1601) to `(sec, nsec)` since 1970.
@@ -1047,6 +1052,10 @@ pub(super) fn open_source(path: &Path) -> Result<File, SourceError> {
         .map_err(|e| {
             if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) {
                 SourceError::InUse
+            } else if std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+                // A directory cannot be opened without backup semantics; it
+                // is not a regular file either way (10.1).
+                SourceError::NotRegular
             } else {
                 SourceError::Io(e)
             }

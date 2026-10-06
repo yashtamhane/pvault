@@ -260,6 +260,11 @@ impl Fixture {
             for e in fs::read_dir(dir).unwrap() {
                 let e = e.unwrap();
                 let name = format!("{prefix}{}", e.file_name().to_string_lossy());
+                // Lock files are zero-length and may be locked (mandatory
+                // locks on Windows); they are not vault content.
+                if name == "vault.lock" || name == "vault.gate" {
+                    continue;
+                }
                 if e.file_type().unwrap().is_dir() {
                     walk(&e.path(), &format!("{name}/"), out);
                 } else {
@@ -693,6 +698,7 @@ fn staged_change_is_rolled_back() {
 
 /// 10.2 and 10.4: changes visible at a check point are detected; the
 /// transient case is demonstrated, not claimed.
+#[cfg(not(windows))]
 #[test]
 fn source_changes() {
     use std::io::Write;
@@ -750,6 +756,40 @@ fn source_changes() {
         Ok(_) => eprintln!("transient change: NOT detected (documented limit, 10.4)"),
         Err(e) => panic!("{e:?}"),
     }
+}
+
+/// 10.1 on Windows: the source is open with read sharing only, so no new
+/// writer can open it while pvault reads (prevention; Unix detects instead:
+/// `source_changes`).
+#[cfg(windows)]
+#[test]
+fn source_writers_are_blocked_on_windows() {
+    let f = Fixture::new().init();
+    let generation = f.generation();
+    let src = f.source("s", &vec![1u8; 300_000]);
+    // Windows (10.1): the source is open with read sharing only, so no new
+    // writer can open it while pvault reads; prevention replaces detection.
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let tried = Rc::new(Cell::new(false));
+    let seen = tried.clone();
+    edit::tests::set_after_snapshot(move |p| {
+        for e in [
+            fs::OpenOptions::new().append(true).open(p).err(),
+            fs::OpenOptions::new().write(true).open(p).err(),
+        ] {
+            assert_eq!(
+                e.and_then(|e| e.raw_os_error()),
+                Some(32),
+                "sharing violation"
+            );
+        }
+        seen.set(true);
+    });
+    let out = f.add(&src, "blocked", false).unwrap();
+    assert!(tried.get());
+    assert_eq!(out.size, 300_000, "the original content was stored");
+    assert_eq!(f.generation(), generation + 1);
 }
 
 #[test]

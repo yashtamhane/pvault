@@ -934,6 +934,28 @@ filter that runs no test, fails the step. On macOS APFS the in-process case
 skips with an explicit message (APFS refuses invalid UTF-8); with the
 variable set it fails there, as verified locally.
 
+**Found by native CI and fixed (2026-10-06, after the first push):**
+
+- Windows: folders opened relative to a handle lacked `READ_CONTROL`, so the
+  settings-folder privacy check could not read the DACL; and owner-only
+  objects created by an elevated administrator were owned by the
+  Administrators group (the default owner), so they failed the privacy
+  check. `open_dir` now requests `READ_CONTROL`, and the owner-only security
+  descriptor names the user as owner.
+- Windows: the volume probe rejected paths holding an unpaired surrogate (a
+  native name); only the ASCII volume prefix is used, now decoded lossily.
+  A directory given to `add` is reported as not a regular file.
+- Windows `add` source changes: read sharing blocks new writers while pvault
+  reads (10.1, prevention), now tested as such
+  (`source_writers_are_blocked_on_windows`); Unix keeps the detection tests.
+- Linux CI: the in-kernel exFAT driver comes from `linux-modules-extra`.
+
+**Vaults on FUSE (`fuseblk`):** no vault there can be opened, read-only
+included: the accepted vault-artifact identity (8.1) needs a birth time for
+the lock files, and FUSE provides none. This predates Milestone 4 and fails
+closed (nothing changed); the image test asserts it. In-kernel FAT and exFAT
+provide birth times, so read-only access to vaults there works.
+
 **Validation not performed locally:**
 
 - Linux-only and Windows-only tests (non-UTF-8 names on ext4, the Windows
