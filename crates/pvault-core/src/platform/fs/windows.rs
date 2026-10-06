@@ -60,7 +60,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, FileAttributeTagInfo, FileBasicInfo,
     FileIdInfo, FileRemoteProtocolInfo, FlushFileBuffers, GetDriveTypeW,
     GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
-    SYNCHRONIZE, VOLUME_NAME_GUID,
+    READ_CONTROL, SYNCHRONIZE, VOLUME_NAME_GUID,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOVABLE};
@@ -293,10 +293,12 @@ impl Dir {
     }
 
     pub(super) fn open_dir(&self, name: &OsStr) -> io::Result<Self> {
+        // READ_CONTROL: `is_private` reads the owner and DACL of this handle
+        // (`GetSecurityInfo`), as `Dir::open` (GENERIC_READ) already allows.
         let h = nt_open(
             self.root(),
             name,
-            FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE,
             FILE_OPEN,
             FILE_DIRECTORY_FILE,
         )

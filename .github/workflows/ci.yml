@@ -67,6 +67,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends dosfstools exfatprogs exfat-fuse
+          # The in-kernel exFAT driver is in linux-modules-extra on the
+          # runner's kernel; without it the step fails (no silent skip).
+          sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)"
+          sudo modprobe exfat
           truncate -s 64M "$RUNNER_TEMP/fat.img" "$RUNNER_TEMP/exfat.img" "$RUNNER_TEMP/fuse.img"
           mkfs.vfat -F 32 -n PVFAT "$RUNNER_TEMP/fat.img"
           mkfs.exfat -L PVEXFAT "$RUNNER_TEMP/exfat.img"
