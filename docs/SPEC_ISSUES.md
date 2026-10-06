@@ -2008,3 +2008,26 @@ same primitives.
   branches, Q1–Q4 locality/mapping probes, and runtime rename/delete semantics
   remain unverified until that CI runs. ReFS, mounted VHD and real remote SMB
   coverage remain separate manual gaps; no test claims power-loss safety.
+
+### 10.12 Milestone 3 acceptance
+
+**Accepted on 2026-10-05:** commit `afa6a3f` ("Accept native Windows locality result"), pushed to `main`; CI run 37391563815 green on all twelve jobs. This supersedes the "native Windows remains an acceptance gate" item in 10.11.
+
+| Job | `cargo test --workspace` passed / failed / ignored |
+| --- | --- |
+| clippy + test, ubuntu-latest (stable) | 182 / 0 / 5 (plus `--benches` rerun: 143 / 0 / 4) |
+| clippy + test, macos-latest (stable) | 181 / 0 / 5 (plus `--benches` rerun: 142 / 0 / 4) |
+| clippy + test, windows-latest (stable) | 170 / 0 / 5 (plus `--benches` rerun: 134 / 0 / 4; locality-probe step: 2 / 0 / 0) |
+| Rust 1.89 build + test, ubuntu-latest | 182 / 0 / 5 |
+| Rust 1.89 build + test, macos-latest | 181 / 0 / 5 |
+| Rust 1.89 build + test, windows-latest | 170 / 0 / 5 |
+| fuzz smoke | passed: four targets, 61 s each, no crash or error |
+| release build checks (F85) | passed: release build with `fault-injection` refused; no failpoint name in release artifacts |
+| cargo-deny 0.20.2 | passed: 0 errors; one allowed duplicate-`syn` warning |
+| Unicode table regeneration; rustfmt; swtpm smoke test | passed |
+
+- **Ignored tests:** the five per run are helper processes or explicit-only tests: `store::tests::crash_child`, `lock::tests::lock_holder_child`, `stdin_helper`, `fuzz_seeds::fuzz_seeds`, and `platform::terminal::tests::signal_helper_reads_from_pty` (Unix) or `platform::fs::tests::windows_native_locality_probe_mappings` (Windows). The mapping probe ran in the dedicated `--include-ignored` step, so no requested Windows case was skipped.
+- **Dedicated Windows locality probe** (stable windows-latest, 2 passed, 0 ignored): local NTFS temp directory accepted (NTFS); `subst` drive accepted, matching the underlying volume; loopback UNC path refused (Q2 returned error 3, no volume-GUID path); loopback-mapped SMB drive refused (same). Handle-relative create, rename and delete, the directory-replacement test and the reparse-substitution test also ran natively.
+- **Q1 did not discriminate in the observed tests:** `FileRemoteProtocolInfo` returned `ERROR_NOACCESS` (998) for the local NTFS path *and* for both loopback SMB paths. The refusals came from Q2 to Q4. Q1 currently adds no detection; the criterion still refuses unless all four queries accept.
+- **Unverified assumptions:** W1 and WO-1 to WO-3 (8.5, N1) remain unverified product assumptions about Windows power loss. Only process crashes are tested; no test claims power-loss safety on any platform.
+- **Outstanding coverage:** ReFS (dev drive), a mounted VHD and a real remote SMB server have not been probed (8.5 probe list). Until they are, the criterion fails closed for anything it does not recognize.
