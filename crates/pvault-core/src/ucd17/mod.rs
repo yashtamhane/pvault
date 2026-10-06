@@ -97,6 +97,20 @@ pub(crate) fn decompose_compatible(c: char, emit: &mut impl FnMut(char)) {
     }
 }
 
+/// Full canonical decomposition of `c` (NFD before reordering), from the
+/// same frozen tables. Used for the vault-path collision key (Milestone 4).
+pub(crate) fn decompose_canonical(c: char, emit: &mut impl FnMut(char)) {
+    let cp = u32::from(c);
+    if (S_BASE..S_BASE + S_COUNT).contains(&cp) {
+        decompose_compatible(c, emit); // Hangul is canonical and algorithmic
+        return;
+    }
+    match mapping(tables::CANON_INDEX, tables::CANON_DATA, cp) {
+        Some(cps) => emit_all(cps, emit),
+        None => emit(c),
+    }
+}
+
 /// Primary composite of `a` followed by `b`, if one exists.
 pub(crate) fn compose(a: char, b: char) -> Option<char> {
     let (a, b) = (u32::from(a), u32::from(b));
@@ -175,6 +189,11 @@ mod tests {
             let mut theirs = Vec::new();
             crate_char::decompose_compatible(c, |d| theirs.push(d));
             assert_eq!(ours, theirs, "decomposition {cp:#x}");
+            let mut ours = Vec::new();
+            decompose_canonical(c, &mut |d| ours.push(d));
+            let mut theirs = Vec::new();
+            crate_char::decompose_canonical(c, |d| theirs.push(d));
+            assert_eq!(ours, theirs, "canonical decomposition {cp:#x}");
             let private = (0xE000..=0xF8FF).contains(&cp)
                 || (0xF0000..=0xFFFFD).contains(&cp)
                 || (0x100000..=0x10FFFD).contains(&cp);

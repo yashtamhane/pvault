@@ -4,6 +4,19 @@
 
 use thiserror::Error;
 
+/// Where exports and card files can go (O3; `platform::fs::is_private_destination_type`).
+#[cfg(target_os = "macos")]
+const PRIVATE_DESTINATION_HINT: &str =
+    "a local APFS or HFS+ drive, for example in your home folder";
+#[cfg(target_os = "linux")]
+const PRIVATE_DESTINATION_HINT: &str =
+    "a local ext4, XFS, Btrfs or tmpfs file system, for example in your home folder";
+#[cfg(windows)]
+const PRIVATE_DESTINATION_HINT: &str =
+    "a local NTFS or ReFS drive, for example in your user folder";
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+const PRIVATE_DESTINATION_HINT: &str = "a supported local drive";
+
 /// Errors returned by `pvault-core`.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -144,6 +157,202 @@ pub enum Error {
     /// every file are kept.
     #[error("The vault state could not be determined safely. No cleanup was performed. Run fsck.")]
     Indeterminate,
+
+    // ---- Milestone 4 (`docs/CLI.md` 7) ----
+    /// A bound vault given to a portable-only command (F17, portable part).
+    #[error("This version of pvault opens portable vaults only; this vault is bound.")]
+    BoundVault,
+
+    /// A journal of a kind the command does not resolve.
+    #[error("This vault has an unfinished {0}. Run fsck to finish it.")]
+    PendingJournal(&'static str),
+
+    /// An `update` whose cleanup cannot be finished (`docs/M4_READINESS.md` 9.5).
+    #[error(
+        "This vault's last change was saved, but its cleanup could not be finished because a file it needs is missing. Nothing was deleted. Run fsck."
+    )]
+    UnresolvedCleanup,
+
+    /// Files at protocol names whose ownership cannot be proved (9.7).
+    #[error("Files pvault cannot prove it created block this change: {}. Nothing was deleted.", .0.join(", "))]
+    UnownedLeftovers(Vec<String>),
+
+    /// The settings folder cannot be used (7.1).
+    #[error("The pvault settings folder is unavailable: {0}.")]
+    SettingsUnavailable(String),
+
+    /// The settings folder is not private to the user (7.1).
+    #[error("The pvault settings folder {} is not private to you.", .0.display())]
+    SettingsNotPrivate(std::path::PathBuf),
+
+    /// Tracking records need an 8.5-supported local settings folder (7.1).
+    #[error("Exports and card files need a settings folder on a supported local drive ({0}).")]
+    RegistrationUnsupported(String),
+
+    /// A tracking record failed to parse; it is never modified (7.5, 7.6).
+    #[error("The record {} is damaged; pvault will not change it. Move it aside to continue (anything it tracked is then untracked).", .0.display())]
+    RecordDamaged(std::path::PathBuf),
+
+    /// A tracking record is full.
+    #[error("Too many unfinished {0} are recorded. Run pvault clean-partials.")]
+    RecordFull(&'static str),
+
+    /// A registration flush failed: no secret byte was written (7.1).
+    #[error("The {0} could not be registered durably; nothing was written.")]
+    NotRegistered(&'static str),
+
+    /// A path too long for a record.
+    #[error("This path is too long to track safely.")]
+    PathTooLongToTrack,
+
+    /// A card structure or combination error (7.4a).
+    #[error("{0}")]
+    Card(crate::card::CardError),
+
+    /// Card text input error.
+    #[error("{0}")]
+    CardText(crate::card::CardTextError),
+
+    /// PNG or QR input error (7.4c).
+    #[error("{0}")]
+    Png(crate::card::PngError),
+
+    /// A delivered card does not match the card in memory (6.4).
+    #[error("{0} does not match what was printed.")]
+    CardMismatch(&'static str),
+
+    /// An export or card-file destination whose file system pvault cannot
+    /// confirm enforces owner-only access (7.9, 7.4b; decided 2026-10-06,
+    /// O3, fail closed).
+    #[error(
+        "pvault writes exported files and recovery cards only where it can confirm that the file system keeps them private to you (owner-only access). This destination is on {0}, which it cannot confirm. Nothing was written. Choose a folder on {suggestion}.",
+        suggestion = PRIVATE_DESTINATION_HINT
+    )]
+    DestinationNotPrivate(String),
+
+    /// The card destination is the vault folder or inside it (7.4b).
+    #[error("Card files cannot be written inside the vault folder.")]
+    CardDestinationInVault,
+
+    /// A file name already exists (card or export).
+    #[error("A file named {0} already exists; nothing was written.")]
+    NameExists(String),
+
+    /// A file name is too long for the destination file system.
+    #[error("The destination name is too long to add the .pvpartial suffix on this file system.")]
+    NameTooLong,
+
+    /// A typed vault path breaks an input rule.
+    #[error("This path is not allowed in a vault: {0}.")]
+    PathNotAllowed(&'static str),
+
+    /// A typed vault path contains an unassigned code point.
+    #[error("This path contains a character this version of pvault does not support.")]
+    PathUnsupported,
+
+    /// The typed vault path exists.
+    #[error("This path already exists in the vault. Use --replace to replace it.")]
+    PathExists,
+
+    /// The typed vault path collides with another entry by case or form.
+    #[error(
+        "This path collides with an existing entry that differs only by letter case or Unicode form. Use pvault list to see it."
+    )]
+    PathCollision,
+
+    /// `--replace` must name the stored path exactly.
+    #[error("--replace must name the stored path exactly. Use pvault list to see it.")]
+    ReplaceNeedsStoredPath,
+
+    /// No entry at the vault path.
+    #[error("No file or folder with this path is in the vault.")]
+    PathNotFound,
+
+    /// A folder where a file is needed, or the reverse.
+    #[error("{0}")]
+    WrongKind(&'static str),
+
+    /// `rm` of a non-empty folder without `--recursive`.
+    #[error("This folder is not empty. Use --recursive to remove it and its contents.")]
+    FolderNotEmpty,
+
+    /// An `add` source that is not a regular file.
+    #[error("The source is not a regular file.")]
+    SourceNotRegular,
+
+    /// An `add` source whose final component is a link.
+    #[error("The source is a symbolic link or reparse point; give the file itself.")]
+    SourceLink,
+
+    /// Windows: the source is open for writing elsewhere.
+    #[error("The source file is in use by another program.")]
+    SourceInUse,
+
+    /// The source changed during `add`; rolled back.
+    #[error("The source file changed while it was being added; the vault was not changed.")]
+    SourceChanged,
+
+    /// The export destination exists.
+    #[error("The destination already exists; nothing was written.")]
+    DestinationExists,
+
+    /// The destination folder is a link.
+    #[error("The destination folder is a symbolic link or reparse point.")]
+    DestinationFolderLink,
+
+    /// A no-replace rename is unsupported at the destination.
+    #[error("This file system cannot export without overwriting safely; nothing was written.")]
+    NoReplaceUnsupported,
+
+    /// An export was published but its durability is unconfirmed (exit 5).
+    #[error("The export was written to the destination, but it could not be confirmed as durable.")]
+    ExportUnconfirmed,
+
+    /// Whether an export was published could not be determined (exit 5).
+    #[error("The export's outcome could not be determined; check the destination.")]
+    ExportOutcomeUnknown,
+
+    /// `--force` is refused in Milestone 4.
+    #[error("The --force option is not available in this version; nothing was written.")]
+    ForceRefused,
+
+    /// Two passphrase entries differ.
+    #[error("The passphrases do not match.")]
+    PassphraseMismatch,
+
+    /// A passphrase was refused by the creation rules.
+    #[error("{0}")]
+    Passphrase(crate::passphrase::PassphraseError),
+
+    /// The custom passphrase was estimated weak.
+    #[error("This passphrase is too weak. Choose a stronger one or a generated passphrase.")]
+    PassphraseWeak,
+
+    /// A required terminal is missing (generated passphrase display, or a
+    /// confirmation needed without one).
+    #[error("{0}")]
+    NeedsTerminal(&'static str),
+
+    /// Secret input failed.
+    #[error("{0}")]
+    Input(crate::input::InputError),
+
+    /// `--secrets-stdin` ended before a needed line, or its last line had
+    /// no terminator.
+    #[error("Input ended before all secrets were read.")]
+    InputEnded,
+
+    /// The owner declined or cancelled.
+    #[error("Cancelled.")]
+    Cancelled,
+
+    /// The target folder for `init` is not empty.
+    #[error("The folder is not empty; choose an empty or new folder for the vault.")]
+    TargetNotEmpty,
+
+    /// An init journal is present and must be resolved by `pvault init`.
+    #[error("This folder holds an interrupted setup. Run pvault init on it to resolve it.")]
+    InitPending,
 
     /// Reading or writing a stream failed.
     #[error("I/O error: {0}")]

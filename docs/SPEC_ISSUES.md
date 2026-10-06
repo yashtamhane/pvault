@@ -45,7 +45,7 @@ issue.
 | SI-07 | CBOR implementation | Accepted (option 2, M3) | Three options compared; secret and path handling designed (decode, storage, zeroization, errors) | 4.4, 7.6, 7.8, 10.1 | F14, F71, F73, fuzz | M3 |
 | SI-08 | Shamir implementation | Accepted (option 1); implemented in M2 | `vsss-rs = "=6.0.1"` through its public polynomial API with pvault-owned, wiped storage; no allocation inside `vsss-rs`; independent vectors | 7.4, 7.6 | F5, F6, F62 | M2 |
 | SI-09 | QR input | Accepted | `png` with bounded limits; SVG output; camera deferred | 7.4a, 7.4c, 7.6 | F47, F61 | M4 |
-| SI-10 | Card files | Accepted + Pending (design) | Explicit destination, owner-only, recorded identity, identity-checked cleanup, remnants documented (accepted); active-operation lifetime lock and cleaner rules (pending) | 7.4b | F78 | M4 |
+| SI-10 | Card files | Accepted (lifetime lock and cleaner approved for M4, A6) | Explicit destination, owner-only, recorded identity, identity-checked cleanup, remnants documented; active-operation lifetime lock and cleaner rules approved | 7.4b | F78 | M4 |
 | SI-11 | Secure file creation | Accepted + Pending (design) | FFI primitives, refuse when unsupported (accepted); `--force` exchange design and its real guarantees (pending; refused until approved) | 7.6a, 7.9 | F50, F51, proposed F90 | M4 |
 | SI-12 | Durability primitives | Accepted (M3; W1, N1) | Windows **W1 selected**: writable NTFS/ReFS under the explicit undocumented assumption, with no verified power-loss claim; remaining platform table still awaits approval | 4.3, 8.5 | F25, F26 (process crash only) | M3 |
 | SI-13 | FAT/exFAT and crash safety | Accepted (modified) | Mutations refused outside an allowlist; read-only otherwise; no redundant headers | 1, 2, 8.5 | F74 | M3 |
@@ -75,7 +75,7 @@ issue.
 | SI-37 | Object keys not rotated | Accepted (modified) | Documented; `--rekey-files` deferred | 6.11 | n/a | — |
 | SI-38 | Safe `init` | Accepted (M3; `init` built in M4) | Four authenticated phases; file-identity ownership; exact confirmation/block rules for unowned residue | 8.1, 8.3 | F26, F59, F60, F69 | M3 / M4 |
 | SI-39 | Journal schemas | Accepted | Exact schemas in 8.1; Revoke/Erase at M8 | 8.1 | F27, F71 | M3 |
-| SI-40 | Leftover files | Accepted (transition artifacts, M3) + Pending (live-vault add/rm, fsck rules: M4/M6) | Authenticated-ownership rules; add/rm reordering | 4, 8.2, 8.3 | F25, F26, proposed F89 | M3 |
+| SI-40 | Leftover files | Accepted (transition artifacts, M3; live-vault add/rm, A3/A4, M4) + Pending (fsck rules: M6) | Authenticated-ownership rules; add/rm reordering | 4, 8.2, 8.3 | F25, F26, proposed F89 | M3 |
 | SI-41 | Message table | Accepted (modified) | Table in 5.8; parse failures stay generic | 5.6, 5.8 | F7, F13, F14 | M3 |
 | SI-42 | Owner authorization and duress | Accepted + Pending (design) | `tpm-harden` removed; availability rule; checks C1 to C3 prepared, plus C4 if the SI-36 encrypted identity token is adopted | 9.3 | F75, F81 | M5 |
 | SI-43 | Erase confirmation | Accepted (modified) | Basename + vault-ID prefix; no unrelated deletion | 9.5 | F84 | M9 |
@@ -1332,7 +1332,7 @@ phrase and block cases. These are recommendations, not approvals.
 - `clean-partials` is the only spelling (7.9). It also cleans stale card records.
 - F17 is defined precisely.
 - The `partials.cbor` and `cards.cbor` path metadata is documented.
-- The rollback record (`rollback.cbor`) format, locking and limits are defined (9.7).
+- The rollback record (`rollback.cbor`) format, locking and limits are defined (9.7). *Refined 2026-10-05:* the 9.7 "map from `vault_id`" conflicts with the 4.4 text-key rule; the proposed entry-list schema is in `docs/M4_READINESS.md` section 7.4.
 - `fsck` wording for other vaults' indices: to be handled in `docs/CLI.md` (the message wording).
 - The layout gains `platform/`, `lock.rs`, `partials.rs` and `paths.rs`. `pvault-app` stays out of `default-members` until Milestone 14.
 - TPM randomness mixing is **off by default** (7.1).
@@ -1671,12 +1671,17 @@ The bound-mode TPM work (salted session, `NV_ReadPublic`, `NV_Read`) is extra an
     - N5 (decided): the 65,536-entry vault limit (files and directories); exceeding it leaves the vault unchanged.
 15. Transition artifact identities, `old_keytable_digest` and `tracking_created` (SI-35, SI-38 and SI-40 schema impact), and the revised file-identity encoding.
 
-**Before Milestone 4**
-13a. SI-30: the case-folding source for input-time collision checks (an approved crate, a vendored `CaseFolding.txt` table with a Unicode notice, or `to_lowercase`), provided the decode/input split is approved.
-13b. Windows console interactive validation (M2-F7).
-14. SI-10: approve the card-file lifetime lock and cleaner rules. Should any terminal display of card text exist?
-15. SI-11: approve the `--force` design and its stated guarantees (proposed F90). Windows `--force` stays refused.
-16. SI-47 / SI-19 / SI-41: approve `docs/CLI.md`, including `--secrets-stdin` and the message wording.
+**Before Milestone 4** (status 2026-10-05; details in `docs/M4_READINESS.md`)
+13a. SI-30: case folding and path input. **Approved:** vendored Unicode 17.0.0 canonical caseless matching, NFC input normalization and refusal of unassigned characters (M4_READINESS section 8).
+13b. Windows console interactive validation (M2-F7). **Approved as a manual acceptance gate** (checklist in M4_READINESS section 14); not yet performed.
+14. SI-10: card-file lifetime lock and cleaner. **Approved (A6):** no terminal display of card text; completed lifecycle and cleaner design in M4_READINESS section 11.
+15. SI-11: `--force`. **Decided:** refused throughout Milestone 4; the exchange design stays pending (F90).
+16. SI-47 / SI-19 / SI-41: `docs/CLI.md`, including `--secrets-stdin` and the message wording, **approved (A1)**.
+17. SI-40: the live-vault `add`/`rm` protocol. The `update` journal record and 8.4 exception in M4_READINESS section 9 are **approved (A3/A4)**. Required by F26.
+18. Per-user record schemas (`rollback.cbor`, `partials.cbor`, `cards.cbor`): the entry-list schemas in M4_READINESS section 7 are **approved (A2/A6)**.
+19. `add` source files. **Approved (A5):** regular files only; `created_at` = time added; `modified_at` from the source; exact rules in M4_READINESS section 10.
+20. Duress in Milestone 4. **Decided:** no duress setup; a duress match fails without mutation (temporary limitation).
+21. New dependencies (`qrcode`, `rqrr`, `png`, `directories`) with three crate-specific license exceptions and notices (M4_READINESS section 12) are **approved (A7)**.
 
 **Before Milestone 5**
 17. SI-18 / SI-22: approve the TPM pins, the exact public area and the salted-session design, with its trust assumptions.
@@ -2031,3 +2036,47 @@ same primitives.
 - **Q1 did not discriminate in the observed tests:** `FileRemoteProtocolInfo` returned `ERROR_NOACCESS` (998) for the local NTFS path *and* for both loopback SMB paths. The refusals came from Q2 to Q4. Q1 currently adds no detection; the criterion still refuses unless all four queries accept.
 - **Unverified assumptions:** W1 and WO-1 to WO-3 (8.5, N1) remain unverified product assumptions about Windows power loss. Only process crashes are tested; no test claims power-loss safety on any platform.
 - **Outstanding coverage:** ReFS (dev drive), a mounted VHD and a real remote SMB server have not been probed (8.5 probe list). Until they are, the criterion fails closed for anything it does not recognize.
+
+### 10.13 Milestone 4 preparation: approved directions (author, 2026-10-05)
+
+| Topic | Decision |
+| --- | --- |
+| Recovery-card text | No terminal display of card secrets. Hidden Base32 input is allowed. Secrets are never command-line arguments |
+| Vault paths at input | Vendored Unicode 17.0.0 canonical caseless matching for collisions; NFC normalization of input; refusal of unassigned characters. The approved Unicode-independent decoding of existing paths is unchanged |
+| Duress | No duress setup in Milestone 4. A duress match fails without mutation. Temporary milestone limitation, recorded in spec 5.3 and 8.3 |
+| `add` sources | Regular files only. `created_at` is the time added; `modified_at` comes from the source |
+| `--force` | Refused throughout Milestone 4 |
+| QR photos | Synthetic distortion tests, plus a manual printed-card photo check (a gate; result outstanding) |
+| Windows console | A manual checklist as an acceptance gate (prepared in `docs/M4_READINESS.md` section 14; result outstanding) |
+| Documentation | Stale text corrected (spec version, 7.3 `H_w_v1` steps, 8.5 Q1–Q4 evidence, the layout, the Milestone 4 test row, this file's section 4 and SI-50). Q1 is investigated without weakening Q2 to Q4 (M4_READINESS section 13) |
+
+Concrete designs awaiting approval: `docs/CLI.md` and `docs/M4_READINESS.md` section 15 (A1 to A7).
+
+### 10.14 Milestone 4 approvals (author, 2026-10-05)
+
+The author approved A1 to A7 of `docs/M4_READINESS.md` as revised, with:
+- `FlushConsoleInputBuffer` within the isolated terminal module (an addition to the 7.6a terminal scope);
+- exit code 5 for an export whose publication or durability is uncertain;
+- `CLOSE UNFINISHED CLEANUP <8 hex>` removing only the authenticated pending `update` journal, after explicit confirmation.
+
+| Item | Approved design |
+| --- | --- |
+| A1 | `docs/CLI.md`, including the corrected queued-input wording: pending terminal input is discarded before each hidden prompt is displayed and read, and application-side buffered input is cleared and wiped; this does not prove which prompt was visible when input was typed, and does not stop input that arrives after the flush |
+| A2 | Per-user records: settings folder, privacy check, the two storage policies (registration on 8.5-supported local settings folders, qualified by the platform flush assumptions; best effort for the rollback record), schemas, caps, identity rule |
+| A3 | The `update` journal (phases `staged`, `committing`, `cleaned`), the `add`/`rm` protocol, ownership rules, unresolved-cleanup handling, and the 8.4 exception |
+| A4 | `DELETE VAULT LEFTOVERS <8 hex>`, its candidate sets and the journal-temp exception |
+| A5 | Source-file rules and their stated limits |
+| A6 | Card-file lifecycle, cleaner and destination rules (SI-10 complete) |
+| A7 | Dependency pins and features, the crate-specific license exceptions for `rqrr` (ISC), `foldhash` (Zlib) and `option-ext` (MPL-2.0), and their notices |
+
+Manual gates accepted, results outstanding: the Windows console checklist and the printed-card photo check. Milestone 4 is accepted only after its native CI jobs and both manual gates pass.
+
+Decided 2026-10-06 (details and results in `docs/M4_READINESS.md` 17):
+
+| Item | Decision |
+| --- | --- |
+| O1 | PNG card verification during `init` needs the terminal device, also with `--secrets-stdin`; refused before anything is written without one; photos are opened only after the terminal printing acknowledgment; line counts unchanged. The test-only synchronization marker is removed; the real CLI is tested with a pseudo-terminal (Unix) and in the Windows console gate |
+| O2 | The accepted signal and console handlers stay. `docs/CLI.md` 3 distinguishes native termination (Ctrl-C, Ctrl-Break, signals, window close: the platform's status) from application cancellation (exit 7) |
+| FAT/exFAT | Real disposable-image tests (`fat_exfat_images`) in native CI on Linux, macOS and Windows; run locally on macOS images. Mocked types do not replace them |
+| Native names | Checked against the approved design (7.2, CLI 1.2): handle-relative names are native (`OsStr`) again; vault paths stay strict Unicode. Remaining restrictions come from the platform (Windows `\`, Unix `/` and NUL) or the file system (APFS rejects invalid UTF-8) |
+| O3 (2026-10-06) | Owner-only access stays required, fail closed: exported plaintext and card files go only to file systems pvault identifies as local and enforcing owner-only access in their kernel driver (Linux `ext4`, `xfs`, `btrfs`, `tmpfs`; macOS `apfs`, `hfs`; Windows local `NTFS`, `ReFS`). FAT/exFAT, FUSE (`fuseblk`), network, other, unknown and unidentifiable destinations are refused (exit 6) before any secret, destination file or record entry; vaults there stay readable. No permission-setting call is taken as proof. Table and reasons: `docs/M4_READINESS.md` 17, `docs/CLI.md` 1.3 |

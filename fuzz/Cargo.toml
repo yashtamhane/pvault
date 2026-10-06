@@ -43,3 +43,10 @@ path = "fuzz_targets/stream_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "card_parse"
+path = "fuzz_targets/card_parse.rs"
+test = false
+doc = false
+bench = false

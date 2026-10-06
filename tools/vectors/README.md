@@ -13,6 +13,7 @@ value comes from a published source or from an independent implementation:
 | `pvault_stream.txt` | Spec 7.7, computed with `cryptography` AES-GCM-SIV (OpenSSL) and `PyNaCl` XChaCha20-Poly1305 (libsodium). |
 | `pvault_gf256.txt` | GF(2^8) with 0x11B: SHA-256 of the full multiplication table and the inverse table, from Python log/antilog tables (generator 0x03). |
 | `pvault_shamir.txt` | Spec 7.4: secret, coefficients and shares at x = 1, 2, 3, from the same Python field code. Every pair is re-interpolated at x = 0 before writing. |
+| `pvault_card.txt` | Spec 7.4a: payload and Crockford Base32 from Python `hashlib` and integer bit extraction; QR byte-mode/M matrix from Python `qrcode` 8.2 (MIT), forced to one byte segment. |
 | `xchacha20_draft.txt` | Parsed from draft-irtf-cfrg-xchacha-03, Appendix A.3.2.1 (SHA-256 pinned), and re-verified with a Python HChaCha20 plus `cryptography` ChaCha20 (OpenSSL). |
 | `pvault_wrap.txt` | Spec 7.5: the same Python HChaCha20 (checked against the draft's Section 2.2.1 vector) plus OpenSSL ChaCha20, cross-checked against `PyNaCl` XChaCha20-Poly1305 (libsodium) at block counter 1. |
 | `pvault_passphrase.txt` | Spec 7.3 / SI-51 / D2: rejection sampling over the EFF list read from `assets/` (SHA-256 pinned); `H_w_v1` (unassigned refusal, NFKC, `str.casefold` full case folding, an explicit `White_Space` table) and H_c (unassigned refusal, NFC) with Python's `unicodedata` (Unicode 16.0). Inputs avoid characters whose properties changed in Unicode 17.0, which the Rust side uses. |
@@ -25,7 +26,8 @@ value comes from a published source or from an independent implementation:
 - Python 3.14.7 on macOS (arm64), in an isolated virtual environment used for
   development only.
 - Packages, pinned in `requirements.txt`: cryptography 50.0.2 (OpenSSL 4.0.3),
-  PyNaCl 1.6.2, argon2-cffi 25.1.0, argon2-cffi-bindings 26.1.0.
+  PyNaCl 1.6.2, argon2-cffi 25.1.0, argon2-cffi-bindings 26.1.0 and qrcode
+  8.2.
 
 ## Inputs
 
@@ -45,6 +47,14 @@ python3 -m venv /tmp/pvault-vectors
 /tmp/pvault-vectors/bin/pip install -r tools/vectors/requirements.txt
 /tmp/pvault-vectors/bin/python tools/vectors/gen_vectors.py \
     --wycheproof DIR --rfc DIR --out crates/pvault-core/testdata
+```
+
+To regenerate only the Milestone 4 recovery-card vector (no downloaded
+published-vector inputs are needed):
+
+```sh
+/tmp/pvault-vectors/bin/python tools/vectors/gen_vectors.py \
+    --cards-only --out crates/pvault-core/testdata
 ```
 
 The generated repository files in `crates/pvault-core/testdata/` are checked-in

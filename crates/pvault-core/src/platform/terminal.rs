@@ -13,12 +13,47 @@
 //! **Not recoverable:** SIGKILL, `TerminateProcess`, or a crash before the
 //! guard runs. These can leave echo off; the remedy is `stty sane` or
 //! `reset`, or closing the console window.
+//!
+//! **Pending input** (approved for Milestone 4, A1): before each prompt is
+//! displayed and read, pending terminal input is discarded (Unix: the
+//! `tcsetattr` call uses `TCSAFLUSH`; Windows: `FlushConsoleInputBuffer`).
+//! pvault's own buffers belong to one prompt: the Unix reader takes one byte
+//! at a time with no buffer, and the Windows console buffer is wiped when
+//! the prompt ends. This reduces the chance that stray queued lines answer a
+//! later prompt; it does not prove which prompt was visible when a line was
+//! typed, and it cannot stop input that arrives after the flush.
 
-use crate::input::{InputError, SecretLine};
+use crate::input::{ByteSource, InputError, SecretLine, read_line};
 
 /// Prompts on the terminal and reads one secret line with echo off.
 pub fn read_secret(prompt: &str) -> Result<SecretLine, InputError> {
-    imp::read_secret(prompt)
+    read_hidden(prompt, |source| read_line(source))
+}
+
+/// Prompts on the terminal with echo off, then lets `read` take as many
+/// lines as it needs from the same hidden session (for card text).
+pub fn read_hidden<T>(
+    prompt: &str,
+    read: impl FnOnce(&mut dyn ByteSource) -> Result<T, InputError>,
+) -> Result<T, InputError> {
+    imp::read_hidden(prompt, read)
+}
+
+/// Prompts on the terminal and reads one visible line (confirmations,
+/// acknowledgments, file paths). Never reads standard input.
+pub fn read_visible(prompt: &str) -> Result<String, InputError> {
+    let line = imp::read_visible(prompt)?;
+    String::from_utf8(line.as_bytes().to_vec()).map_err(|_| InputError::InvalidUtf16)
+}
+
+/// Writes text for the owner's eyes only to the terminal device.
+pub fn show(text: &str) -> Result<(), InputError> {
+    imp::show(text)
+}
+
+/// Whether a terminal device can be opened.
+pub fn has_terminal() -> bool {
+    imp::has_terminal()
 }
 
 #[cfg(unix)]
@@ -31,7 +66,7 @@ mod imp {
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering::SeqCst};
 
-    use crate::input::{InputError, SecretLine, UnbufferedSource, read_line};
+    use crate::input::{ByteSource, InputError, SecretLine, UnbufferedSource, read_line};
 
     /// Terminal settings saved before echo is turned off.
     struct Saved(UnsafeCell<MaybeUninit<libc::termios>>);
@@ -90,7 +125,9 @@ mod imp {
             quiet.c_lflag |= libc::ECHONL;
             // SAFETY: `quiet` is a valid `termios` derived from the current
             // settings of the open descriptor `fd`.
-            if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) } != 0 {
+            // TCSAFLUSH also discards input received but not yet read, so
+            // queued lines cannot answer this prompt (A1).
+            if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &quiet) } != 0 {
                 return Err(io::Error::last_os_error()); // `guard` restores on drop
             }
             Ok(guard)
@@ -154,7 +191,7 @@ mod imp {
         }
     }
 
-    pub(super) fn read_secret(prompt: &str) -> Result<SecretLine, InputError> {
+    fn open_tty() -> Result<File, InputError> {
         // SAFETY: the path is a valid NUL-terminated string. The flags do
         // not make the terminal a controlling terminal and close it on exec.
         let fd = unsafe {
@@ -167,19 +204,73 @@ mod imp {
             return Err(InputError::NoTerminal);
         }
         // SAFETY: `fd` was just opened and is owned by nothing else.
-        let tty = unsafe { File::from_raw_fd(fd) };
-        read_secret_from(&tty, prompt)
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    pub(super) fn has_terminal() -> bool {
+        open_tty().is_ok()
+    }
+
+    pub(super) fn show(text: &str) -> Result<(), InputError> {
+        let mut tty = open_tty()?;
+        tty.write_all(text.as_bytes()).map_err(InputError::Io)?;
+        tty.flush().map_err(InputError::Io)
+    }
+
+    pub(super) fn read_hidden<T>(
+        prompt: &str,
+        read: impl FnOnce(&mut dyn ByteSource) -> Result<T, InputError>,
+    ) -> Result<T, InputError> {
+        let tty = open_tty()?;
+        read_hidden_from(&tty, prompt, read)
     }
 
     /// Reads one secret from an already open terminal.
+    #[cfg(test)]
     pub(crate) fn read_secret_from(tty: &File, prompt: &str) -> Result<SecretLine, InputError> {
+        read_hidden_from(tty, prompt, |source| read_line(source))
+    }
+
+    /// Discards pending input and turns echo off (EchoOff, TCSAFLUSH), then
+    /// shows the prompt, then reads.
+    pub(crate) fn read_hidden_from<T>(
+        tty: &File,
+        prompt: &str,
+        read: impl FnOnce(&mut dyn ByteSource) -> Result<T, InputError>,
+    ) -> Result<T, InputError> {
+        let guard = EchoOff::engage(tty.as_raw_fd()).map_err(InputError::Io)?;
         let mut out = tty;
         out.write_all(prompt.as_bytes()).map_err(InputError::Io)?;
         out.flush().map_err(InputError::Io)?;
-        let guard = EchoOff::engage(tty.as_raw_fd()).map_err(InputError::Io)?;
-        let result = read_line(&mut UnbufferedSource(tty));
+        let result = read(&mut UnbufferedSource(tty));
         drop(guard);
         result
+    }
+
+    pub(super) fn read_visible(prompt: &str) -> Result<SecretLine, InputError> {
+        let tty = open_tty()?;
+        read_visible_from(&tty, prompt)
+    }
+
+    /// Discards pending input (TCSAFLUSH with unchanged settings), then
+    /// shows the prompt and reads one echoed line.
+    pub(crate) fn read_visible_from(tty: &File, prompt: &str) -> Result<SecretLine, InputError> {
+        let fd = tty.as_raw_fd();
+        let mut current = MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: `fd` is open, and on success `tcgetattr` initializes
+        // `current`.
+        if unsafe { libc::tcgetattr(fd, current.as_mut_ptr()) } != 0 {
+            return Err(InputError::Io(io::Error::last_os_error()));
+        }
+        // SAFETY: `tcgetattr` succeeded; the settings are written back
+        // unchanged, only discarding pending input.
+        if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, current.as_ptr()) } != 0 {
+            return Err(InputError::Io(io::Error::last_os_error()));
+        }
+        let mut out = tty;
+        out.write_all(prompt.as_bytes()).map_err(InputError::Io)?;
+        out.flush().map_err(InputError::Io)?;
+        read_line(&mut UnbufferedSource(tty))
     }
 }
 
@@ -198,7 +289,8 @@ mod imp {
         CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::Console::{
-        ENABLE_ECHO_INPUT, GetConsoleMode, ReadConsoleW, SetConsoleCtrlHandler, SetConsoleMode,
+        ENABLE_ECHO_INPUT, FlushConsoleInputBuffer, GetConsoleMode, ReadConsoleW,
+        SetConsoleCtrlHandler, SetConsoleMode,
     };
     use windows_sys::core::BOOL;
     use zeroize::Zeroizing;
@@ -272,6 +364,12 @@ mod imp {
             if unsafe { SetConsoleMode(handle, mode & !ENABLE_ECHO_INPUT) } == 0 {
                 return Err(io::Error::last_os_error());
             }
+            // Discards pending input, so queued lines cannot answer this
+            // prompt (A1).
+            // SAFETY: `handle` is an open console input handle.
+            if unsafe { FlushConsoleInputBuffer(handle) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
             Ok(guard)
         }
     }
@@ -336,34 +434,85 @@ mod imp {
         }
     }
 
-    pub(super) fn read_secret(prompt: &str) -> Result<SecretLine, InputError> {
-        let conout = open("CONOUT$").map_err(|_| InputError::NoTerminal)?;
-        let conin = open("CONIN$").map_err(|_| InputError::NoTerminal)?;
-        let mut out = File::from(conout);
-        out.write_all(prompt.as_bytes()).map_err(InputError::Io)?;
-        let handle = conin.as_raw_handle() as HANDLE;
-        let guard = EchoOff::engage(handle).map_err(InputError::Io)?;
-        let mut source = ConsoleSource {
+    fn source(handle: HANDLE) -> ConsoleSource {
+        ConsoleSource {
             handle,
             units: Zeroizing::new([0u16; MAX_LINE + 1]),
             len: 0,
             pos: 0,
             decoder: Utf16Decoder::default(),
-        };
-        let result = read_line(&mut source);
+        }
+    }
+
+    pub(super) fn has_terminal() -> bool {
+        open("CONIN$").is_ok() && open("CONOUT$").is_ok()
+    }
+
+    pub(super) fn show(text: &str) -> Result<(), InputError> {
+        let conout = open("CONOUT$").map_err(|_| InputError::NoTerminal)?;
+        File::from(conout)
+            .write_all(text.as_bytes())
+            .map_err(InputError::Io)
+    }
+
+    /// Echo off and pending input discarded (EchoOff), then the prompt, then
+    /// the read. The console buffer belongs to this prompt and is wiped when
+    /// it is dropped.
+    pub(super) fn read_hidden<T>(
+        prompt: &str,
+        read: impl FnOnce(&mut dyn ByteSource) -> Result<T, InputError>,
+    ) -> Result<T, InputError> {
+        let conout = open("CONOUT$").map_err(|_| InputError::NoTerminal)?;
+        let conin = open("CONIN$").map_err(|_| InputError::NoTerminal)?;
+        let mut out = File::from(conout);
+        let handle = conin.as_raw_handle() as HANDLE;
+        let guard = EchoOff::engage(handle).map_err(InputError::Io)?;
+        out.write_all(prompt.as_bytes()).map_err(InputError::Io)?;
+        let mut source = source(handle);
+        let result = read(&mut source);
         drop(guard);
         drop(source);
         let _ = out.write_all(b"\r\n");
         result
     }
+
+    pub(super) fn read_visible(prompt: &str) -> Result<SecretLine, InputError> {
+        let conout = open("CONOUT$").map_err(|_| InputError::NoTerminal)?;
+        let conin = open("CONIN$").map_err(|_| InputError::NoTerminal)?;
+        let handle = conin.as_raw_handle() as HANDLE;
+        // SAFETY: `handle` is an open console input handle.
+        if unsafe { FlushConsoleInputBuffer(handle) } == 0 {
+            return Err(InputError::Io(io::Error::last_os_error()));
+        }
+        File::from(conout)
+            .write_all(prompt.as_bytes())
+            .map_err(InputError::Io)?;
+        let mut source = source(handle);
+        read_line(&mut source)
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
 mod imp {
-    use crate::input::{InputError, SecretLine};
+    use crate::input::{ByteSource, InputError, SecretLine};
 
-    pub(super) fn read_secret(_prompt: &str) -> Result<SecretLine, InputError> {
+    pub(super) fn read_hidden<T>(
+        _prompt: &str,
+        _read: impl FnOnce(&mut dyn ByteSource) -> Result<T, InputError>,
+    ) -> Result<T, InputError> {
         Err(InputError::NoTerminal)
+    }
+
+    pub(super) fn read_visible(_prompt: &str) -> Result<SecretLine, InputError> {
+        Err(InputError::NoTerminal)
+    }
+
+    pub(super) fn show(_text: &str) -> Result<(), InputError> {
+        Err(InputError::NoTerminal)
+    }
+
+    pub(super) fn has_terminal() -> bool {
+        false
     }
 }
 
@@ -377,8 +526,10 @@ mod tests {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    use super::imp::read_secret_from;
-    use crate::input::InputError;
+    use super::imp::{read_hidden_from, read_secret_from};
+    use crate::card::{CardTextError, CardTextProgress, CardTextReader, PAYLOAD_LEN};
+    use crate::input::{InputError, read_line};
+    use crate::secrets::SecretBytes;
 
     /// The echo-off state is process-wide, so tests that use it run one at
     /// a time.
@@ -429,6 +580,35 @@ mod tests {
         }
     }
 
+    fn read_card_from(
+        tty: &File,
+    ) -> Result<Result<SecretBytes<PAYLOAD_LEN>, CardTextError>, InputError> {
+        read_hidden_from(tty, "Card: ", |source| {
+            let mut reader = CardTextReader::new();
+            loop {
+                let line = match read_line(source) {
+                    Ok(line) => line,
+                    Err(InputError::Cancelled) => return Ok(Err(reader.ended())),
+                    Err(error) => return Err(error),
+                };
+                match reader.push_line(&line) {
+                    Ok(CardTextProgress::Complete) => return Ok(reader.payload()),
+                    Ok(CardTextProgress::NeedMore) => {}
+                    Err(error) => return Ok(Err(error)),
+                }
+            }
+        })
+    }
+
+    fn card_input(input: Vec<u8>) -> Result<SecretBytes<PAYLOAD_LEN>, CardTextError> {
+        let Pty { master, slave } = pty();
+        let watcher = slave.try_clone().unwrap();
+        let reader = std::thread::spawn(move || read_card_from(&slave));
+        wait_for_echo(&watcher, false);
+        (&master).write_all(&input).unwrap();
+        reader.join().unwrap().unwrap()
+    }
+
     fn drain_master(master: &File) -> Vec<u8> {
         // SAFETY: plain flag changes on an open descriptor.
         unsafe {
@@ -465,6 +645,75 @@ mod tests {
             !shown.windows(7).any(|w| w == b"hunter2"),
             "the secret was not echoed"
         );
+    }
+
+    /// CLI 2: the hidden terminal session accepts a printed seven-line card,
+    /// stops exactly after line seven, and applies every multiline boundary
+    /// to whole lines.
+    #[test]
+    fn hidden_multiline_card_boundaries() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let card = crate::card::tests::fixed_card(1, 0x5a);
+        let text = String::from_utf8(card.base32().expose_secret().to_vec()).unwrap();
+        let printed = card.base32_lines().join("\n");
+
+        let Pty { master, slave } = pty();
+        let watcher = slave.try_clone().unwrap();
+        let reader = std::thread::spawn(move || read_card_from(&slave));
+        wait_for_echo(&watcher, false);
+        (&master)
+            .write_all(format!("{printed}\nEXTRA LINE\n").as_bytes())
+            .unwrap();
+        let payload = reader.join().unwrap().unwrap().unwrap();
+        assert_eq!(payload.expose_secret(), card.payload());
+        // The callback returned after line seven; it did not consume line 8.
+        let mut extra = [0u8; 11];
+        (&watcher).read_exact(&mut extra).unwrap();
+        assert_eq!(&extra, b"EXTRA LINE\n");
+
+        assert_eq!(
+            card_input(format!("{}Z\n", &text[..216]).into_bytes()).unwrap_err(),
+            CardTextError::TooMany
+        );
+        assert_eq!(
+            card_input(format!("{}\n\n", &text[..215]).into_bytes()).unwrap_err(),
+            CardTextError::TooFew(215)
+        );
+        let nine: String = text
+            .as_bytes()
+            .chunks(24)
+            .map(|chunk| format!("{}\n", std::str::from_utf8(chunk).unwrap()))
+            .collect();
+        assert_eq!(
+            card_input(nine.into_bytes()).unwrap_err(),
+            CardTextError::TooManyLines
+        );
+    }
+
+    /// A line queued before the hidden prompt is discarded by TCSAFLUSH and
+    /// cannot become this prompt's card input (A1).
+    #[test]
+    fn queued_card_input_is_discarded_before_prompt() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let card = crate::card::tests::fixed_card(1, 0x5a);
+        let text = card.base32();
+        let Pty { master, slave } = pty();
+        (&master).write_all(&[b'X'; 216]).unwrap();
+        (&master).write_all(b"\n").unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let _ = drain_master(&master); // discard the stale line's echo
+        let reader = std::thread::spawn(move || read_card_from(&slave));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut shown = Vec::new();
+        while !shown.windows(6).any(|w| w == b"Card: ") {
+            shown.extend_from_slice(&drain_master(&master));
+            assert!(Instant::now() < deadline, "card prompt was not shown");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        (&master).write_all(text.expose_secret()).unwrap();
+        (&master).write_all(b"\n").unwrap();
+        let payload = reader.join().unwrap().unwrap().unwrap();
+        assert_eq!(payload.expose_secret(), card.payload());
     }
 
     #[test]

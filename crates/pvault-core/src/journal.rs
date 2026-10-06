@@ -51,9 +51,14 @@ const KEYS: &[&str] = &[
     "vault_id",
     "target_mode",
     "tracking_gen",
+    "new_object_id",
     "new_tpm_index",
     "header_file_id",
     "header_id_kind",
+    "object_file_id",
+    "object_id_kind",
+    "old_kt_file_id",
+    "old_kt_id_kind",
     "keytable_digest",
     "new_core_digest",
     "new_tpm_id_ct_i",
@@ -325,6 +330,69 @@ pub enum Record {
     Init(InitRecord),
     /// `op: "recover"` or `"convert"`.
     Transition(TransitionRecord),
+    /// `op: "update"` (`add`, `rm`; approved for Milestone 4, A3).
+    Update(UpdateRecord),
+}
+
+/// `update` phases (`docs/M4_READINESS.md` 9.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdatePhase {
+    /// Every artifact exists, empty, with its identity recorded.
+    Staged,
+    /// The new key table and object are final; `new_core_digest` is known.
+    Committing,
+    /// The header is the new core and removed objects are handled; only the
+    /// old key table and the journal remain.
+    Cleaned,
+}
+
+impl UpdatePhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Staged => "staged",
+            Self::Committing => "committing",
+            Self::Cleaned => "cleaned",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "staged" => Self::Staged,
+            "committing" => Self::Committing,
+            "cleaned" => Self::Cleaned,
+            _ => return None,
+        })
+    }
+}
+
+/// An `update` record (`docs/M4_READINESS.md` 9.3). Single `mac` under
+/// `journal_key(current bundle)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateRecord {
+    /// Phase.
+    pub phase: UpdatePhase,
+    /// `core.vault_id`.
+    pub vault_id: [u8; 16],
+    /// Generation before the change.
+    pub old_gen: u64,
+    /// `old_gen + 1`.
+    pub new_gen: u64,
+    /// Exact old core digest.
+    pub old_core_digest: [u8; 64],
+    /// The old core's `keytable_digest`.
+    pub old_keytable_digest: [u8; 64],
+    /// Identity of `keytable.<old_gen>.pv`.
+    pub old_kt_id: FileIdentity,
+    /// Identity of `keytable.<new_gen>.pv.tmp`.
+    pub target_kt_id: FileIdentity,
+    /// Identity of `vault.hdr.tmp`.
+    pub header_id: FileIdentity,
+    /// `add`: the new `file_id` and the identity of its object temp.
+    pub new_object: Option<([u8; 16], FileIdentity)>,
+    /// Exact new core digest (`committing`, `cleaned`).
+    pub new_core_digest: Option<[u8; 64]>,
+    /// MAC.
+    pub mac: [u8; 64],
 }
 
 #[derive(Clone, Copy)]
@@ -396,6 +464,32 @@ impl Record {
                     f.push(("new_core_digest", Val::B(d)));
                 }
                 push_id(&mut f, "header_id_kind", "header_file_id", &r.header_id);
+                if with_macs {
+                    f.push(("mac", Val::B(&r.mac)));
+                }
+            }
+            Self::Update(r) => {
+                f.push(("op", Val::T("update")));
+                f.push(("phase", Val::T(r.phase.as_str())));
+                f.push(("vault_id", Val::B(&r.vault_id)));
+                f.push(("old_gen", Val::U(r.old_gen)));
+                f.push(("new_gen", Val::U(r.new_gen)));
+                f.push(("old_core_digest", Val::B(&r.old_core_digest)));
+                f.push(("old_keytable_digest", Val::B(&r.old_keytable_digest)));
+                f.push(("old_kt_id_kind", Val::T(r.old_kt_id.kind())));
+                f.push(("old_kt_file_id", Val::B(r.old_kt_id.bytes())));
+                f.push(("target_kt_id_kind", Val::T(r.target_kt_id.kind())));
+                f.push(("target_kt_file_id", Val::B(r.target_kt_id.bytes())));
+                f.push(("header_id_kind", Val::T(r.header_id.kind())));
+                f.push(("header_file_id", Val::B(r.header_id.bytes())));
+                if let Some((oid, id)) = &r.new_object {
+                    f.push(("new_object_id", Val::B(oid)));
+                    f.push(("object_id_kind", Val::T(id.kind())));
+                    f.push(("object_file_id", Val::B(id.bytes())));
+                }
+                if let Some(d) = &r.new_core_digest {
+                    f.push(("new_core_digest", Val::B(d)));
+                }
                 if with_macs {
                     f.push(("mac", Val::B(&r.mac)));
                 }
@@ -528,6 +622,12 @@ impl Record {
                 }
                 r.mac = m;
             }
+            Self::Update(r) => {
+                if new.is_some() {
+                    return Err(Error::JournalInvalid);
+                }
+                r.mac = m;
+            }
             Self::Transition(r) => {
                 let dual = r.phase == TransitionPhase::Committing;
                 match (dual, new) {
@@ -547,6 +647,7 @@ impl Record {
     pub fn verify_old(&self, key: &SecretBytes<32>) -> bool {
         match self {
             Self::Init(r) => self.check_with(key, &r.mac),
+            Self::Update(r) => self.check_with(key, &r.mac),
             Self::Transition(r) => match &r.macs {
                 Macs::Single(m) => self.check_with(key, m),
                 Macs::Dual { old, .. } => self.check_with(key, old),
@@ -627,6 +728,11 @@ struct Raw<'a> {
     tracking_core_digest: Option<[u8; 64]>,
     cleanup_template: Option<u8>,
     old_slots_authenticated: Option<bool>,
+    new_object_id: Option<[u8; 16]>,
+    old_kt_file_id: Option<&'a [u8]>,
+    old_kt_id_kind: Option<&'a str>,
+    object_file_id: Option<&'a [u8]>,
+    object_id_kind: Option<&'a str>,
 }
 
 fn id(kind: Option<&str>, bytes: Option<&[u8]>) -> Result<Option<FileIdentity>, CborError> {
@@ -729,7 +835,13 @@ fn parse_inner(bytes: &[u8]) -> Result<Record, CborError> {
             "cleanup_tpm_id_nonce" => r.cleanup_nonce = Some(*d.bytes_exact()?),
             "tracking_core_digest" => r.tracking_core_digest = Some(*d.bytes_exact()?),
             "cleanup_tpm_id_template" => r.cleanup_template = Some(d.u8()?),
-            _ => r.old_slots_authenticated = Some(d.bool()?),
+            "old_slots_authenticated" => r.old_slots_authenticated = Some(d.bool()?),
+            "new_object_id" => r.new_object_id = Some(*d.bytes_exact()?),
+            "old_kt_file_id" => r.old_kt_file_id = Some(d.bytes_max(32)?),
+            "old_kt_id_kind" => r.old_kt_id_kind = Some(d.text()?),
+            "object_file_id" => r.object_file_id = Some(d.bytes_max(32)?),
+            "object_id_kind" => r.object_id_kind = Some(d.text()?),
+            _ => return Err(CborError),
         }
         Ok(())
     })?;
@@ -775,6 +887,37 @@ fn parse_inner(bytes: &[u8]) -> Result<Record, CborError> {
         } else {
             Err(CborError)
         };
+    }
+    if op == "update" {
+        let phase = UpdatePhase::parse(phase).ok_or(CborError)?;
+        let old_gen = req(r.old_gen)?;
+        let new_gen = req(r.new_gen)?;
+        if old_gen.checked_add(1) != Some(new_gen) {
+            return Err(CborError);
+        }
+        let new_object = match (r.new_object_id, id(r.object_id_kind, r.object_file_id)?) {
+            (None, None) => None,
+            (Some(oid), Some(fid)) => Some((oid, fid)),
+            _ => return Err(CborError),
+        };
+        let rec = UpdateRecord {
+            phase,
+            vault_id,
+            old_gen,
+            new_gen,
+            old_core_digest: req(r.old_core_digest)?,
+            old_keytable_digest: req(r.old_keytable_digest)?,
+            old_kt_id: req(id(r.old_kt_id_kind, r.old_kt_file_id)?)?,
+            target_kt_id: req(id(r.target_kt_id_kind, r.target_kt_file_id)?)?,
+            header_id: req(id(r.header_id_kind, r.header_file_id)?)?,
+            new_object,
+            new_core_digest: r.new_core_digest,
+            mac: req(r.mac)?,
+        };
+        if rec.new_core_digest.is_some() != (phase != UpdatePhase::Staged) {
+            return Err(CborError);
+        }
+        return Ok(Record::Update(rec));
     }
     let op = match op {
         "recover" => TransitionOp::Recover,
@@ -1067,6 +1210,64 @@ pub fn promote_init(canonical: &[u8], temp: &[u8], init_key: &SecretBytes<32>) -
         && kept(&c.keytable_digest, &t.keytable_digest)
         && kept(&c.new_core_digest, &t.new_core_digest);
     if ok {
+        Promotion::Promote
+    } else {
+        Promotion::Residue
+    }
+}
+
+/// `update` journal-temp promotion (`docs/M4_READINESS.md` 9.5). Permitted:
+/// `staged` → `committing` (header old, or the temp's new core: the Windows
+/// WO-1 case) and `committing` → `cleaned` (header new). Both records must
+/// authenticate with `key`; every field of the canonical record is preserved
+/// and the temp adds only its phase's field. A byte-identical temp is an
+/// authenticated duplicate only under the same header condition.
+pub fn promote_update(
+    canonical: &[u8],
+    temp: &[u8],
+    key: &SecretBytes<32>,
+    header: Option<&AuthenticatedHeader>,
+) -> Promotion {
+    let (Ok(Record::Update(c)), Ok(Record::Update(t))) =
+        (Record::parse(canonical), Record::parse(temp))
+    else {
+        return Promotion::Residue;
+    };
+    let Some(h) = header else {
+        return Promotion::Residue;
+    };
+    let is_old = eq64(&h.core_digest, &c.old_core_digest);
+    let is_new = |r: &UpdateRecord| r.new_core_digest.is_some_and(|d| eq64(&h.core_digest, &d));
+    if !Record::Update(c.clone()).verify_old(key) {
+        return Promotion::Residue;
+    }
+    if temp == canonical {
+        return if is_old || is_new(&c) {
+            Promotion::Duplicate
+        } else {
+            Promotion::Residue
+        };
+    }
+    if !Record::Update(t.clone()).verify_old(key) {
+        return Promotion::Residue;
+    }
+    let same = c.vault_id == t.vault_id
+        && c.old_gen == t.old_gen
+        && c.new_gen == t.new_gen
+        && c.old_core_digest == t.old_core_digest
+        && c.old_keytable_digest == t.old_keytable_digest
+        && c.old_kt_id == t.old_kt_id
+        && c.target_kt_id == t.target_kt_id
+        && c.header_id == t.header_id
+        && c.new_object == t.new_object;
+    let ok = match (c.phase, t.phase) {
+        (UpdatePhase::Staged, UpdatePhase::Committing) => is_old || is_new(&t),
+        (UpdatePhase::Committing, UpdatePhase::Cleaned) => {
+            c.new_core_digest == t.new_core_digest && is_new(&t)
+        }
+        _ => false,
+    };
+    if same && ok {
         Promotion::Promote
     } else {
         Promotion::Residue

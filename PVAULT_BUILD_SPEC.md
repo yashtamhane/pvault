@@ -13,7 +13,7 @@
 
 > **How to use this file:** Give this whole file to your AI coding assistant (Claude Code, Copilot, Cursor, etc.) in VS Code. Tell it: *"Read PVAULT_BUILD_SPEC.md fully. Follow it milestone by milestone. Start with Milestone 0."*
 >
-> **Spec version:** 7.4. Full feature set, built in one pass and released at the end. Destructive features (the duress trigger action, Revoke, Erase, flush, K2) are built last, after a mandatory review gate.
+> **Spec version:** 7.5. Full feature set, built in one pass and released at the end. Destructive features (the duress trigger action, Revoke, Erase, flush, K2) are built last, after a mandatory review gate.
 >
 > **v7 changes from v6 (Milestone 0.5 consistency pass; the decision record is `docs/SPEC_ISSUES.md`):**
 > - `libc` and `windows-sys` are approved for narrowly scoped platform FFI (7.6a).
@@ -205,7 +205,7 @@ my-vault/
   keytable.<generation>.pv        encrypted key table (chunked, Section 7.8)
   objects/<file_id_hex>.pv        encrypted files (chunked, Section 7.7)
   vault.journal                   present only during multi-step operations (Section 8)
-  vault.lock                      lock file (8.4)
+  vault.gate, vault.lock          lock files (8.4)
   vault.hdr.tmp, keytable.<generation>.pv.tmp, objects/<file_id_hex>.pv.tmp,
   vault.journal.tmp               transient files during atomic replacement
 ```
@@ -360,7 +360,9 @@ journal_key   = HKDF-SHA-512(K_mac,     info="pvault/v1/journal")       (after u
 1. Parse header; validate Argon2 caps.
 2. Derive keys.
 3. Duress check (9.6). On match: portable duress Revoke (only on a file system that passes 8.5),
-   then return generic failure.
+   then return generic failure. (Until the duress trigger is built in Milestone 9, a match
+   returns the generic failure and changes nothing; Milestone 4 cannot set up duress.
+   Temporary limitation, decided 2026-10-05.)
 4. bundle = slots.slot_ct XOR XChaCha20(k_slot, slots.slot_nonce)
 5. Verify core_mac, then slots_mac.
 6. Rollback check; open, verify and decrypt the key table.
@@ -682,15 +684,17 @@ The full design, including the input rules, the estimator and the lifecycle, is 
   - **Generated (`words`):** 10 to 16 words from the EFF large wordlist (7,776 words), selected by the owner, **default 12**. Each word is drawn uniformly: two bytes from `getrandom` as a big-endian `u16`, values of 62,208 or more rejected, the rest reduced modulo 7,776. Displayed as lowercase words separated by single spaces, with the calculated classical entropy `n × log2(7776)` and the policy rating (Medium for 10–11 words, Strong for 12–16; policy ratings, not guarantees).
   - **Custom:** written by the owner, handled by H_c (below). Its strength is **estimated at creation only** (`zxcvbn` 3.1.1 in a child process; SI-51 section 5). The estimate is never run at unlock, verification, or a recovery that keeps the passphrase.
 - **Duress passphrase:** generated only, **fixed at 12 words** for now.
-- **H_w, generated-word handling**, applied to `words` input (main and duress), including the init-journal key (8.3):
-  1. Unicode NFKC.
-  2. Trim leading and trailing whitespace.
-  3. Replace each run of Unicode whitespace (the `White_Space` property) with one U+0020 space.
-  4. Unicode lowercase (full `to_lowercase`, applied per character).
+- **H_w, generated-word handling (`H_w_v1`, approved for Milestone 3; frozen Unicode 17.0.0 tables, `ucd17`)**, applied to `words` input (main and duress), including the init-journal key (8.3):
+  1. Refuse any code point unassigned in Unicode 17.0.0 (`Cn`).
+  2. Unicode NFKC.
+  3. Full default case folding (`CaseFolding.txt` statuses C and F).
+  4. Replace each run of `White_Space` characters (the fixed 17.0.0 set) with one U+0020 space, and trim leading and trailing whitespace.
+
+  (The Milestone 2 steps, which used per-character `to_lowercase` and the standard library's whitespace set, are superseded.)
 
   Words are separated **only** by whitespace. Hyphens are part of words, never separators: the list contains `drop-down`, `felt-tip`, `t-shirt` and `yo-yo`.
 - **H_c, custom handling:** Unicode NFC only; no trimming, lowercasing or collapsing. Refused and warned characters are listed in SI-51 section 3.
-- **Normalization stability: approved for Milestone 3 (2026-10-05; SI-51; `docs/SPEC_ISSUES.md` 10.7; D2).** H_c output must stay identical for the life of a vault, across releases. Pinning the toolchain or the normalization crate per release does not guarantee that for code points that are unassigned today. A stable normalization-version policy must be approved at the Milestone 3 schema review, before any vault stores a custom credential. The proposal (`docs/M3_READINESS.md` D2) refuses code points unassigned in pvault's Unicode version for H_c, at creation and at every entry. It also replaces the H_w steps above with a frozen `H_w_v1`: Unicode 17.0.0 `Cn` refusal, NFKC, full default case folding, and a fixed `White_Space` set, from vendored, hash-pinned tables. That changes the Milestone 2 H_w code for non-ASCII input. When generated-word handling refuses a custom input, the duress check is a non-match and the duress-only run is skipped (decided N3; 5.1, 5.6).
+- **Normalization stability: approved for Milestone 3 (2026-10-05; SI-51; `docs/SPEC_ISSUES.md` 10.7; D2).** H_c output must stay identical for the life of a vault, across releases. Pinning the toolchain or the normalization crate per release does not guarantee that for code points that are unassigned today. A stable normalization-version policy must be approved at the Milestone 3 schema review, before any vault stores a custom credential. The proposal (`docs/M3_READINESS.md` D2) refuses code points unassigned in pvault's Unicode version for H_c, at creation and at every entry. It also replaced the Milestone 2 H_w steps with the frozen `H_w_v1` listed above: Unicode 17.0.0 `Cn` refusal, NFKC, full default case folding, and a fixed `White_Space` set, from vendored, hash-pinned tables. That changes the Milestone 2 H_w code for non-ASCII input. When generated-word handling refuses a custom input, the duress check is a non-match and the duress-only run is skipped (decided N3; 5.1, 5.6).
 - **Limits:** raw input ≤ 1,024 bytes; H_w output ≤ 1,024 bytes; H_c output 1 to 256 bytes.
 - **Word-list hint (input only, `words` kind):** after H_w and before any key derivation, check each word against the embedded list. If one is missing, print "Word N is not in the word list." for the first such word and stop. No Argon2id run happens and the TPM is not touched. The hint depends only on the typed input.
 - **Collision rule:** a collision means that the actual main credential, after generated-word processing, equals the generated duress credential: `H_w(main input) == duress words`. It is checked at duress setup and whenever either credential changes (new main passphrase, new duress passphrase). It is not a check over every possible input.
@@ -739,18 +743,18 @@ check      8 bytes  first 8 bytes of SHA-512("pvault/v1/card" || all preceding b
   - labels for the vault ID (hex), the card role (Bound card / Card A / Card B), the `set_id` (hex) and the creation date.
 
   A card file never contains a passphrase.
-- **Creation:** each file is created relative to an opened handle of the destination directory, with exclusive creation and without following symlinks (the rules of 7.9). Permissions are owner-only: `0600`, or an owner-only ACL on Windows.
+- **Creation:** each file is created relative to an opened handle of the destination directory, with exclusive creation and without following symlinks (the rules of 7.9). Permissions are owner-only: `0600`, or an owner-only ACL on Windows. **Destinations must verifiably enforce owner-only access (decided 2026-10-06, O3; fail closed):** exported plaintext and card files are written only where pvault identifies a local file system whose kernel driver enforces owner-only access by itself: Linux `ext4`, `xfs`, `btrfs`, `tmpfs`; macOS `apfs`, `hfs`; Windows local `NTFS`, `ReFS` (locality by the 8.5 checks). Everything else is refused: FAT and exFAT, FUSE (`fuseblk`, `fuse.*`), network file systems, any other or unknown type, and destinations whose file system cannot be identified. A successful permission-setting call is never taken as proof. The refusal (exit 6, with a suggested destination) comes before any destination file is created, any record entry is written or any secret is read. Existing vaults on such file systems stay readable (`list`, `get` to a supported destination, `status`; 8.5). Supported types and reasons: `docs/M4_READINESS.md` 17.
 - **Tracking:** before any share bytes are written, each created file is recorded in the per-user record `cards.cbor`. The record holds `op_id`, the absolute path, the device and inode / file ID, `vault_id`, `set_id` and `created_at`.
 - **Cleanup:**
   - It runs after successful delivery verification, after an abort or rollback, and (with owner confirmation, for stale records) in `fsck` and `clean-partials`.
   - A card file is deleted **only if** it is recorded, reopens as a regular file without following symlinks, and its device and inode / file ID match the record.
   - Anything else is dropped from the record and reported, never deleted. Files are never matched by name or pattern.
-- **Active-operation lifetime lock and cleaner rules: PENDING (SI-10, with SI-14).** The design is in `docs/SPEC_ISSUES.md`. In summary:
+- **Active-operation lifetime lock and cleaner rules:** **approved for Milestone 4 (2026-10-05)** (SI-10, A6). The exact writer lifecycle (registration before any share byte; deletion through held handles), cleaner and destination rules are `docs/M4_READINESS.md` section 11. In summary:
   - Every operation that writes card files holds an exclusive per-operation lock, `cards/<op_id>.lock`, from before the first card file is created until all of its card files are deleted and its record entries removed.
   - A cleaner considers an entry only if it can take that lock without blocking. Otherwise it skips the entry entirely: not listed, not offered, not deleted.
 
-  Until SI-10 is approved, no cleaner for card files may be implemented.
-- **Remnants (document):** deleting a card file does not erase it from flash storage, file-system journals, backups, cloud-sync folders, print spoolers or thumbnail caches. Card text shown on screen can remain in terminal scrollback, terminal logs, screen recordings and shell history. The CLI never prints share material to the terminal unless the owner explicitly asks for it. Whether such a display option exists at all is **PENDING (SI-10)**.
+  A stale entry's file is deleted after a restart only with the owner's confirmation and a matching recorded birth time (`docs/M4_READINESS.md` 7.2); otherwise it is reported, never deleted.
+- **Remnants (document):** deleting a card file does not erase it from flash storage, file-system journals, backups, cloud-sync folders, print spoolers or thumbnail caches. Card text shown on screen can remain in terminal scrollback, terminal logs, screen recordings and shell history. The CLI never prints share material to the terminal. **Decided (2026-10-05): no display option exists**; card text exists only in the card files. Hidden typing of card text back for verification is allowed, and card text is never a command-line argument.
 
 ### 7.4c PNG input limits (card QR codes)
 
@@ -758,6 +762,7 @@ check      8 bytes  first 8 bytes of SHA-512("pvault/v1/card" || all preceding b
 - **Size limits:** reject a declared width or height above 4096 pixels. Reject an image whose decoded buffer (width × height × bytes per pixel, computed with overflow checks before any allocation) would exceed 64 MiB.
 - **Decoding:** convert to 8-bit grayscale for `rqrr`, then zeroize every decoded pixel buffer after use, because it contains the share.
 - **Payload:** exactly one QR code is decoded. Its payload must be exactly 135 bytes, and it is then validated under 7.4a.
+- **When a photo is read (decided 2026-10-06, O1):** a photo of a newly printed card can exist only after the cards are written and printed. PNG verification therefore opens the file only after the owner's printing acknowledgment on the terminal device, and needs that device also with `--secrets-stdin`; without one it is refused before anything is written (`docs/CLI.md` 6.1).
 
 ### 7.5 Wraps
 `ct = plaintext XOR XChaCha20_keystream(key, 24-byte random nonce)` via the raw `chacha20` crate, with the keystream starting at block counter 0 (draft-irtf-cfrg-xchacha-03). Unauthenticated by design; correctness is proven only by the MACs (5.4). Vectors are in `docs/FORMAT.md`.
@@ -798,7 +803,7 @@ Wordlist at `assets/eff_large_wordlist.txt`, embedded **unmodified** (SHA-256 `a
 - file-system operations required by 4.3, 7.4b, 7.9 and 8.5: handle-relative open, create and rename; no-follow flags; file identity; permissions and ACLs; flush primitives; file-system type queries;
 - memory queries and memory locking (4.3, 10.2);
 - file locking (8.4);
-- terminal input and echo control (approved; SI-51): `/dev/tty` open, `tcgetattr` / `tcsetattr` / `read`, and `sigaction` for restoring the terminal on SIGINT, SIGTERM, SIGHUP and SIGQUIT (with SIGTSTP ignored during reads); Windows `CreateFileW` (`CONIN$` / `CONOUT$`), `GetConsoleMode`, `SetConsoleMode`, `ReadConsoleW` and `SetConsoleCtrlHandler`.
+- terminal input and echo control (approved; SI-51): `/dev/tty` open, `tcgetattr` / `tcsetattr` / `read`, and `sigaction` for restoring the terminal on SIGINT, SIGTERM, SIGHUP and SIGQUIT (with SIGTSTP ignored during reads); Windows `CreateFileW` (`CONIN$` / `CONOUT$`), `GetConsoleMode`, `SetConsoleMode`, `ReadConsoleW` and `SetConsoleCtrlHandler`; and, **approved for Milestone 4 (2026-10-05)** (A1), `FlushConsoleInputBuffer` on Windows and `TCSAFLUSH` with `tcsetattr` on Unix to discard pending terminal input before each hidden prompt. The handlers restore the terminal and then let the default action end the process (decided 2026-10-06, O2): Ctrl-C, Ctrl-Break, the listed signals and closing the console are native terminations with the platform's own status, not application cancellation (exit 7; `docs/CLI.md` 3).
 
 All such calls live in isolated `platform` modules, and their `// SAFETY:` comments are reviewed. If an operation this spec requires is unsupported on the platform or file system, the tool **refuses** that operation. It never substitutes a check-then-act fallback that weakens a no-follow or no-overwrite guarantee.
 
@@ -859,17 +864,18 @@ Rules:
     - empty components, `.` and `..`;
     - `\`, NUL and other control characters (U+0000 to U+001F, U+007F);
     - names that cannot be created on every supported platform: the characters `< > : " | ? *`, a trailing space or dot, and the Windows reserved names `CON`, `PRN`, `AUX`, `NUL`, `COM1` to `COM9` and `LPT1` to `LPT9` (case-insensitive, with or without an extension).
-  - **Uniqueness:** two paths collide if they are equal after NFC and Unicode default case folding. No two entries may collide, and a file and a directory may not share a path. This is checked on input only (`add`, Milestone 4). The case-folding source (an approved crate, a vendored table, or `to_lowercase`) is therefore **needed before Milestone 4**, provided the decode/input split above is approved. If it is not approved, it is needed before Milestone 3.
+  - **Uniqueness:** two paths collide if they are equal after NFC and Unicode default case folding. No two entries may collide, and a file and a directory may not share a path. This is checked on input only (`add`, Milestone 4). **Direction approved (2026-10-05):** input paths are normalized to NFC; code points unassigned in Unicode 17.0.0 are refused; collisions use Unicode canonical caseless matching (`NFD(toCasefold(NFD(x)))`) with the vendored Unicode 17.0.0 tables. The exact rules are in `docs/M4_READINESS.md` section 8, for final approval. Decoding of existing paths stays Unicode-independent.
 - **Replacement:**
   - Adding a path that exists, or that collides with an existing one, fails unless `--replace` names exactly that path.
   - A replacement is a rewrite (7.7): a new `file_id` and new keys, with the old entry and object removed in the same commit.
   - Replacing a file with a directory, or the reverse, is refused.
+- **`add` sources:** **approved for Milestone 4 (2026-10-05)** (A5). Regular files only, opened without following a final symlink or reparse point; the size is fixed from the open handle and the metadata is rechecked after reading; `created_at` is the time added and `modified_at` the source's modification time. These checks detect changes still visible at a check point; they do not make a consistent snapshot (`docs/M4_READINESS.md` section 10).
 - **Addressing:** `get` and `rm` address entries by vault path. `rm` refuses a non-empty directory unless `--recursive` is given.
 - **Binding:** the key table is bound to the header by `core.keytable_digest` (SHA-512 of the whole file) under `core_mac`. It is non-circular: the key table never references the core MAC or digest.
 - **Generations:**
   - Every commit writes `keytable.<new_gen>.pv`, then commits the header with `keytable_gen = generation = new_gen`, then deletes the old file. `new_gen = generation + 1`, with one approved exception (Milestone 3): the remote-rollback tracking commit uses `tracking_gen = old_gen + 2` (8.1, glossary).
   - `keytable_gen == generation` therefore holds after every commit, including commits that change only the slots; those re-encrypt the unchanged table.
-  - The exact write ordering of `add` and `rm` for authenticated leftover handling is **PENDING (SI-40)**.
+  - The write ordering of `add` and `rm` is **approved for Milestone 4 (2026-10-05)** (SI-40, A3): the `update` journal protocol of `docs/M4_READINESS.md` section 9 (phases `staged`, `committing`, `cleaned`), with the ownership rules of 9.2 and the leftover confirmation of 9.7.
 
 ### 7.9 Decrypted output
 - `get` writes to `<destination>.pvpartial` beside the destination, verifying each chunk; on full success fsync and rename; on failure delete it and return the generic error.
@@ -881,16 +887,17 @@ Rules:
     0. Generate a random 16-byte `transfer_id` and acquire an exclusive OS lock on `transfers/<transfer_id>.lock` in the platform config directory. **This transfer lock is held for the entire export**, until step 5 completes or failure cleanup finishes, and the OS releases it automatically if the process dies.
     1. Create the `.pvpartial` exclusively (rules above). It is empty.
     2. Obtain its identity from the **open handle** (`fstat` device + inode; Windows: volume serial + file ID).
-    3. Durably record `{transfer_id, vault_id, absolute_path, device_id, inode_or_file_id, created_at}` in the non-secret per-user record `partials.cbor` (platform config directory, via `directories`).
+    3. Durably record (registration under the storage policy **approved for Milestone 4 (2026-10-05)**, A2: `docs/M4_READINESS.md` 7.1 and 7.5, qualified there; no plaintext before registration) `{transfer_id, vault_id, absolute_path, device_id, inode_or_file_id, created_at}` in the non-secret per-user record `partials.cbor` (platform config directory, via `directories`).
     4. Only then begin writing plaintext.
     5. After the final rename, or after failure cleanup, remove the entry, then release and delete the transfer lock file.
     A crash before step 3 can leave an **empty**, untracked `.pvpartial`, but never untracked plaintext. A later `get` that hits it (exclusive creation fails) may delete it after owner confirmation **only if** it is a regular file (not a symlink) of size 0; otherwise it refuses and reports the path.
   - **`partials.cbor` integrity:** every read-modify-write of the record takes an exclusive OS lock on `partials.lock` beside it, writes `partials.cbor.tmp`, fsyncs, renames and fsyncs the directory. Readers take a shared lock. A malformed record is reported and never used to delete anything.
   - **Stale partials:** on the next `get` for that vault, or on `fsck`, the tool considers each recorded entry and first tries a **non-blocking** exclusive lock on its `transfers/<transfer_id>.lock`. If the lock is held, the export is still running: **skip the entry entirely** (do not list it, offer it or delete it). Only entries whose transfer lock can be acquired are treated as stale; the cleaner holds that lock while it lists and removes them, so the transfer cannot resume concurrently. It then asks the owner to confirm removal. Before deleting, it reopens the path without following symlinks and checks that it is a regular file whose device and inode/file ID match the record. Mismatched or missing files are only dropped from the record, never deleted. `pvault clean-partials` performs the same confirmed cleanup on demand, for both `partials.cbor` and `cards.cbor` (7.4b). It does not open or unlock any vault and takes **no vault lock**: it uses only `partials.lock` and the per-transfer locks, so it can run while a vault is busy. When cleanup runs inside `get` or `fsck`, it happens under the vault lock those commands already hold, with the same transfer-lock check.
-  - **Final rename:** relative to the parent handle, using a no-replace primitive: `renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on macOS, and a handle-relative rename with replacement disabled on Windows. If the file system does not support it, `get` refuses. There is no check-then-rename fallback.
+  - **Final rename:** relative to the parent handle, using a no-replace primitive: `renameat2(RENAME_NOREPLACE)` on Linux, `renameatx_np(RENAME_EXCL)` on macOS, and a handle-relative rename with replacement disabled on Windows. If the file system does not support it, `get` refuses. There is no check-then-rename fallback. **Publication:** **approved for Milestone 4 (2026-10-05)** (A1/A2). Once the rename makes the destination visible, pvault never deletes or overwrites it; a later flush or record failure is reported as published with durability unconfirmed (exit 5), and a stale record names only the `.pvpartial` path (`docs/M4_READINESS.md` 7.5).
   - **`--force`: PENDING (SI-11).** The proposed design is an atomic exchange (Linux `RENAME_EXCHANGE`, macOS `RENAME_SWAP`) followed by inspection of the displaced entry. Its success, rollback, failed-rollback and crash cases, and the guarantees it actually provides, are specified in `docs/SPEC_ISSUES.md`. Until SI-11 is approved, `--force` is refused on every platform.
   - **Metadata in the record (document):** `partials.cbor` and `cards.cbor` hold absolute destination paths in plaintext while an export or card file exists.
-  - The final file keeps owner-only permissions; the owner can change them afterwards.
+  - The final file keeps owner-only permissions; the owner can change them afterwards. **Destinations must verifiably enforce owner-only access (decided 2026-10-06, O3; fail closed):** exported plaintext and card files are written only where pvault identifies a local file system whose kernel driver enforces owner-only access by itself: Linux `ext4`, `xfs`, `btrfs`, `tmpfs`; macOS `apfs`, `hfs`; Windows local `NTFS`, `ReFS` (locality by the 8.5 checks). Everything else is refused: FAT and exFAT, FUSE (`fuseblk`, `fuse.*`), network file systems, any other or unknown type, and destinations whose file system cannot be identified. A successful permission-setting call is never taken as proof. The refusal (exit 6, with a suggested destination) comes before any destination file is created, any record entry is written or any secret is read. Existing vaults on such file systems stay readable (`list`, `get` to a supported destination, `status`; 8.5). Supported types and reasons: `docs/M4_READINESS.md` 17.
+  - **Destination names are native** (the approved native-path design, `docs/M4_READINESS.md` 7.2 and `docs/CLI.md` 1.2; an implementation restriction to Unicode names was removed on 2026-10-06): any Unix bytes except `/` and NUL, any Windows UTF-16 (unpaired surrogates included) except `\`; the same holds for the vault folder, the card folder and recorded paths. Only vault paths (7.8) must be Unicode. Some file systems reject names themselves (APFS: invalid UTF-8).
 - "No temporary plaintext" means none anywhere except the requested destination.
 - Mount mode streams verified chunks and returns an I/O error on the first failure.
 
@@ -990,6 +997,7 @@ with a snapshot recheck (8.3 confirmation rules, with a live-vault phrase).
 The vault stays readable meanwhile. The same rule governs the creation of the
 `committing` header temp: an unowned `vault.hdr.tmp` already present blocks
 the commit.
+- **`op: "update"` (`add`, `rm`):** **approved for Milestone 4 (2026-10-05)** (A3). Fields and phases in `docs/M4_READINESS.md` 9.3: the common fields, `old_gen`, `new_gen`, `old_core_digest`, `old_keytable_digest`, the identities `old_kt_*`, `target_kt_*`, `header_*` and, for `add`, `new_object_id` with `object_*`; `new_core_digest` in `committing` and `cleaned`. Single `mac` under `journal_key(current bundle)`.
 - **Revoke and Erase records:** designed at the Milestone 8 review.
 
 **Expected-core binding (approved for Milestone 3).** Every expected-core field is exactly the 4.2 value `SHA-512("pvault/v1/core" || canonical_cbor(CoreFields))`, encoded as a CBOR byte string of length 64 and covered by the journal MAC. A restart classifies a header as old, new or rollback-tracking only when (1) its `core_mac` verifies with that side's bundle, (2) its recomputed `core_digest` equals the corresponding journal field in constant time, and (3) the applicable journal MAC verifies. Generation alone never selects a side. A dual-MAC record's MAC input omits both `mac_old` and `mac_new`; a single-MAC record omits `mac`.
@@ -1178,9 +1186,9 @@ side (the header still matches `old_core_digest`), with old material:
 
 | Operation | Order |
 | --- | --- |
-| `init` | The four-phase safe-init protocol below (approved for Milestone 3; `init` is built in Milestone 4): durable `prepared` journal → optional bound index → identity-journaled key-table temp → durable completed key table and `keytable_written` → cards/type-back/optional duress → identity-journaled header temp and `committing` → header commit → durable journal removal. |
-| `add` | object tmp → flush → rename → new keytable file → header commit (generation+1) → delete old keytable file. A reordering for authenticated leftover handling is **PENDING (SI-40)** |
-| `rm` | new keytable file without the entry → header commit → delete old keytable file → delete object. A reordering is **PENDING (SI-40)** |
+| `init` | The four-phase safe-init protocol below (approved for Milestone 3; `init` is built in Milestone 4): durable `prepared` journal → optional bound index → identity-journaled key-table temp → durable completed key table and `keytable_written` → cards/type-back/optional duress (no duress option in Milestone 4: duress setup arrives in Milestone 5, decided 2026-10-05) → identity-journaled header temp and `committing` → header commit → durable journal removal. |
+| `add` | object tmp → flush → rename → new keytable file → header commit (generation+1) → delete old keytable file. Superseded for Milestone 4 by the journaled `update` protocol, **approved for Milestone 4 (2026-10-05)** (`docs/M4_READINESS.md` section 9) |
+| `rm` | Journaled `update` protocol, **approved for Milestone 4 (2026-10-05)** (`docs/M4_READINESS.md` section 9): `staged` → new key table → `committing` → header commit → removed objects → `cleaned` → old key table → journal removal |
 | Recovery | Section 6, including 6.8 (directly to portable) |
 | `convert` | Section 6.9 |
 | `duress set` / `duress disable` | Section 6.10 |
@@ -1319,7 +1327,7 @@ filename, glob or generation number alone.
 - **Mounted sessions** hold a shared lock for their lifetime. Writes made through the mount are performed by the mounting process, which upgrades to exclusive only for the duration of each commit. The mechanism is **PENDING (SI-14)**.
 - **Intended restriction while mounted:** because every unlock needs the exclusive lock, CLI commands that unlock (`list`, `get`, `add`, `rm`, recovery, `convert`, `fsck`, Revoke, Erase) are refused while the vault is mounted, with the message "This vault is mounted. Use the mounted drive, or unmount first." `status` does not unlock: it reads the header and TPM state under a shared lock and works while mounted.
 - **Generation check (best-effort detection):** immediately before every header commit, re-read the on-disk header and abort if `core.generation` differs from the value read at the start of the operation. This **detects some** conflicting writes, but it is not a guarantee: a writer that ignores the lock can still modify the header between the check and the rename. **Concurrency safety depends on every writer being a `pvault` process that honors the lock.** Other software writing into a vault folder is out of scope; document this in `docs/FAILURE_MODES.md`.
-- Only one journal may exist per vault. Any operation that finds an existing journal must stop and direct the owner to `fsck`, **except the two handlers whose job is to resolve it:** `fsck` (resolves any journal per 6.6 and 8.2) and `init` (resolves an interrupted setup per 8.3; with no header it handles only `op: "init"` journals, and with a header present it only completes the post-commit case). Neither may start a new multi-step operation until the existing journal is resolved.
+- Only one journal may exist per vault. Any operation that finds an existing journal must stop and direct the owner to `fsck`, **except the two handlers whose job is to resolve it:** `fsck` (resolves any journal per 6.6 and 8.2) and `init` (resolves an interrupted setup per 8.3; with no header it handles only `op: "init"` journals, and with a header present it only completes the post-commit case). Neither may start a new multi-step operation until the existing journal is resolved. **Exception:** **approved for Milestone 4 (2026-10-05)** (A3). An authenticated `op: "update"` journal is resolved by the ordinary-unlock commands `add`, `rm`, `list` and `get` at step 7 of 5.7, under the exclusive lock (`docs/M4_READINESS.md` 9.5). An unresolved cleanup (old key table missing) keeps the journal: reads continue, mutations stop, and only `fsck` or the confirmation `CLOSE UNFINISHED CLEANUP <8 hex>`, which removes only that authenticated journal, closes it.
 - If the file system does not support locking, refuse and say why (8.5).
 
 ### 8.5 File-system support and durability
@@ -1364,18 +1372,21 @@ filename, glob or generation number alone.
       `GetDriveTypeW` classifies a root. Microsoft does not document one
       unique Q1 error for a local handle. Native Windows CI run 37390554153
       observed `ERROR_NOACCESS` (998) on local NTFS; the older anticipated
-      `ERROR_INVALID_PARAMETER` remains accepted. Q2's failure mode on SMB
-      is not yet verified.
-    - The native Milestone 3 probe has recorded local NTFS. Remaining native
-      coverage is a ReFS dev drive, a mounted VHD, a mapped SMB drive, an
-      available UNC path and a `subst` drive. Until every query matches an
-      accepted result, the criterion fails closed.
+      `ERROR_INVALID_PARAMETER` remains accepted.
+    - **Observed in run 37391563815 (Milestone 3 acceptance):** local NTFS and
+      a `subst` drive were accepted; a loopback UNC path and a
+      loopback-mapped SMB drive were refused by Q2 (error 3, no volume GUID
+      path). Q1 returned `ERROR_NOACCESS` (998) for all four, so it did not
+      discriminate local from remote in these tests; the refusals came from
+      Q2 to Q4. A diagnostic investigation is planned for Milestone 4
+      (`docs/M4_READINESS.md` section 13); it does not change Q2 to Q4.
+    - Remaining native coverage: a ReFS dev drive, a mounted VHD and a real
+      remote SMB server. Until every query matches an accepted result, the
+      criterion fails closed.
     - All four functions, `FileRemoteProtocolInfo` and `VOLUME_NAME_GUID`
-      are in the `windows-sys` feature `Win32_Storage_FileSystem`, which is
-      already enabled. The `DRIVE_*` constants are in
-      `Win32_System_WindowsProgramming`, which is **not** enabled yet. That is
-      a feature addition to the existing crate at implementation time, not a
-      new dependency, and no dependency is changed now.
+      are in the `windows-sys` feature `Win32_Storage_FileSystem`; the
+      `DRIVE_*` constants are in `Win32_System_WindowsProgramming`. Both
+      features were enabled in Milestone 3.
   - Every directory pvault writes in (`objects/`) is identified from its own
     held handle and must be the same mount and volume as the vault directory.
   - Linux identification needs `mnt_id` in fdinfo (Linux 3.15 and later) or
@@ -1568,7 +1579,7 @@ portable: duress_tag = HMAC-SHA-512(duress_key, "pvault/v1/duress-tag" || vault_
 - The duress tag is a second Argon2id-gated verifier (5.4).
 
 ### 9.7 Rollback detection
-`generation` increments on every commit (Section 3). A local record `rollback.cbor`, a deterministic-CBOR (4.4) map from `vault_id` to the highest generation seen, lives in the platform config directory. It is updated with the same locking and atomic-update discipline as `partials.cbor`. Lower generation → warning, not a block. Only ordinary unlocks and commits update it; verification-only paths never do.
+`generation` increments on every commit (Section 3). A local record `rollback.cbor` (4.4; an entry list of `{vault_id, generation}`, **approved for Milestone 4 (2026-10-05)**, A2; exact schema `docs/M4_READINESS.md` 7.4) lives in the platform config directory. It is updated with the same locking and atomic-update discipline as `partials.cbor`. Lower generation → warning, not a block. Only ordinary unlocks and commits update it; verification-only paths never do.
 
 **Limits (document):**
 - Revoke and duress writes do not change `generation`, so restoring a pre-Revoke header is **not** detected.
@@ -1819,7 +1830,7 @@ Each milestone ends with `cargo fmt --check`, `cargo clippy -- -D warnings`, `ca
 | 1 | Core crypto: random, kdf (5.1 parameters and known-answer vectors), mac, cascade | Round trips (0 B, 1 B, 64 KiB, 64 KiB+1, 10 MiB); KDF vectors; benches run |
 | 2 | Shamir (0x11B field, published test vectors; implementation per SI-08), passphrases (7.3: generation, H_w and word-list check, H_c, collision rule), bounded secret input (7.6a), the custom-passphrase estimator child process (SI-51), wraps. No header or journal schema changes | F5, F6, F62; wordlist = 7,776; normalization tests (F75 normalization part); SI-51 section 9 tests that need no vault |
 | 3 | Formats: deterministic CBOR (4.4), header (core/slots, two MACs, caps and limits), chunked stream (version in AAD), key-table file with vault paths (7.8), journal schemas (8.1), locking (8.4 per SI-14), file-system support check (8.5), test-only failpoints | F7, F9 to F14, F56a, F58, F71, F73 (decode part), F74 (detection part), F76, F85 |
-| 4 | Cards (7.4a to 7.4c: payload, Base32, SVG QR, PNG input, card files, published vectors). Portable mode: init (with full card verification), add, list, get, rm with crash-safe ordering and secure `.pvpartial`; `docs/CLI.md` approved first | F15, F16, F20, F26 (init/add/rm), F33, F4 (portable), F50, F51, F61 (portable cards), F64, F65 (portable cards), F67, F70, F72, F73, F74, F75, F78, F79 |
+| 4 | Cards (7.4a to 7.4c: payload, Base32, SVG QR, PNG input, card files, published vectors). Portable mode: init (with full card verification), add, list, get, rm with crash-safe ordering and secure `.pvpartial`; `docs/CLI.md` approved first | F15, F16, F20, F26 (init/add/rm), F33 (`get` part), F4 (portable), F50, F51, F61 (portable cards), F64, F65 (portable cards), F67, F70 (card records once SI-10 is approved), F72 (`get` part), F73, F74, F75, F78, F79. The `fsck` parts of F33 and F72 belong to Milestone 6 |
 | 5 | Bound mode via swtpm: policy-nonce index, precomputed and post-write Name, read rules (9.2a), ownership verification (9.2b), sessions (SI-22), duress setup (6.10) and availability (9.3) | F1 to F3, F17, F19, F30, F52, F59, F60, F61 and F65 (bound cards), F81 |
 | 6 | Recovery (both modes, and directly to portable), bundle rotation, write-ahead journal, dual-MAC transition records, full-share card verification, duress choices, `fsck`, `convert` | F8, F18, F21 to F29b, F31, F32, F26 (convert), F44 to F47, F53 to F55, F57, F63 (verify-card and recovery parts), F66, F68, F69, F80, F82, F83 |
 | 7 | Hardening: fuzz all targets 10+ min, memory locking with strict mode, timing measurements, draft docs, `cargo audit` | All tests that do not need mounting or gated features are green in CI (F1 to F33, F44 to F47, F50 to F55, F56a, F57 to F62, F63 except K2, F64 to F83, F85). F48 and F49 are gated (Milestones 9 and 10); F84 is gated (Milestone 9); F56b needs mounting (Milestone 11) |

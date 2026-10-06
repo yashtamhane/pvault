@@ -78,7 +78,7 @@ fn setup(path: &Path) -> CoreFields {
     let k = keys();
     let mut core = sample_core(Mode::Bound, PassphraseKind::Words);
     assert_eq!((core.generation, core.keytable_gen), (OLD_GEN, OLD_GEN));
-    let f = dir.create_new(&keytable_name(OLD_GEN)).unwrap();
+    let f = dir.create_new(keytable_name(OLD_GEN)).unwrap();
     core.keytable_digest =
         keytable::write_file(&sample(), &core.vault_id, OLD_GEN, &k.kt_old, &f).unwrap();
     fs::flush_file(&f).unwrap();
@@ -166,7 +166,7 @@ fn drive(dir: &Dir, core: &CoreFields, k: &Keys, phase: TransitionPhase) -> Tran
         keytable::write_file(&sample(), &core.vault_id, NEW_GEN, &k.kt_new, &kt.file).unwrap();
     fs::flush_file(&kt.file).unwrap();
     drop(kt);
-    dir.rename_noreplace(&keytable_tmp_name(NEW_GEN), &keytable_name(NEW_GEN))
+    dir.rename_noreplace(keytable_tmp_name(NEW_GEN), keytable_name(NEW_GEN))
         .unwrap();
     dir.flush().unwrap();
     if phase == TransitionPhase::TargetCreated {
@@ -330,7 +330,7 @@ fn verify_tracked(path: &Path, old_core: &CoreFields, k: &Keys, recorded: Option
         );
     }
     let file = dir
-        .open_regular(&keytable_name(TRACK_GEN), false)
+        .open_regular(keytable_name(TRACK_GEN), false)
         .unwrap()
         .unwrap();
     let table = keytable::read_file(
@@ -456,7 +456,7 @@ fn reencrypted_tracking_keytable_is_indeterminate() {
     ));
     assert_eq!(std::fs::read(tmp.join(HEADER)).unwrap(), header_before);
     assert!(dir.exists(JOURNAL).unwrap() && dir.exists(HEADER_TMP).unwrap());
-    assert!(dir.exists(&keytable_name(OLD_GEN)).unwrap());
+    assert!(dir.exists(keytable_name(OLD_GEN)).unwrap());
     // The journaled digest is the exact core; the unchanged old core is not it.
     assert!(
         !Header::parse(&header_before)
@@ -502,12 +502,12 @@ fn new_side_restart_after_commit() {
             resume_old_side(&dir, &k.old()),
             Err(Error::Indeterminate)
         ));
-        assert!(dir.exists(&keytable_name(OLD_GEN)).unwrap() && dir.exists(JOURNAL).unwrap());
+        assert!(dir.exists(keytable_name(OLD_GEN)).unwrap() && dir.exists(JOURNAL).unwrap());
         let done = resume_new_side(&dir, &k.new_side()).unwrap();
         assert!(done.kept.is_empty());
         assert_eq!(done.core.generation, NEW_GEN);
-        assert!(!dir.exists(&keytable_name(OLD_GEN)).unwrap());
-        assert!(dir.exists(&keytable_name(NEW_GEN)).unwrap());
+        assert!(!dir.exists(keytable_name(OLD_GEN)).unwrap());
+        assert!(dir.exists(keytable_name(NEW_GEN)).unwrap());
         assert!(!dir.exists(JOURNAL).unwrap() && !dir.exists(HEADER_TMP).unwrap());
         std::fs::remove_dir_all(&tmp).unwrap();
     }
@@ -532,8 +532,7 @@ fn crash_before_replacement_stays_old() {
         Ok(Resumed::NeedsRollback(r)) if r.phase == TransitionPhase::Committing
     ));
     assert!(
-        dir.exists(&keytable_name(OLD_GEN)).unwrap()
-            && dir.exists(&keytable_name(NEW_GEN)).unwrap()
+        dir.exists(keytable_name(OLD_GEN)).unwrap() && dir.exists(keytable_name(NEW_GEN)).unwrap()
     );
     std::fs::remove_dir_all(&tmp).unwrap();
 }
@@ -566,7 +565,7 @@ fn new_side_promotes_committing_temp() {
     let done = resume_new_side(&dir, &k.new_side()).unwrap();
     assert_eq!(done.core, new_core);
     assert!(!dir.exists(JOURNAL).unwrap() && !dir.exists(JOURNAL_TMP).unwrap());
-    assert!(!dir.exists(&keytable_name(OLD_GEN)).unwrap());
+    assert!(!dir.exists(keytable_name(OLD_GEN)).unwrap());
     std::fs::remove_dir_all(&tmp).unwrap();
 }
 
@@ -620,7 +619,7 @@ fn failure_boundary() {
             .unwrap()
             .core_digest_is(&recorded)
     );
-    assert!(dir.exists(JOURNAL).unwrap() && dir.exists(&keytable_name(OLD_GEN)).unwrap());
+    assert!(dir.exists(JOURNAL).unwrap() && dir.exists(keytable_name(OLD_GEN)).unwrap());
     restart(&tmp, &k);
     verify_tracked(&tmp, &old_core, &k, Some(recorded));
     std::fs::remove_dir_all(&tmp).unwrap();
@@ -675,7 +674,7 @@ fn full_cleanup_table_refuses_before_side_effects() {
         core.add_cleanup(crate::header::tests::cleanup(0x0180_0000 + i, false))
             .unwrap();
     }
-    let f = dir.create_new(&keytable_name(OLD_GEN)).unwrap();
+    let f = dir.create_new(keytable_name(OLD_GEN)).unwrap();
     core.keytable_digest =
         keytable::write_file(&sample(), &core.vault_id, OLD_GEN, &k.kt_old, &f).unwrap();
     std::fs::write(
@@ -690,7 +689,7 @@ fn full_cleanup_table_refuses_before_side_effects() {
         Err(Error::Capacity(_))
     ));
     assert_eq!(std::fs::read(tmp.join(JOURNAL)).unwrap(), journal_before);
-    assert!(!dir.exists(&keytable_tmp_name(TRACK_GEN)).unwrap());
+    assert!(!dir.exists(keytable_tmp_name(TRACK_GEN)).unwrap());
     std::fs::remove_dir_all(&tmp).unwrap();
 }
 

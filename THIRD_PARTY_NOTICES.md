@@ -123,3 +123,53 @@ release artifacts is planned for Milestone 13.
   `Apache-2.0 WITH LLVM-exception` only to `libfuzzer-sys@0.4.13`; the product
   allowlist is unchanged. Advisories, bans, sources and licenses are checked
   against the fuzz lockfile separately.
+
+## rqrr 0.11.0 and quirc-derived code
+
+- **Use:** QR-code recognition in release binaries.
+- **Source:** crates.io package `rqrr` 0.11.0,
+  <https://crates.io/crates/rqrr/0.11.0>.
+- **rqrr license:** MIT or Apache-2.0; pvault uses the MIT option. Copyright
+  2019 Moritz Wanzenböck. The MIT permission and warranty notice in the
+  package's `LICENSE-MIT` must remain with copies or substantial portions.
+- **quirc-derived code:** Copyright (C) 2010-2012 Daniel Beer
+  <dlbeer@gmail.com>, under the ISC license. Permission to use, copy, modify
+  and/or distribute it for any purpose, with or without fee, is granted if
+  that copyright and permission notice appear in all copies. The software is
+  provided "AS IS", without warranty; the author is not liable for damages
+  arising from its use or performance. The exact notice is distributed in
+  the crate as `LICENSE-ISC`.
+
+## foldhash 0.2.0
+
+- **Use:** transitive hasher dependency of QR decoding in release binaries.
+- **Source:** crates.io package `foldhash` 0.2.0,
+  <https://crates.io/crates/foldhash/0.2.0>.
+- **License:** Zlib. Copyright (c) 2024 Orson Peters. The software is provided
+  as-is without warranty. It may be used, altered and redistributed for any
+  purpose if its origin is not misrepresented, altered versions are marked,
+  and the package's license notice is not removed from source distributions.
+
+## option-ext 0.2.0
+
+- **Use:** transitive dependency of the settings-directory lookup in release
+  binaries.
+- **Source availability:** crates.io package `option-ext` 0.2.0,
+  <https://crates.io/crates/option-ext/0.2.0>, including its covered source.
+- **License:** Mozilla Public License 2.0, without an Exhibit B notice. The
+  package includes the complete text in `LICENSE.txt`; recipients can also
+  obtain it at <https://mozilla.org/MPL/2.0/>. MPL 2.0 source-availability
+  obligations apply to the covered files.
+
+## MIT-only release dependencies
+
+- `lru` 0.18.5: Copyright (c) 2016 Jerome Froelich.
+- `simd-adler32` 0.3.10: Copyright (c) 2021 Marvin Countryman.
+- **Source:** <https://crates.io/crates/lru/0.18.5> and
+  <https://crates.io/crates/simd-adler32/0.3.10>.
+- **License:** MIT. Permission is granted, free of charge, to use, copy,
+  modify, merge, publish, distribute, sublicense and/or sell copies, provided
+  the applicable copyright and permission notice is included in all copies
+  or substantial portions. The software is provided "AS IS", without
+  warranty or liability. Each crate includes the exact notice in its license
+  file.

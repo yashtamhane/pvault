@@ -31,8 +31,10 @@
 //! `MoveFileExW(MOVEFILE_WRITE_THROUGH)`. The amended W1 assumption and its
 //! limits are explicit in spec 8.5 and `docs/SPEC_ISSUES.md` SI-12.
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
@@ -63,7 +65,35 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::WindowsProgramming::{DRIVE_FIXED, DRIVE_REMOVABLE};
 
-use super::{FileIdentity, Ownership, Volume};
+use std::ffi::OsString;
+use std::os::windows::ffi::OsStringExt;
+
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_NO_MORE_FILES, ERROR_SHARING_VIOLATION, LocalFree,
+};
+use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+use windows_sys::Win32::Security::{
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION, AclSizeInformation,
+    AddAccessAllowedAceEx, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+    GetAclInformation, GetLengthSid, GetSecurityDescriptorControl, GetTokenInformation,
+    InitializeAcl, InitializeSecurityDescriptor, IsWellKnownSid, OBJECT_INHERIT_ACE,
+    OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR,
+    SetSecurityDescriptorControl, SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    WinBuiltinAdministratorsSid, WinLocalSystemSid,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    BY_HANDLE_FILE_INFORMATION, FILE_ALL_ACCESS, FILE_FLAG_SEQUENTIAL_SCAN, FILE_ID_BOTH_DIR_INFO,
+    FILE_STANDARD_INFO, FILE_TYPE_DISK, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo,
+    FileStandardInfo, GetFileInformationByHandle, GetFileType,
+};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+use super::{FileIdentity, IdKind, Ownership, RecordIdentity, SourceError, SourceMeta, Volume};
+
+/// `ACCESS_ALLOWED_ACE_TYPE` and `SECURITY_DESCRIPTOR_REVISION` (their
+/// `windows-sys` feature is not otherwise needed).
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
 
 /// Every pvault open shares read, write and delete, as `std::fs` does, so
 /// pvault's own handles never block each other's rename or delete.
@@ -96,12 +126,24 @@ fn not_regular() -> io::Error {
 /// Opens or creates `name`, one component, relative to `root`.
 fn nt_open(
     root: HANDLE,
-    name: &str,
+    name: &OsStr,
     access: u32,
     disposition: u32,
     options: u32,
 ) -> Result<OwnedHandle, NtError> {
-    let wide: Vec<u16> = name.encode_utf16().collect();
+    nt_open_sd(root, name, access, disposition, options, None)
+}
+
+/// [`nt_open`] with an explicit security descriptor for creation.
+fn nt_open_sd(
+    root: HANDLE,
+    name: &OsStr,
+    access: u32,
+    disposition: u32,
+    options: u32,
+    sd: Option<&OwnerOnly>,
+) -> Result<OwnedHandle, NtError> {
+    let wide: Vec<u16> = name.encode_wide().collect();
     let bytes = u16::try_from(wide.len() * 2).map_err(|_| NtError(STATUS_INVALID_PARAMETER))?;
     let object_name = UNICODE_STRING {
         Length: bytes,
@@ -116,7 +158,7 @@ fn nt_open(
         ObjectName: &object_name,
         // Win32 name semantics (CreateFileW is case-insensitive).
         Attributes: OBJ_CASE_INSENSITIVE,
-        SecurityDescriptor: core::ptr::null(),
+        SecurityDescriptor: sd.map_or(core::ptr::null(), |d| d.as_ptr()),
         SecurityQualityOfService: core::ptr::null(),
     };
     let mut handle: HANDLE = core::ptr::null_mut();
@@ -250,7 +292,7 @@ impl Dir {
         raw(&self.handle)
     }
 
-    pub(super) fn open_dir(&self, name: &str) -> io::Result<Self> {
+    pub(super) fn open_dir(&self, name: &OsStr) -> io::Result<Self> {
         let h = nt_open(
             self.root(),
             name,
@@ -272,32 +314,36 @@ impl Dir {
         })
     }
 
-    pub(super) fn create_dir(&self, name: &str) -> io::Result<()> {
-        let h = nt_open(
+    pub(super) fn create_dir(&self, name: &OsStr) -> io::Result<()> {
+        let sd = OwnerOnly::new(true)?;
+        let h = nt_open_sd(
             self.root(),
             name,
             FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             FILE_CREATE,
             FILE_DIRECTORY_FILE,
+            Some(&sd),
         )
         .map_err(NtError::into_io)?;
         check_kind(raw(&h), true)
     }
 
-    pub(super) fn create_new(&self, name: &str) -> io::Result<File> {
-        let h = nt_open(
+    pub(super) fn create_new(&self, name: &OsStr) -> io::Result<File> {
+        let sd = OwnerOnly::new(false)?;
+        let h = nt_open_sd(
             self.root(),
             name,
             FILE_GENERIC_READ | FILE_GENERIC_WRITE,
             FILE_CREATE,
             FILE_NON_DIRECTORY_FILE | FILE_WRITE_THROUGH,
+            Some(&sd),
         )
         .map_err(NtError::into_io)?;
         check_kind(raw(&h), false)?;
         Ok(File::from(h))
     }
 
-    pub(super) fn open_regular(&self, name: &str, write: bool) -> io::Result<Option<File>> {
+    pub(super) fn open_regular(&self, name: &OsStr, write: bool) -> io::Result<Option<File>> {
         let (access, extra) = if write {
             (FILE_GENERIC_READ | FILE_GENERIC_WRITE, FILE_WRITE_THROUGH)
         } else {
@@ -319,7 +365,7 @@ impl Dir {
         Ok(Some(File::from(h)))
     }
 
-    pub(super) fn exists(&self, name: &str) -> io::Result<bool> {
+    pub(super) fn exists(&self, name: &OsStr) -> io::Result<bool> {
         match nt_open(
             self.root(),
             name,
@@ -333,7 +379,7 @@ impl Dir {
         }
     }
 
-    pub(super) fn rename(&self, from: &str, to: &str, replace: bool) -> io::Result<()> {
+    pub(super) fn rename(&self, from: &OsStr, to: &OsStr, replace: bool) -> io::Result<()> {
         let source = nt_open(
             self.root(),
             from,
@@ -350,7 +396,7 @@ impl Dir {
         })?;
         check_kind(raw(&source), false)?;
 
-        let name: Vec<u16> = to.encode_utf16().collect();
+        let name: Vec<u16> = to.encode_wide().collect();
         let name_bytes = name
             .len()
             .checked_mul(2)
@@ -400,7 +446,7 @@ impl Dir {
         Ok(())
     }
 
-    pub(super) fn unlink(&self, name: &str) -> io::Result<()> {
+    pub(super) fn unlink(&self, name: &OsStr) -> io::Result<()> {
         // Like `unlinkat`: removes the entry itself, never a link target.
         let h = nt_open(
             self.root(),
@@ -417,7 +463,7 @@ impl Dir {
     /// identity `expected`, and deletes that same handle.
     pub(super) fn remove_owned(
         &self,
-        name: &str,
+        name: &OsStr,
         expected: &FileIdentity,
     ) -> io::Result<Ownership> {
         let h = match nt_open(
@@ -441,6 +487,191 @@ impl Dir {
         }
         delete_by_handle(raw(&h))?;
         Ok(Ownership::Removed)
+    }
+
+    /// The names in this directory, without `.` and `..`.
+    pub(super) fn list(&self) -> io::Result<Vec<OsString>> {
+        let mut names = Vec::new();
+        // u64 storage keeps the entries 8-byte aligned.
+        let mut buf = vec![0u64; 8192];
+        let mut class = FileIdBothDirectoryRestartInfo;
+        loop {
+            // SAFETY: the directory handle is open with list access; `buf` is
+            // writable for the size passed.
+            let ok = unsafe {
+                GetFileInformationByHandleEx(
+                    self.root(),
+                    class,
+                    buf.as_mut_ptr().cast(),
+                    (buf.len() * 8) as u32,
+                )
+            };
+            if ok == 0 {
+                // SAFETY: reads the calling thread's last-error value.
+                let e = unsafe { GetLastError() };
+                if e == ERROR_NO_MORE_FILES {
+                    return Ok(names);
+                }
+                return Err(io::Error::from_raw_os_error(e as i32));
+            }
+            class = FileIdBothDirectoryInfo;
+            let base = buf.as_ptr().cast::<u8>();
+            let total = buf.len() * 8;
+            let mut offset = 0usize;
+            loop {
+                let name_at = core::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+                if offset + name_at > total {
+                    return Err(io::Error::other("malformed directory listing"));
+                }
+                // SAFETY: `offset` is within `buf`, and the system wrote a
+                // FILE_ID_BOTH_DIR_INFO there (8-byte aligned per its rules).
+                let entry = unsafe { &*base.add(offset).cast::<FILE_ID_BOTH_DIR_INFO>() };
+                let len = entry.FileNameLength as usize;
+                if offset + name_at + len > total || !len.is_multiple_of(2) {
+                    return Err(io::Error::other("malformed directory listing"));
+                }
+                // SAFETY: the name lies within `buf` (checked above); u16
+                // reads are aligned because the struct is 8-byte aligned and
+                // the name offset is even.
+                let units = unsafe {
+                    core::slice::from_raw_parts(base.add(offset + name_at).cast::<u16>(), len / 2)
+                };
+                let name = OsString::from_wide(units);
+                if name != "." && name != ".." {
+                    names.push(name);
+                }
+                if entry.NextEntryOffset == 0 {
+                    break;
+                }
+                offset += entry.NextEntryOffset as usize;
+            }
+        }
+    }
+
+    /// Whether `other` is this directory or lies below it, by comparing
+    /// volume GUID paths of the two handles.
+    pub(super) fn contains(&self, other: &Dir) -> io::Result<bool> {
+        let mine = final_path(self.root())?.to_lowercase();
+        let theirs = final_path(other.root())?.to_lowercase();
+        let mine = mine.trim_end_matches('\\');
+        Ok(theirs == mine || theirs.starts_with(&format!("{mine}\\")))
+    }
+
+    pub(super) fn held_at(&self, name: &OsStr, file: &File) -> io::Result<Option<bool>> {
+        let h = match nt_open(
+            self.root(),
+            name,
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_OPEN,
+            0,
+        ) {
+            Ok(h) => h,
+            Err(e) if e.not_found() => return Ok(None),
+            Err(e) => return Err(e.into_io()),
+        };
+        Ok(Some(file_id(raw(&h))? == file_id(raw(file))?))
+    }
+
+    /// Opens `name` for deletion and deletes that handle only if it is the
+    /// same file as `file` (which this process holds open).
+    pub(super) fn delete_held(&self, name: &OsStr, file: &File) -> io::Result<bool> {
+        let h = match nt_open(
+            self.root(),
+            name,
+            DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE,
+        ) {
+            Ok(h) => h,
+            Err(e) if e.not_found() => return Ok(false),
+            Err(e) => return Err(e.into_io()),
+        };
+        if file_id(raw(&h))? != file_id(raw(file))? {
+            return Ok(false);
+        }
+        delete_by_handle(raw(&h))?;
+        Ok(true)
+    }
+
+    /// Owner is the current user; the DACL is protected and allows only the
+    /// user, SYSTEM and Administrators (`docs/M4_READINESS.md` 7.1).
+    pub(super) fn is_private(&self) -> io::Result<bool> {
+        let user = TokenUserSid::current()?;
+        let mut owner: PSID = core::ptr::null_mut();
+        let mut dacl: *mut ACL = core::ptr::null_mut();
+        let mut sd: *mut core::ffi::c_void = core::ptr::null_mut();
+        // SAFETY: the handle is open; every out-pointer is a valid local.
+        let rc = unsafe {
+            GetSecurityInfo(
+                self.root(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                core::ptr::null_mut(),
+                &mut dacl,
+                core::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+        let verdict = (|| {
+            // SAFETY: `owner` and `user` point to valid SIDs.
+            if owner.is_null() || unsafe { EqualSid(owner, user.sid()) } == 0 {
+                return false;
+            }
+            let (mut control, mut revision) = (0u16, 0u32);
+            // SAFETY: `sd` is the descriptor GetSecurityInfo returned.
+            if unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) } == 0
+                || control & SE_DACL_PROTECTED == 0
+                || dacl.is_null()
+            {
+                return false;
+            }
+            // SAFETY: an all-zero ACL_SIZE_INFORMATION is a valid output buffer.
+            let mut info: ACL_SIZE_INFORMATION = unsafe { core::mem::zeroed() };
+            // SAFETY: `dacl` is valid; the buffer has the size passed.
+            if unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&raw mut info).cast(),
+                    core::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            } == 0
+            {
+                return false;
+            }
+            for i in 0..info.AceCount {
+                let mut ace: *mut core::ffi::c_void = core::ptr::null_mut();
+                // SAFETY: `i` is below the ACE count of the valid `dacl`.
+                if unsafe { GetAce(dacl, i, &mut ace) } == 0 {
+                    return false;
+                }
+                // SAFETY: `GetAce` returned a pointer to an ACE header.
+                let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+                if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+                    continue; // deny and other ACE types grant nothing
+                }
+                // SAFETY: an access-allowed ACE starts with this layout, and
+                // its SID begins at `SidStart`.
+                let sid = unsafe { (&raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast() };
+                // SAFETY: `sid` and `user.sid()` are valid SIDs.
+                let allowed = unsafe {
+                    EqualSid(sid, user.sid()) != 0
+                        || IsWellKnownSid(sid, WinLocalSystemSid) != 0
+                        || IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+                };
+                if !allowed {
+                    return false;
+                }
+            }
+            true
+        })();
+        // SAFETY: `sd` was allocated by GetSecurityInfo and is freed once.
+        unsafe { LocalFree(sd) };
+        Ok(verdict)
     }
 
     pub(super) fn flush(&self) -> io::Result<()> {
@@ -630,4 +861,226 @@ fn volume_of(h: HANDLE) -> io::Result<Volume> {
 /// The raw probe of a directory handle.
 pub(super) fn probe_dir(dir: &Dir) -> Probe {
     probe(dir.handle.as_raw_handle() as HANDLE)
+}
+
+/// The current process user's SID, from its token.
+struct TokenUserSid {
+    buf: Vec<u64>,
+}
+
+impl TokenUserSid {
+    fn current() -> io::Result<Self> {
+        let mut token: HANDLE = core::ptr::null_mut();
+        // SAFETY: the pseudo-handle of the current process; `token` is a
+        // writable out-pointer.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut len = 0u32;
+        // SAFETY: a size query with a null buffer is permitted.
+        unsafe { GetTokenInformation(token, TokenUser, core::ptr::null_mut(), 0, &mut len) };
+        let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+        // SAFETY: `buf` is writable for `len` bytes and 8-byte aligned.
+        let ok = unsafe {
+            GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len)
+        };
+        let err = io::Error::last_os_error();
+        // SAFETY: `token` was opened above and is closed once.
+        unsafe { CloseHandle(token) };
+        if ok == 0 {
+            return Err(err);
+        }
+        Ok(Self { buf })
+    }
+
+    fn sid(&self) -> PSID {
+        // SAFETY: `buf` holds a TOKEN_USER written by GetTokenInformation.
+        unsafe { (*self.buf.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+    }
+}
+
+/// A security descriptor whose protected DACL grants full access to the
+/// current user only (inheritable for directories). Used at creation, so the
+/// object is never visible with inherited permissions (spec 7.4b, 7.9, 8.3).
+struct OwnerOnly {
+    _user: TokenUserSid,
+    _acl: Vec<u64>,
+    sd: Box<SECURITY_DESCRIPTOR>,
+}
+
+impl OwnerOnly {
+    fn new(dir: bool) -> io::Result<Self> {
+        let user = TokenUserSid::current()?;
+        // SAFETY: `user.sid()` is a valid SID.
+        let sid_len = unsafe { GetLengthSid(user.sid()) } as usize;
+        let size =
+            core::mem::size_of::<ACL>() + core::mem::size_of::<ACCESS_ALLOWED_ACE>() + sid_len;
+        let size = size.div_ceil(4) * 4;
+        let mut acl = vec![0u64; size.div_ceil(8)];
+        let acl_ptr = acl.as_mut_ptr().cast::<ACL>();
+        let flags = if dir {
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+        } else {
+            0
+        };
+        // SAFETY: an all-zero SECURITY_DESCRIPTOR is valid storage for
+        // InitializeSecurityDescriptor.
+        let mut sd: Box<SECURITY_DESCRIPTOR> = Box::new(unsafe { core::mem::zeroed() });
+        let sd_ptr: *mut SECURITY_DESCRIPTOR = &mut *sd;
+        // SAFETY: `acl` is writable for `size` bytes and 8-byte aligned;
+        // `sd` is writable; `user.sid()` is valid for the calls.
+        let ok = unsafe {
+            InitializeAcl(acl_ptr, size as u32, ACL_REVISION) != 0
+                && AddAccessAllowedAceEx(acl_ptr, ACL_REVISION, flags, FILE_ALL_ACCESS, user.sid())
+                    != 0
+                && InitializeSecurityDescriptor(sd_ptr.cast(), SECURITY_DESCRIPTOR_REVISION) != 0
+                && SetSecurityDescriptorDacl(sd_ptr.cast(), 1, acl_ptr, 0) != 0
+                && SetSecurityDescriptorControl(sd_ptr.cast(), SE_DACL_PROTECTED, SE_DACL_PROTECTED)
+                    != 0
+        };
+        if !ok {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            _user: user,
+            _acl: acl,
+            sd,
+        })
+    }
+
+    fn as_ptr(&self) -> *const SECURITY_DESCRIPTOR {
+        &*self.sd
+    }
+}
+
+fn final_path(h: HANDLE) -> io::Result<String> {
+    let mut buf = vec![0u16; 32768];
+    // SAFETY: `h` is open; `buf` has the length passed.
+    let n = unsafe {
+        GetFinalPathNameByHandleW(h, buf.as_mut_ptr(), buf.len() as u32, VOLUME_NAME_GUID)
+    } as usize;
+    if n == 0 || n >= buf.len() {
+        return Err(io::Error::last_os_error());
+    }
+    String::from_utf16(&buf[..n]).map_err(|_| io::Error::other("path is not valid UTF-16"))
+}
+
+/// FILETIME (100 ns since 1601) to `(sec, nsec)` since 1970.
+fn filetime(t: i64) -> (i64, u32) {
+    let since_1970 = t - 116_444_736_000_000_000;
+    (
+        since_1970.div_euclid(10_000_000),
+        (since_1970.rem_euclid(10_000_000) * 100) as u32,
+    )
+}
+
+fn basic_info(h: HANDLE) -> io::Result<FILE_BASIC_INFO> {
+    // SAFETY: an all-zero FILE_BASIC_INFO is a valid output buffer.
+    let mut basic: FILE_BASIC_INFO = unsafe { core::mem::zeroed() };
+    // SAFETY: `h` is open; the buffer has the size passed.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            h,
+            FileBasicInfo,
+            (&raw mut basic).cast(),
+            core::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(basic)
+}
+
+/// `(volume serial, 16-byte file ID)`, with the 64-bit index fallback.
+fn volume_and_id(h: HANDLE) -> io::Result<(u64, Vec<u8>)> {
+    // SAFETY: an all-zero FILE_ID_INFO is a valid output buffer.
+    let mut id: FILE_ID_INFO = unsafe { core::mem::zeroed() };
+    // SAFETY: `h` is open; the buffer has the size passed.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            h,
+            FileIdInfo,
+            (&raw mut id).cast(),
+            core::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    } != 0
+    {
+        return Ok((id.VolumeSerialNumber, id.FileId.Identifier.to_vec()));
+    }
+    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid output buffer.
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { core::mem::zeroed() };
+    // SAFETY: `h` is open and `info` is writable.
+    if unsafe { GetFileInformationByHandle(h, &mut info) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    let mut ino = vec![0u8; 8];
+    ino.extend_from_slice(&index.to_be_bytes());
+    Ok((u64::from(info.dwVolumeSerialNumber), ino))
+}
+
+pub(super) fn record_identity(file: &File) -> io::Result<RecordIdentity> {
+    let h = raw(file);
+    let (dev, ino) = volume_and_id(h)?;
+    let created = basic_info(h)?.CreationTime;
+    Ok(RecordIdentity {
+        kind: IdKind::Windows,
+        dev,
+        ino,
+        btime: (created != 0).then(|| (created as u64).to_be_bytes().to_vec()),
+    })
+}
+
+pub(super) fn open_source(path: &Path) -> Result<File, SourceError> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ as SHARE_READ_ONLY;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(SHARE_READ_ONLY)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN)
+        .open(path)
+        .map_err(|e| {
+            if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) {
+                SourceError::InUse
+            } else {
+                SourceError::Io(e)
+            }
+        })?;
+    let attrs = attributes(raw(&file)).map_err(SourceError::Io)?;
+    if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(SourceError::Link);
+    }
+    // SAFETY: an open file handle.
+    if attrs & FILE_ATTRIBUTE_DIRECTORY != 0 || unsafe { GetFileType(raw(&file)) } != FILE_TYPE_DISK
+    {
+        return Err(SourceError::NotRegular);
+    }
+    Ok(file)
+}
+
+pub(super) fn source_meta(file: &File) -> io::Result<SourceMeta> {
+    let h = raw(file);
+    // SAFETY: an all-zero FILE_STANDARD_INFO is a valid output buffer.
+    let mut standard: FILE_STANDARD_INFO = unsafe { core::mem::zeroed() };
+    // SAFETY: `h` is open; the buffer has the size passed.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            h,
+            FileStandardInfo,
+            (&raw mut standard).cast(),
+            core::mem::size_of::<FILE_STANDARD_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let basic = basic_info(h)?;
+    let (dev, ino) = volume_and_id(h)?;
+    Ok(SourceMeta {
+        size: u64::try_from(standard.EndOfFile).map_err(|_| io::Error::other("negative size"))?,
+        mtime: filetime(basic.LastWriteTime),
+        ctime: filetime(basic.ChangeTime),
+        dev,
+        ino,
+    })
 }

@@ -78,6 +78,12 @@ impl Drop for WipedBlocks {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Argon2id runs on this thread (F75: input errors must not reach one).
+    pub(crate) static ARGON2_RUNS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 /// Derives `master_pw` from an already-normalized passphrase (spec 5.1, 7.3).
 pub fn master_pw(
     passphrase: &SecretBuf,
@@ -85,6 +91,8 @@ pub fn master_pw(
     params: Argon2Params,
 ) -> Result<SecretBytes<KEY_LEN>, Error> {
     params.check_hard_caps()?;
+    #[cfg(test)]
+    ARGON2_RUNS.with(|c| c.set(c.get() + 1));
     let argon_params = argon2::Params::new(params.m_kib, params.t, params.p, Some(KEY_LEN))
         .map_err(|_| Error::KdfParams)?;
 

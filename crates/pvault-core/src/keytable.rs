@@ -331,6 +331,43 @@ impl KeyTable {
         core::str::from_utf8(bytes).unwrap_or("")
     }
 
+    /// Copies every entry, keys included, as the input of a successor
+    /// table (`add`, `rm`). The copies are zeroized when dropped.
+    pub(crate) fn to_new_entries(&self) -> Result<Vec<NewEntry>, Error> {
+        let mut out = Vec::with_capacity(self.len());
+        for i in 0..self.len() {
+            let e = self.entry(i).ok_or(Error::KeyTableCorrupt)?;
+            let keys = match self.file_keys(i) {
+                Some((a, c)) => Some((
+                    SecretBytes::take_from(&mut a.to_vec())?,
+                    SecretBytes::take_from(&mut c.to_vec())?,
+                )),
+                None => None,
+            };
+            out.push(NewEntry {
+                kind: e.kind,
+                path: Zeroizing::new(e.path.to_owned()),
+                file_id: e.file_id.unwrap_or([0; 16]),
+                size: e.size,
+                created_at: e.created_at,
+                modified_at: e.modified_at,
+                keys,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The stream keys of file entry `i`.
+    pub(crate) fn stream_keys(&self, i: usize) -> Result<Option<StreamKeys>, Error> {
+        match self.file_keys(i) {
+            Some((a, c)) => Ok(Some(StreamKeys::new(
+                SecretBytes::take_from(&mut a.to_vec())?,
+                SecretBytes::take_from(&mut c.to_vec())?,
+            ))),
+            None => Ok(None),
+        }
+    }
+
     /// Number of entries.
     pub fn len(&self) -> usize {
         self.descs.len()

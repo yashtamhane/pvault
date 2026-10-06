@@ -245,6 +245,30 @@ Normalization runs the UAX #15 algorithm in one fixed, wiped buffer:
 `H_w(main input)` equals the duress words. It is checked at duress setup and
 whenever either credential changes.
 
+## Recovery cards (spec 7.4a)
+
+The 135-byte card payload is:
+
+```text
+"PVC1" || u8(version = 1) || vault_id[16] || u8(mode)
+|| card_set_id[8] || u8(share_x) || share[96] || check[8]
+
+check = first 8 bytes of SHA-512("pvault/v1/card" || preceding 127 bytes)
+```
+
+`mode` is 0 for a bound card (`share_x = 3`) and 1 for a portable card
+(`share_x = 1` for Card A or 2 for Card B). The typed form is Crockford
+Base32 over the payload as one big-endian bit string: exactly 216 symbols,
+printed in groups of four. A QR code contains the raw payload as one byte-mode
+segment at error-correction level M, using the smallest fitting version and
+the encoder's automatically selected mask.
+
+Vector: `testdata/pvault_card.txt`. It fixes the payload fields and publishes
+the payload, Base32 text, QR width and row-major QR module bits (MSB first,
+zero-padded only at the tail). Python `hashlib`, independent integer bit
+extraction and Python `qrcode` 8.2 generate the expected values; pvault code
+is not used.
+
 ## Custom-passphrase estimator protocol (SI-51)
 
 The parent re-executes the pvault binary with the single argument
@@ -461,6 +485,7 @@ Vectors: `testdata/pvault_tokens.txt` (one per scope).
 | `rfc4231_hmac_sha512.txt` | RFC 4231 Section 4, Test Cases 1–4, 6, 7 | 6 |
 | `rfc9106_argon2id.txt` | RFC 9106 Section 5.3 | 1 |
 | `xchacha20_draft.txt` | draft-irtf-cfrg-xchacha-03 Appendix A.3.2.1 (XChaCha20, counter 0) | 1 |
+| `pvault_card.txt` | Independent Python payload/Base32 plus `qrcode` 8.2 byte-mode/M module matrix | 1 |
 | `unicode/NormalizationTest-17.0.0.txt` | Unicode 17.0.0 UCD, unchanged (SHA-256 `5019ffd5…87db`) | 19,000+ lines |
 
 The Wycheproof vectors are at commit `3fa63dd0344abb611f1fb1d77e119938603ea230`.

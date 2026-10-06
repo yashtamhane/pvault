@@ -20,6 +20,14 @@ allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "Unicode-3.0"]
 exceptions = [
     { allow = ["GPL-3.0-only"], crate = "pvault-core" },
     { allow = ["GPL-3.0-only"], crate = "pvault-cli" },
+    { allow = ["GPL-3.0-only"], crate = "pvault-tests" },
+    # Milestone 4 (A7, approved 2026-10-05): quirc-derived code in rqrr (ISC).
+    { allow = ["ISC"], crate = "rqrr" },
+    # Milestone 4 (A7): hasher used by rqrr's LRU cache (Zlib).
+    { allow = ["Zlib"], crate = "foldhash" },
+    # Milestone 4 (A7): Option helpers used by directories (MPL-2.0; no
+    # Exhibit B notice, so the GPL secondary-license clause applies).
+    { allow = ["MPL-2.0"], crate = "option-ext" },
 ]
 confidence-threshold = 0.93
 # By default the license check skips crates that are reachable only through

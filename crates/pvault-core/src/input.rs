@@ -29,6 +29,7 @@ pub const MAX_LINE: usize = MAX_RAW_BYTES;
 pub struct SecretLine {
     buf: SecretBytes<MAX_LINE>,
     len: usize,
+    terminated: bool,
 }
 
 impl SecretLine {
@@ -36,7 +37,14 @@ impl SecretLine {
         Self {
             buf: SecretBytes::zeroed(),
             len: 0,
+            terminated: false,
         }
+    }
+
+    /// Whether the line ended with LF (rather than end of input). Card text
+    /// is accepted only after a complete, terminated final line (A1).
+    pub fn terminated(&self) -> bool {
+        self.terminated
     }
 
     /// The bytes of the line, without its line ending.
@@ -131,6 +139,7 @@ pub fn read_line<S: ByteSource + ?Sized>(source: &mut S) -> Result<SecretLine, I
         };
         any = true;
         if byte == b'\n' {
+            line.terminated = true;
             return Ok(line);
         }
         if pending_cr {

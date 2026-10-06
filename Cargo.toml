@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/pvault-core", "crates/pvault-cli"]
+members = ["crates/pvault-core", "crates/pvault-cli", "crates/pvault-tests"]
 # cargo-fuzz targets build with nightly only (spec 12).
 exclude = ["fuzz"]
 
@@ -40,6 +40,13 @@ vsss-rs = { version = "=6.0.1", default-features = false }
 # Custom-passphrase strength estimate (SI-51): called only inside the
 # creation-time estimator child process.
 zxcvbn = { version = "=3.1.1", default-features = false }
+# Recovery cards (spec 7.4a to 7.4c; approved for Milestone 4, A7).
+qrcode = { version = "=0.14.1", default-features = false }
+rqrr = { version = "=0.11.0", default-features = false }
+png = "=0.18.1"
+# Per-user settings folder (7.9, 9.7; approved for Milestone 4, A7).
+directories = "=6.0.0"
+tempfile = "3.27.0"
 assert_cmd = "2"
 criterion = "0.8.2"
 proptest = "1.11"
@@ -56,6 +63,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_Security_Authorization",
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
     "Win32_System_WindowsProgramming",

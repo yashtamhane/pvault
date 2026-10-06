@@ -1,0 +1,426 @@
+# pvault command-line interface
+
+**Status:** approved by the author for Milestone 4 (2026-10-05; A1). This
+defines the Milestone 4 command surface (spec 14, SI-47, SI-19, SI-41). Later milestones add commands and options; anything not listed
+here does not exist in Milestone 4. Conflicts with the governing spec are
+listed in section 9.
+
+## 1. Conventions
+
+```text
+pvault [GLOBAL OPTIONS] <command> <vault-dir> [ARGUMENTS] [OPTIONS]
+```
+
+- The vault directory is the first argument of every vault command.
+- **Output streams.** Requested data (the `list` output, `status` report)
+  goes to standard output. Messages, progress and warnings go to standard
+  error. Prompts and anything shown for the owner's eyes only (the generated
+  passphrase) go to the **terminal device** (`/dev/tty`, Windows
+  `CONIN$`/`CONOUT$`), never to standard output or standard error.
+- Messages are fixed English text without color.
+- Sizes are bytes. Times are UTC, `YYYY-MM-DDTHH:MM:SSZ`.
+
+### 1.1 What output may contain
+
+| Content | Where it may appear |
+| --- | --- |
+| Passphrases, card text, shares, keys | Never on standard output or standard error. The generated passphrase only on the terminal device (section 2) |
+| Stored vault paths (from the key table) | Only in `list` output, which is what the owner asked for. No message names a stored path |
+| A vault path the owner typed in this command | In that command's messages, in its normalized (NFC) form: `add` ("Added …", "Stored as: …"), `get` ("Exported … to …"), `rm` errors, path-rule errors |
+| Other entries' paths | Never in messages. A collision says that an existing entry differs only by case or Unicode form, without naming it; `list` shows it |
+| Native file-system paths (vault folder, source, destination, card folder, settings folder, recorded export and card paths) | In messages, rendered by section 1.2 |
+| Counts and sizes | Anywhere ("Removed 12 entries.") |
+
+### 1.2 Safe rendering
+
+Every path or file name that pvault prints, on any stream, goes through one
+rendering function, so no output can carry terminal control sequences or
+reorder text:
+
+- The text is decoded as UTF-8 (Unix bytes) or UTF-16 (Windows units).
+  Invalid bytes are written `\xHH`; unpaired surrogates `\u{D800}` style.
+- These characters are written as `\u{XXXX}` (uppercase hex, no padding
+  beyond 4 digits): C0 controls U+0000–U+001F, DEL U+007F, C1 controls
+  U+0080–U+009F, U+2028, U+2029, the bidirectional controls U+061C,
+  U+200E, U+200F, U+202A–U+202E, U+2066–U+2069, U+FEFF, and every code point
+  that is unassigned in Unicode 17.0.0 or is a noncharacter.
+- A backslash is written `\\`. The escaping is therefore unambiguous and
+  reversible.
+- `list` uses the same rendering for stored paths. Stored paths can contain
+  C1 and bidirectional controls (7.8 rejects only C0 and DEL), so this is
+  required, not cosmetic. To address such an entry, the owner types the
+  actual characters; the escaped form is display only.
+
+### 1.3 Where plaintext and card files may be written (O3)
+
+Exported files and card files are written only to a folder whose file system
+pvault identifies as local and enforcing owner-only access in its own kernel
+driver (decided 2026-10-06, fail closed). A successful permission-setting call
+is never taken as proof.
+
+| Platform | Supported destination types | Why |
+| --- | --- | --- |
+| Linux | `ext4`, `xfs`, `btrfs`, `tmpfs` | Local kernel file systems that store and enforce POSIX owner and mode bits (`tmpfs` in memory) |
+| macOS | `apfs`, `hfs` | Local file systems that store and enforce owner and mode bits |
+| Windows | `NTFS`, `ReFS` on a local volume (8.5 Q1 to Q4) | Store and enforce the owner-only DACL pvault sets |
+
+Refused: FAT and exFAT (no owner or permission storage; the mount or nothing
+decides), FUSE (`fuseblk`, `fuse.*`: a user-space server decides), network
+file systems (`nfs`, `cifs`, `smbfs`, `afpfs`, `webdav`, Windows shares: the
+server decides), any other or unknown type (for example `zfs`, `overlay`,
+`9p`), and any folder whose file system cannot be identified. The refusal is
+exit 6 and comes before any secret is read and before any destination file
+or record entry exists.
+
+## 2. Secrets, confirmations and the terminal
+
+**Secrets** are the passphrase (typed, confirmed or typed back) and recovery
+card text (Base32). They are **never** accepted as command-line arguments or
+from environment variables, and no option or variable for them exists (F79).
+
+| Source | When | Rules |
+| --- | --- | --- |
+| Terminal, hidden | Default | Echo off; restored on normal return, error, Ctrl-C, Ctrl-Break, SIGINT, SIGTERM, SIGHUP, SIGQUIT and window close. At most 1,024 raw bytes per line; a line ends at the first LF, and one CR before it is removed (SI-51 section 3) |
+| Standard input | Only with the global `--secrets-stdin` | Standard input must not be a terminal (refused if it is). Secrets are read **one complete line each** (terminator required), in the order listed for each command in section 6. A card's text is one line holding exactly 216 symbols (separators allowed), validated as a whole line; more or fewer symbols reject it. pvault reads exactly the lines it needs and nothing more |
+| Standard input without `--secrets-stdin` | Never | A secret prompt on a non-terminal standard input is refused |
+
+**Card text typed at the terminal.** A printed card shows its text on 7
+lines, so the hidden card prompt accepts one or more lines. Input is read and
+validated **whole lines at a time**:
+
+1. pvault reads one complete line, including its terminator (LF, with an
+   optional CR before it), at most 1,024 bytes. A line is never split or
+   partly used.
+2. The whole line is validated: every character must be a Crockford symbol
+   (7.4a input normalization: `I`/`L` read as `1`, `O` as `0`, any case) or a
+   separator (space or hyphen). One invalid character rejects the attempt.
+3. The line's symbols are added to the count. If the count now **exceeds**
+   216, the attempt is rejected ("The card text has more than 216 symbols."),
+   including when the excess is on the line that crossed 216.
+4. If the count is **exactly** 216, the attempt is complete, and only now is
+   the card text accepted for comparison. No further line is read for it.
+5. Otherwise the next line is read. An empty line before 216, a ninth line,
+   or end of input (no terminator after the last symbols) rejects the attempt.
+
+A rejected attempt consumes nothing beyond the line that caused it; the
+remaining type-ahead is discarded as described next. Nothing is echoed.
+
+**Pending input is discarded before each hidden prompt.** Pasting can queue
+more lines than a prompt uses (for example a card followed by a stray line).
+Before each hidden prompt is displayed and read, pvault discards all pending
+terminal input: on Unix the echo-off `tcsetattr` uses `TCSAFLUSH` (input
+received but not yet read is discarded), and on Windows
+`FlushConsoleInputBuffer` runs on the console input handle after
+`SetConsoleMode`; only then is the prompt shown. pvault also clears and wipes
+its own buffered input: the console reader's buffer belongs to one prompt and
+is wiped when that prompt ends, and the Unix reader takes one byte at a time
+with no buffer. This reduces the chance that stray queued lines answer a
+later prompt. It does **not** prove which prompt was visible when a line was
+typed, and it cannot stop input that arrives after the flush (for example
+the tail of a slow paste); such input is read as the answer to the prompt
+on screen. Type-ahead before a prompt is lost by design. Under
+`--secrets-stdin` lines are consumed strictly in the documented order and
+unread lines stay unread.
+
+**Acknowledgments** ("Press Enter after printing") are read from the terminal
+device when one exists, also under `--secrets-stdin`. Without a terminal they
+are skipped; they are never read from standard input.
+
+**Confirmations** (typed phrases such as `ACCEPT MEDIUM PASSPHRASE` or
+`DELETE INIT LEFTOVERS 1a2b3c4d`) are not secrets, but they authorize risky
+actions. They are read **only from the terminal device**, never from standard
+input, and their input is echoed. Without a terminal, every confirmation is
+treated as declined (8.3: "non-interactive operation … leaves … blocked").
+
+**Shown secrets.** The generated passphrase is displayed only on the terminal
+device. Without a terminal, generated mode is refused (use `--custom` with
+`--secrets-stdin`). After the owner presses Enter, pvault clears the screen
+on a best-effort basis; terminal scrollback, logs and recordings may still
+hold it (7.4b remnants). **Recovery-card text is never displayed** (decided
+2026-10-05); cards exist only as files. Card Base32 may be **typed** back,
+hidden, for verification.
+
+## 3. Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| 0 | Success |
+| 1 | The operation failed. Includes `Unlock failed.`, damaged data and I/O errors |
+| 2 | Usage error (unknown command or option, bad argument) |
+| 3 | The vault is in use by another pvault process |
+| 4 | Blocked until the owner acts: a pending journal, unowned leftovers, a stale export, a declined confirmation |
+| 5 | The outcome is uncertain: for a vault, run `fsck` (outcome unknown, durability unknown, indeterminate state, unresolved cleanup); for an export, the file was published but its durability is unconfirmed |
+| 6 | Refused by the environment: unsupported file system (for a vault change, or an export or card destination without owner-only permissions), memory policy or resource limit, no terminal for a required prompt, unusable settings folder |
+| 7 | Cancelled by the owner inside pvault: declining at a prompt that cancels (for example `ACCEPT MEDIUM PASSPHRASE`), or end of input at a hidden terminal prompt (Unix: Ctrl-D on an empty line). The Windows console delivers Ctrl-Z as the character U+001A, which is input (refused as a control character), not cancellation |
+
+**Native termination is not cancellation** (decided 2026-10-06, O2). Ctrl-C,
+Ctrl-Break, SIGINT, SIGTERM, SIGHUP, SIGQUIT and closing the console window
+end pvault through the system's default action after the terminal is
+restored (7.6a). No pvault exit code is returned: on Unix the process is
+ended by the signal (shells report 128 + the signal number, for example 130
+for SIGINT); on Windows Ctrl-C and Ctrl-Break end it with
+`STATUS_CONTROL_C_EXIT` (0xC000013A; `%ERRORLEVEL%` -1073741510). Crash
+safety covers such an ending as it covers any process crash.
+
+Every failure that depends on a secret (wrong passphrase, MAC failure, a
+duress match) is `Unlock failed.` with code 1, so the code never reveals more
+than the message.
+
+## 4. Global options
+
+| Option | Meaning |
+| --- | --- |
+| `--secrets-stdin` | Read secrets from standard input, one per line, in the documented order (section 2) |
+| `--help`, `-h` | Help |
+| `--version`, `-V` | Version |
+
+## 5. Command summary (Milestone 4)
+
+| Command | Authentication (5.7) | Duress check | Vault lock (8.4) |
+| --- | --- | --- | --- |
+| `init` (new) | none | n/a | exclusive |
+| `init` (resume, header present) | Path A | no | exclusive |
+| `init` (resume, no header) | init-journal MAC | no | exclusive |
+| `add`, `rm` | ordinary unlock | yes | exclusive |
+| `list`, `get` | ordinary unlock | yes | exclusive for the unlock, then shared |
+| `status` | none | no | shared |
+| `clean-partials` | none | no | none (7.9) |
+
+Not available in Milestone 4 (spec 5.7 commands of later milestones, which
+the parser does not accept yet): `recover`, `verify-card`, `convert`,
+`duress`, `fsck`, `mount`, owner Revoke, Erase, K2.
+
+## 6. Commands
+
+### 6.1 `pvault init`
+
+```text
+pvault init <vault-dir> --mode portable --cards-dir <dir>
+            [--words <10-16> | --custom]
+            [--kdf-memory <MiB>] [--kdf-iterations <n>] [--kdf-parallelism <n>]
+            [--card-a-png <file>] [--card-b-png <file>]
+```
+
+| Argument or option | Meaning |
+| --- | --- |
+| `<vault-dir>` | The vault folder. Created if absent (8.3 bootstrap); if it exists it must be empty apart from zero-length `vault.gate` / `vault.lock` |
+| `--mode portable` | Required. Milestone 4 builds portable mode only; `--mode bound` gives "Bound mode is not available in this version." (section 9, K1) |
+| `--cards-dir <dir>` | Required. An existing folder **outside** the vault for the two card files (7.4b). No default. It must be on a supported destination file system (1.3); otherwise `init` refuses (exit 6) before anything is created, the vault folder included, and before any secret is read (O3) |
+| `--words <n>` | Generated passphrase of `n` words, 10 to 16. Default 12 |
+| `--custom` | The owner writes the passphrase (estimated at creation only, SI-51) |
+| `--kdf-memory <MiB>` | Argon2id memory, 256 to 4096; default 1024. Must also pass this computer's policy (≤ 50 % of RAM) and resource checks (4.3). Below 1024 prints "Lower memory makes passphrase guessing cheaper." |
+| `--kdf-iterations <n>` | Argon2id `t`, 3 to 16; default 4 |
+| `--kdf-parallelism <n>` | Argon2id `p`, 1 to 8; default 4 |
+| `--card-a-png <file>`, `--card-b-png <file>` | Verify a printed card from a PNG photo instead of typing its text. File paths are not secrets. **Needs the terminal device, also with `--secrets-stdin`** (decided 2026-10-06, O1): the photo is opened only after the printing acknowledgment on the terminal. Without a terminal: "Verifying a card from a PNG photo needs a terminal for the printing acknowledgment, also with --secrets-stdin. Nothing was written." (exit 6), before anything is created |
+
+**Flow (new vault):**
+1. Bootstrap and preflight (8.3 steps 1 to 7): open the parent, create the folder if absent, identify the file system, create the lock files, take the lock, re-check emptiness, run the preflight. Refusals use the 8.5 and 8.4 messages. The settings folder must allow durable registration (`docs/M4_READINESS.md` 7.1); otherwise `init` refuses here, before writing anything.
+2. Passphrase:
+   - **Generated** (needs the terminal device): the words, the entropy (`n × log2(7776)` bits) and the rating are shown on the terminal. "Write this passphrase down. Press Enter when done."
+   - **Custom:** "Enter the new passphrase:" then "Enter it again:" (a mismatch: "The passphrases do not match.", and the pair is asked again; three mismatches end the command, exit 1, nothing written). Refusals and warnings follow SI-51 section 3, the NFC notice when applicable, then the estimate: weak is refused; medium needs the confirmation `ACCEPT MEDIUM PASSPHRASE`; strong continues. Estimator failure refuses the passphrase.
+3. "Deriving keys…" (Argon2id), then the init journal and key table (8.3).
+4. Card files are written to `--cards-dir` (`docs/M4_READINESS.md` 11): `pvault-<vault-id-8hex>-<set-id-8hex>-card-a.svg` and `…-card-b.svg`. Standard error: "Card files written: <path A>, <path B>. Print both, then keep the printed cards in two different places."
+5. Printing acknowledgment on the terminal: "Press Enter after printing." (with `--card-*-png`: "Print both cards and save the PNG photos at the paths you gave, then press Enter."). It is read from the terminal device also under `--secrets-stdin`; without a terminal it is skipped, which is why `--card-*-png` needs one.
+6. Delivery verification (6.4), Card A then Card B. Per card, the method is:
+   - `--card-a-png` / `--card-b-png` given: that file is opened **now**, after the acknowledgment of step 5 (it did not exist when the command started) and decoded;
+   - otherwise, with a terminal and no `--secrets-stdin`: "Card A: enter the path of a PNG photo of the printed card, or press Enter to type its text:", then the photo path or the hidden card prompt (section 2);
+   - otherwise (`--secrets-stdin`): the next standard-input line is the card text.
+
+   A mismatch gives "Card A does not match what was printed." Interactive verification allows **three** attempts per card (each attempt asks for the method again). Under `--secrets-stdin`, and for a `--card-*-png` file, there is exactly **one** attempt: a mismatch ends the setup, because a retry would desynchronize the input. Ending the setup rolls it back; the cards are invalid.
+7. Type-back: "Type your passphrase from memory:" (hidden). Interactive: three attempts. Under `--secrets-stdin`: one line, one attempt; a mismatch rolls the setup back.
+8. Commit (8.3), then the card files are deleted through the handles kept open since they were created (`docs/M4_READINESS.md` 11), then the journal is removed.
+9. "Vault created: <vault-dir> (portable, vault ID <32 hex>). Keep Card A and Card B apart; together they can open the vault without the passphrase."
+
+**Non-interactive `init`** (`--secrets-stdin`; custom passphrases only). Every
+branch, with the exact lines consumed:
+
+| Point | Behavior | Lines read |
+| --- | --- | --- |
+| Start | Generated mode (no `--custom`) without a terminal device: refused, exit 6. `--card-a-png` or `--card-b-png` without a terminal device: refused, exit 6, before anything is created (O1) | 0 |
+| Passphrase | Line 1: the passphrase. Line 2: the same again. A mismatch ends the command (exit 1, nothing written; no retry) | 2 |
+| Estimate | Strong continues. Medium needs a confirmation: from the terminal device if one exists, otherwise refused (exit 6). Weak or estimator failure: refused (exit 1). Nothing written | 0 |
+| Printing | Acknowledgment from the terminal device if one exists (always, with `--card-*-png`), otherwise skipped. Never read from standard input | 0 |
+| Card A | `--card-a-png`: the file is read after the acknowledgment, no line. Otherwise the next line is Card A's text. One attempt | 0 or 1 |
+| Card B | As Card A | 0 or 1 |
+| Type-back | The next line. One attempt | 1 |
+| End | Nothing more is read; remaining input is left unread | |
+
+Total: 3 to 5 lines. The card lines **cannot be prepared in advance**: the cards
+are generated during the run. The supplier of standard input must wait for
+the "Card files written" line on standard error (or for the files), read the
+card text from the SVG files or the printouts, and only then write lines 3
+and 4. The test harness does exactly that. End of input before a needed line:
+"Input ended before all secrets were read." (exit 1), and the setup is rolled
+back if it had started.
+
+**Resume** (`pvault init <vault-dir>` on a folder with an init journal or a
+committed header, 8.3 restart table):
+- With a header that matches the journal: "This vault's setup was interrupted after it was saved. Enter the passphrase to finish:" (Path A; no duress check). Then the post-commit completion.
+- Without a header: "This folder holds an interrupted setup. Enter the passphrase used for it:" (the journal's `passphrase_kind` selects the handling). Authenticated artifacts are removed, and the setup is rolled back: "The interrupted setup was removed. Run pvault init again." Unowned candidates are listed with name, file identity and size; removing them needs the terminal confirmation `DELETE INIT LEFTOVERS <first 8 hex of setup_id>`.
+- `--secrets-stdin` on resume: exactly one line, the passphrase. Confirmations (residue removal, stale card files) come only from the terminal device; without one they are declined and the command reports what blocks it (exit 4).
+
+### 6.2 `pvault add`
+
+```text
+pvault add <vault-dir> <source-file> <vault-path> [--replace]
+```
+
+- `<source-file>`: a regular file. Rules in `docs/M4_READINESS.md` section 10 (no symlink or reparse point as the final component, no special files, change detection).
+- `<vault-path>`: normalized to NFC; code points unassigned in Unicode 17.0.0 are refused; the 7.8 rules apply; it must not collide (canonical caseless match) with an existing entry unless `--replace` names exactly that entry's stored path. Missing parent folders are created. If normalization changed the text: "Stored as: <path>". All paths are printed with section 1.2.
+- `--replace`: replaces exactly that file entry with a new object, ID and keys (7.7). Replacing a folder with a file is refused.
+- Secrets: the passphrase (one line with `--secrets-stdin`).
+- Success: "Added <vault-path> (<size> bytes)." Created parents: "Created <n> folders." (their paths are prefixes of the typed path).
+- Pending leftovers and journals: section 7 of this document and `docs/M4_READINESS.md` section 9.
+
+### 6.3 `pvault list`
+
+```text
+pvault list <vault-dir> [<vault-path>]
+```
+
+Lists every entry, or the entry and descendants of `<vault-path>`, in key-table
+order. One line per entry on standard output, tab-separated:
+
+```text
+<kind>\t<size>\t<modified>\t<path>
+file	1048576	2026-10-05T12:00:00Z	docs/report.pdf
+dir	-	2026-10-05T12:00:00Z	docs
+```
+
+Paths cannot contain tabs or line breaks (7.8), so the format is unambiguous.
+Secrets: the passphrase.
+
+### 6.4 `pvault get`
+
+```text
+pvault get <vault-dir> <vault-path> <destination> [--force]
+```
+
+- Exports one file entry to `<destination>`, which must not exist. The destination folder must be on a supported destination file system (1.3); otherwise `get` refuses (exit 6) **before the passphrase is read** and before any file or record is created (O3). Exporting **from** a vault on another file system to a supported destination works.
+- Writes `<destination>.pvpartial` first (7.9), verifies every chunk, then renames without replacing. The suffix `.pvpartial` is 10 ASCII characters: 10 bytes in UTF-8 and 10 UTF-16 code units. Whether the suffixed name fits is decided by the destination's own file system, in its own units (bytes on ext4, XFS, Btrfs and APFS; UTF-16 units on NTFS, ReFS, FAT, exFAT and HFS+). pvault does not guess a limit: if exclusive creation fails because the name is too long (`ENAMETOOLONG`; Windows `STATUS_OBJECT_NAME_INVALID` or `ERROR_FILENAME_EXCED_RANGE`), `get` refuses before writing anything: "The destination name is too long to add the .pvpartial suffix on this file system." The same rule applies to card file names.
+- `--force` gives "The --force option is not available in this version; nothing was written." (exit 2) (SI-11; refused throughout Milestone 4).
+- Before exporting, stale exports of this vault are offered for removal (7.9): "An interrupted export of this vault left these files: <list>. Delete them? Type DELETE STALE EXPORTS to confirm:". Declining leaves them and continues. A file is deleted only if its recorded identity, including a recorded birth time, still matches (`docs/M4_READINESS.md` 7.2); otherwise pvault deletes nothing and names it so the owner can check it ("pvault cannot prove that <path> is the file it created; delete it yourself if it is. It may contain exported plaintext."). The settings folder must allow durable registration (`docs/M4_READINESS.md` 7.1); otherwise `get` refuses before creating anything (exit 6).
+- Secrets: the passphrase.
+- **Publication.** The export is *published* when the no-replace rename makes `<destination>` visible.
+  - A failure **before** publication (decryption, verification, writing, flushing the partial, or a rename that verifiably did not happen): the partial is deleted through its open handle, nothing exists at `<destination>`, exit 1.
+  - A failure **after** publication (the parent folder's flush, or the record update that follows): the exported file is **kept**: "Exported <vault-path> to <destination>, but the export could not be confirmed as durable." (exit 5). pvault never deletes a published file.
+  - A rename that reports failure is classified by looking at the names: if `<destination>` is the file pvault holds open, it was published; if the partial name still is, it was not; anything else is reported as "The export's outcome could not be determined; check <destination>." (exit 5), and nothing is deleted.
+- Success: "Exported <vault-path> to <destination> (<size> bytes)."
+
+### 6.5 `pvault rm`
+
+```text
+pvault rm <vault-dir> <vault-path> [--recursive]
+```
+
+Removes a file entry, or an empty folder entry. A non-empty folder needs
+`--recursive`. Secrets: the passphrase. Success: "Removed <n> entries."
+
+### 6.6 `pvault status`
+
+```text
+pvault status <vault-dir>
+```
+
+No passphrase, shared lock only, never writes to the vault. Reports public
+state only (5.8):
+
+```text
+Vault ID:            <32 hex>
+Mode:                portable
+Generation:          <n>   (key table <n>)
+Argon2id:            <m> MiB, t=<t>, p=<p>   (this computer: OK | needs more memory)
+Passphrase kind:     generated | custom
+Duress:              off | configured
+Card set:            <16 hex>
+Pending operation:   none | <op> <phase> (not verified)
+File system:         <type>, supported | <type>, read-only for pvault
+Rollback record:     highest generation seen here <n> | none | unavailable
+Protection:          core dumps <off | best effort>, memory locking <available | limited>
+```
+
+- A header that does not parse: "The header does not parse." (exit 1). Allowed for `status` by 5.8.
+- An exclusive holder: "The vault is in use by another pvault process." (exit 3).
+- A lower generation than recorded: the 9.7 warning.
+- "Duress: configured" on a vault made by a later version is shown as is; Milestone 4 itself cannot configure duress (section 9, K6).
+
+### 6.7 `pvault clean-partials`
+
+```text
+pvault clean-partials
+```
+
+Takes no vault lock (7.9). Lists stale export records (their transfer lock is
+free) and, once SI-10 is approved, stale card-file records. Entries whose
+operation is still running are skipped entirely. Deletion needs the terminal
+confirmation `DELETE <n> STALE FILES`; each file is reopened without following
+links and deleted only if its recorded identity matches, including a recorded
+birth time. Entries without a recorded birth time are never deleted: they are
+reported for the owner to handle, and dropped from the record only after
+confirmation. Without a terminal it only lists (exit 4 if anything is stale).
+
+## 7. Messages
+
+Existing, unchanged: every message of spec 4.3, 5.8, 7.3, 7.8, 8.4, 8.5 and the
+Milestone 3 messages (SPEC_ISSUES 10.11, decided 2026-10-05):
+
+| Condition | Message |
+| --- | --- |
+| Any secret-dependent unlock failure | `Unlock failed.` |
+| Unknown word | `Word N is not in the word list.` |
+| Policy limit | `This vault needs <m> MiB of memory, more than this computer can provide.` |
+| Resource limit | `Not enough free memory to open this vault right now (needs <m> MiB).` |
+| Lock | `The vault is in use by another pvault process.` |
+| File system | `This file system cannot safely store vault changes (<type>). Copy the vault to a supported drive to change it.` |
+| Entry limit | `This vault can hold at most 65,536 files and folders.` |
+| Outcome unknown | `The header replacement outcome could not be determined. Run fsck before making further changes.` |
+| Generation changed | `The vault changed during this operation. The header was not committed.` |
+| Indeterminate | `The vault state could not be determined safely. No cleanup was performed. Run fsck.` |
+| Durability unknown | `The new header is visible, but commit durability could not be confirmed; run fsck.` |
+| Missing tracking header temp | (Milestone 3 text; recovery only) |
+
+New in Milestone 4 (wording for approval):
+
+| Condition | Message |
+| --- | --- |
+| Pending journal of another kind | `This vault has an unfinished <operation>. Run fsck to finish it.` |
+| Unresolved `update` cleanup | `This vault's last change was saved, but its cleanup could not be finished because a file it needs is missing. Nothing was deleted. Run fsck.` (followed by the files not referenced by the current key table) / `Type CLOSE UNFINISHED CLEANUP <8 hex> to stop tracking it (no file is deleted):` |
+| Unowned leftovers block | `Files pvault cannot prove it created block this change: <names>. Nothing was deleted.` |
+| Card structure | `This is not a pvault recovery card.` / `This card belongs to another vault.` / `This is an old card.` / `These two cards are both Card A.` / `These two cards are both Card B.` / `The card text must have 216 characters; <n> were entered.` / `The card text contains an invalid character at position <n>.` |
+| PNG | `The image is not a PNG file.` / `The image is too large.` / `Animated PNG images are not supported.` / `No QR code was found in the image.` / `More than one QR code was found in the image.` |
+| Card destination | `Card files cannot be written inside the vault folder.` / `A file named <name> already exists in <dir>; nothing was written.` |
+| Private destinations (O3) | `pvault writes exported files and recovery cards only where it can confirm that the file system keeps them private to you (owner-only access). This destination is on <type>, which it cannot confirm. Nothing was written. Choose a folder on <suggestion>.` (exit 6; `<type>` is the reported type, or "unidentified or network file system"; the suggestion names the supported local types of 1.3) |
+| Card photos (O1) | `Verifying a card from a PNG photo needs a terminal for the printing acknowledgment, also with --secrets-stdin. Nothing was written.` (exit 6) |
+| Path input (`<path>` is the owner's typed path, normalized) | `<path> already exists in the vault. Use --replace to replace it.` / `<path> collides with an existing entry that differs only by letter case or Unicode form. Use pvault list to see it.` / `--replace must name the stored path exactly. Use pvault list to see it.` / `This path is not allowed in a vault: <reason>.` / `<path> contains a character this version of pvault does not support.` |
+| Source | `The source is not a regular file.` / `The source is a symbolic link or reparse point; give the file itself.` / `The source file changed while it was being added; the vault was not changed.` |
+| Input | `The passphrases do not match.` / `Input ended before all secrets were read.` / `The card text has more than 216 symbols.` |
+| Export | `Exported <vault-path> to <destination>, but the export could not be confirmed as durable.` / `The export's outcome could not be determined; check <destination>.` / `The destination name is too long to add the .pvpartial suffix on this file system.` / `<destination> already exists; nothing was written.` / `<destination>.pvpartial already exists; nothing was written.` / `The destination folder is a symbolic link or reparse point.` / `This file system cannot export without overwriting safely; nothing was written.` |
+| Source in use (Windows) | `The source file is in use by another program.` |
+| Settings folder and records | `The pvault settings folder <path> is not private to you.` / `Exports and card files need a settings folder on a supported local drive (<type>).` / `The export could not be registered durably; nothing was exported.` / `The card files could not be registered durably; no card was written.` / `The export record <path> is damaged; pvault will not change it. Move it aside to continue.` (moving it aside leaves any export it tracked untracked; the message's help text says so) / `Too many unfinished exports are recorded. Run pvault clean-partials.` / `Too many unfinished card files are recorded. Run pvault clean-partials.` / `Card files cannot be tracked on this file system.` / `This path is too long to track safely.` |
+| Rollback record (9.7) | `This vault is older than a copy opened on this computer before (generation <g> < <r>). It may be an old copy.` (warning) / `Rollback detection is unavailable: <reason>.` (warning) / `The rollback record is full; this vault is not tracked.` (warning) |
+| Leftover confirmation | `Type DELETE VAULT LEFTOVERS <8 hex> to delete exactly these files:` |
+| Unprovable stale file | `pvault cannot prove that <path> is the file it created; delete it yourself if it is.` (exports add `It may contain exported plaintext.`; card files add `It may hold a recovery card.`) |
+| Duress setup (M4) | No message: there is no option. A duress match is `Unlock failed.` and changes nothing |
+
+## 8. Locking and journals in commands
+
+- Lock order and protocols: spec 8.4 (G + L). Every attempt is non-blocking.
+- `add`, `rm`, `list` and `get` check for a pending journal after the duress check (5.7). An authenticated `update` journal (if approved; `docs/M4_READINESS.md` section 9) is resolved under the exclusive lock before the command continues; `list` and `get` resolve it before they downgrade. Any other journal stops the command with exit 4.
+
+## 9. Conflicts with the governing spec
+
+| # | Spec | Conflict | Proposal |
+| --- | --- | --- | --- |
+| K1 | 1 ("Bound mode (default)") | Milestone 4 has portable mode only; a bound default cannot work yet | `--mode` is required in Milestone 4; the CLI default is decided when bound mode exists (with spec 16 item 3) |
+| K2 | 10.6, 7.3 | The spec does not say where a generated passphrase is shown when there is no terminal | Shown only on the terminal device; generated mode needs a terminal |
+| K3 | 7.3 (medium band), 10.6 | `ACCEPT MEDIUM PASSPHRASE` is a confirmation; confirmations come only from the terminal | Non-interactive custom passphrases must estimate strong |
+| K4 | 8.4 ("must stop and direct the owner to fsck") | Resolving an `update` journal inside `add`/`rm`/`list`/`get` is a new exception | Part of the SI-40 decision (`docs/M4_READINESS.md` section 9) |
+| K5 | 10.2 (`status` shows the protection state) | `status` cannot know the memory-locking result of another process | `status` reports this computer's capability (a test lock) and the core-dump state |
+| K6 | 8.3 ("optional duress") | Milestone 4 offers no duress setup (decided 2026-10-05) | Temporary limitation; documented in the spec |
+| K7 | 7.9 (`.pvpartial` beside the destination) | Some destination names leave no room for the 10-character suffix; the limit and its units depend on the destination file system | Refused when exclusive creation reports the name as too long (6.4); no limit is guessed |
+| K9 | 10.6 (secrets one per line) | Card text on a printed card spans 7 lines, and a non-interactive `init` cannot know card text before the cards exist | Terminal card entry may span lines (section 2); under `--secrets-stdin` a card is one line, supplied after the cards are written (6.1) |
+| K10 | 7.4b, 7.9 (no display of secrets; terminal output) | Stored paths may contain C1 and bidirectional controls, which a terminal would interpret | Safe rendering of every printed path (1.2) |
+| K8 | none | Exit codes are not in the spec | Section 3 |
+| K11 | 7.4c, 6.4 | A photo of a newly printed card cannot exist before the cards are written; without an acknowledgment pause a non-interactive run would read it too early | Decided 2026-10-06 (O1): `--card-*-png` needs the terminal device; the photo is read after the terminal acknowledgment (6.1) |
+| K13 | 7.9, 7.4b (owner-only files) | Owner-only access can be relied on only where the local kernel enforces it; FAT/exFAT have none, FUSE and network servers decide for themselves, and an unidentified file system proves nothing | Decided 2026-10-06 (O3, fail closed): only the types of 1.3 are export and card destinations; everything else is refused (exit 6) before any secret, file or record; vaults elsewhere stay readable |
+| K12 | 7.6a (restore on signals) | Ctrl-C was listed under exit 7, but the accepted handlers restore the terminal and then end the process natively | Decided 2026-10-06 (O2): handlers unchanged; section 3 separates native termination from cancellation (exit 7) |

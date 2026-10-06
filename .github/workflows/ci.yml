@@ -58,6 +58,102 @@ jobs:
       - name: Windows locality probe
         if: runner.os == 'Windows'
         run: cargo test -p pvault-core --lib --locked windows_native_locality_probe -- --include-ignored --nocapture --test-threads=1
+      # Real FAT, exFAT and (Linux) FUSE `fuseblk` file systems on disposable
+      # images (Milestone 4, docs/M4_READINESS.md 6.3 and 17): vault refusal
+      # (F74) and the O3 refusal of export and card destinations. A mocked
+      # type does not replace these.
+      - name: Mount disposable FAT and exFAT images (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dosfstools exfatprogs exfat-fuse
+          truncate -s 64M "$RUNNER_TEMP/fat.img" "$RUNNER_TEMP/exfat.img" "$RUNNER_TEMP/fuse.img"
+          mkfs.vfat -F 32 -n PVFAT "$RUNNER_TEMP/fat.img"
+          mkfs.exfat -L PVEXFAT "$RUNNER_TEMP/exfat.img"
+          mkfs.exfat -L PVFUSE "$RUNNER_TEMP/fuse.img"
+          sudo mkdir -p /mnt/pvfat /mnt/pvexfat /mnt/pvfuse
+          ids="uid=$(id -u),gid=$(id -g),umask=077"
+          sudo mount -t vfat -o "loop,$ids" "$RUNNER_TEMP/fat.img" /mnt/pvfat
+          sudo mount -t exfat -o "loop,$ids" "$RUNNER_TEMP/exfat.img" /mnt/pvexfat
+          # exFAT through FUSE on a block device reports `fuseblk` (O3).
+          dev=$(sudo losetup -f --show "$RUNNER_TEMP/fuse.img")
+          echo "PVFUSE_DEV=$dev" >> "$GITHUB_ENV"
+          sudo mount.exfat-fuse -o "$ids" "$dev" /mnt/pvfuse
+          findmnt /mnt/pvfat /mnt/pvexfat /mnt/pvfuse
+          test "$(findmnt -no FSTYPE /mnt/pvfuse)" = fuseblk
+          echo "PVAULT_TEST_FAT_DIR=/mnt/pvfat" >> "$GITHUB_ENV"
+          echo "PVAULT_TEST_EXFAT_DIR=/mnt/pvexfat" >> "$GITHUB_ENV"
+          echo "PVAULT_TEST_FUSEBLK_DIR=/mnt/pvfuse" >> "$GITHUB_ENV"
+      - name: Mount disposable FAT and exFAT images (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p "$RUNNER_TEMP/pvfat" "$RUNNER_TEMP/pvexfat"
+          hdiutil create -quiet -size 64m -fs "MS-DOS FAT32" -volname PVFAT -layout NONE "$RUNNER_TEMP/fat.dmg"
+          hdiutil create -quiet -size 64m -fs ExFAT -volname PVEXFAT -layout NONE "$RUNNER_TEMP/exfat.dmg"
+          hdiutil attach -quiet -nobrowse -mountpoint "$RUNNER_TEMP/pvfat" "$RUNNER_TEMP/fat.dmg"
+          hdiutil attach -quiet -nobrowse -mountpoint "$RUNNER_TEMP/pvexfat" "$RUNNER_TEMP/exfat.dmg"
+          mount | grep -E "pvfat|pvexfat"
+          echo "PVAULT_TEST_FAT_DIR=$RUNNER_TEMP/pvfat" >> "$GITHUB_ENV"
+          echo "PVAULT_TEST_EXFAT_DIR=$RUNNER_TEMP/pvexfat" >> "$GITHUB_ENV"
+      - name: Mount disposable FAT and exFAT VHDs (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $volumes = @(
+            @{ Name = 'fat'; Fs = 'fat32'; Letter = 'P' },
+            @{ Name = 'exfat'; Fs = 'exfat'; Letter = 'Q' }
+          )
+          foreach ($v in $volumes) {
+            $vhd = Join-Path $env:RUNNER_TEMP "$($v.Name).vhdx"
+            $script = Join-Path $env:RUNNER_TEMP "$($v.Name).diskpart"
+            @(
+              "create vdisk file=`"$vhd`" maximum=128 type=expandable",
+              "select vdisk file=`"$vhd`"",
+              "attach vdisk",
+              "convert mbr",
+              "create partition primary",
+              "format fs=$($v.Fs) quick label=PV$($v.Name.ToUpper())",
+              "assign letter=$($v.Letter)"
+            ) | Set-Content -Encoding ascii $script
+            diskpart /s $script
+            if ($LASTEXITCODE -ne 0) { throw "diskpart failed for $($v.Name)" }
+            New-Item -ItemType Directory -Path "$($v.Letter):\pv" | Out-Null
+          }
+          Get-Volume -DriveLetter P, Q | Format-Table -AutoSize
+          "PVAULT_TEST_FAT_DIR=P:\pv" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "PVAULT_TEST_EXFAT_DIR=Q:\pv" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: FAT and exFAT image scenarios
+        env:
+          PVAULT_TEST_REQUIRE_IMAGES: "1"
+        run: cargo test -p pvault-tests --locked --test failure_scenarios -- fat_exfat
+      # Native (non-Unicode) file names, docs/M4_READINESS.md 17: on Linux
+      # (byte 0xFF) and Windows (unpaired surrogate) these cases must run; a
+      # skip, or a filter that matches no test, fails the step. macOS APFS
+      # rejects invalid UTF-8 names itself (documented limit), so the step
+      # does not run there.
+      - name: Native-name coverage (no skips)
+        if: runner.os != 'macOS'
+        shell: bash
+        env:
+          PVAULT_TEST_REQUIRE_NATIVE_NAMES: "1"
+        run: |
+          set -o pipefail
+          cargo test -p pvault-core --lib --locked -- --exact \
+            vault::tests::non_unicode_native_names_export_record_and_cleanup 2>&1 | tee native-unit.log
+          grep -q "test result: ok. 1 passed; 0 failed" native-unit.log
+          cargo test -p pvault-tests --locked --test failure_scenarios -- \
+            native_paths_are_rendered_safely 2>&1 | tee native-cli.log
+          grep -q "test result: ok. 1 passed; 0 failed; 0 skipped" native-cli.log
+      - name: Unmount the images (Linux)
+        if: always() && runner.os == 'Linux'
+        run: |
+          sudo umount /mnt/pvfat /mnt/pvexfat /mnt/pvfuse || true
+          if [ -n "${PVFUSE_DEV:-}" ]; then sudo losetup -d "$PVFUSE_DEV" || true; fi
+      - name: Detach the images (macOS)
+        if: always() && runner.os == 'macOS'
+        run: |
+          hdiutil detach -quiet "$RUNNER_TEMP/pvfat" || true
+          hdiutil detach -quiet "$RUNNER_TEMP/pvexfat" || true
 
   # Minimum supported Rust version (spec Section 12, SI-05). Must pass on all
   # three operating systems before a milestone is accepted.
@@ -149,7 +245,7 @@ jobs:
         run: PVAULT_FUZZ_SEEDS="$PWD/fuzz/corpus" cargo test -p pvault-core --lib --locked fuzz_seeds -- --ignored
       - name: Fuzz each target
         run: |
-          for t in header_parse journal_parse keytable_parse stream_parse; do
+          for t in header_parse journal_parse keytable_parse stream_parse card_parse; do
             cargo +"$NIGHTLY" fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=2048
           done
 

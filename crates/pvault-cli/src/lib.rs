@@ -1,0 +1,675 @@
+//! `pvault` command-line interface (`docs/CLI.md`, approved for Milestone 4).
+//!
+//! The binary is a one-line wrapper around [`main`], so the crash tests in
+//! `pvault-tests` can run the same CLI built with `fault-injection`.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use clap::{Parser, Subcommand, ValueEnum};
+use pvault_core::card::{CardTextProgress, CardTextReader, PAYLOAD_LEN};
+use pvault_core::crypto::kdf::Argon2Params;
+use pvault_core::errors::Error;
+use pvault_core::estimator;
+use pvault_core::input::{InputError, SecretLine, StdinSecrets, read_line};
+use pvault_core::passphrase::WordCount;
+use pvault_core::platform::terminal;
+use pvault_core::platform::{CoreDumpProtection, disable_core_dumps};
+use pvault_core::records::Settings;
+use pvault_core::render;
+use pvault_core::secrets::SecretBytes;
+use pvault_core::vault::export::GetError;
+use pvault_core::vault::init::{InitOptions, InitOutcome, PassphraseChoice};
+use pvault_core::vault::{self, Access, Prompter, Session};
+
+/// Offline encrypted file vault.
+#[derive(Debug, Parser)]
+#[command(name = "pvault", version, arg_required_else_help = true)]
+struct Cli {
+    /// Read secrets from standard input, one per line, in the documented
+    /// order.
+    #[arg(long, global = true)]
+    secrets_stdin: bool,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ModeArg {
+    Portable,
+    Bound,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Create a vault (or resume an interrupted setup).
+    Init {
+        /// The vault folder.
+        vault_dir: PathBuf,
+        /// Vault mode. Milestone 4 builds portable vaults only.
+        #[arg(long, value_enum)]
+        mode: Option<ModeArg>,
+        /// An existing folder outside the vault for the two card files.
+        #[arg(long)]
+        cards_dir: Option<PathBuf>,
+        /// Generated passphrase of this many words (10 to 16).
+        #[arg(long, value_parser = clap::value_parser!(u8).range(10..=16), conflicts_with = "custom")]
+        words: Option<u8>,
+        /// Write your own passphrase.
+        #[arg(long)]
+        custom: bool,
+        /// Argon2id memory in MiB (256 to 4096).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(256..=4096), default_value_t = 1024)]
+        kdf_memory: u32,
+        /// Argon2id passes (3 to 16).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(3..=16), default_value_t = 4)]
+        kdf_iterations: u32,
+        /// Argon2id lanes (1 to 8).
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=8), default_value_t = 4)]
+        kdf_parallelism: u32,
+        /// Verify Card A from a PNG photo, read after the printing
+        /// acknowledgment. Needs a terminal (also with --secrets-stdin).
+        #[arg(long)]
+        card_a_png: Option<PathBuf>,
+        /// Verify Card B from a PNG photo, read after the printing
+        /// acknowledgment. Needs a terminal (also with --secrets-stdin).
+        #[arg(long)]
+        card_b_png: Option<PathBuf>,
+    },
+    /// Add a file.
+    Add {
+        /// The vault folder.
+        vault_dir: PathBuf,
+        /// The file to add.
+        source: PathBuf,
+        /// Its path in the vault.
+        vault_path: String,
+        /// Replace exactly this file entry.
+        #[arg(long)]
+        replace: bool,
+    },
+    /// List entries.
+    List {
+        /// The vault folder.
+        vault_dir: PathBuf,
+        /// Only this entry and its descendants.
+        vault_path: Option<String>,
+    },
+    /// Export one file.
+    Get {
+        /// The vault folder.
+        vault_dir: PathBuf,
+        /// The file in the vault.
+        vault_path: String,
+        /// Where to write it (must not exist).
+        destination: PathBuf,
+        /// Not available in this version.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove a file or folder entry.
+    Rm {
+        /// The vault folder.
+        vault_dir: PathBuf,
+        /// The entry.
+        vault_path: String,
+        /// Remove a folder and its contents.
+        #[arg(long)]
+        recursive: bool,
+    },
+    /// Show the vault's public state.
+    Status {
+        /// The vault folder.
+        vault_dir: PathBuf,
+    },
+    /// Remove files left by interrupted exports and setups.
+    CleanPartials,
+}
+
+/// Exit codes (`docs/CLI.md` 3).
+fn code(e: &Error) -> u8 {
+    match e {
+        Error::VaultInUse => 3,
+        Error::PendingJournal(_)
+        | Error::UnownedLeftovers(_)
+        | Error::RecordFull(_)
+        | Error::InitPending
+        | Error::Blocked(_) => 4,
+        Error::OutcomeUnknown
+        | Error::DurabilityUnknown
+        | Error::Indeterminate
+        | Error::UnresolvedCleanup
+        | Error::ExportUnconfirmed
+        | Error::ExportOutcomeUnknown => 5,
+        Error::UnsupportedFileSystem(_)
+        | Error::MemoryPolicy { .. }
+        | Error::MemoryResource { .. }
+        | Error::NeedsTerminal(_)
+        | Error::SettingsUnavailable(_)
+        | Error::SettingsNotPrivate(_)
+        | Error::RegistrationUnsupported(_)
+        | Error::RecordDamaged(_)
+        | Error::NoReplaceUnsupported
+        | Error::DestinationNotPrivate(_)
+        | Error::Unsupported(_) => 6,
+        Error::Input(InputError::NoTerminal | InputError::StdinIsTerminal) => 6,
+        Error::ForceRefused => 2,
+        Error::Cancelled => 7,
+        _ => 1,
+    }
+}
+
+/// The owner's typed path, normalized when possible, rendered (1.1, 1.2).
+fn shown_path(typed: &str) -> String {
+    match pvault_core::paths::normalize_input(typed) {
+        Ok(p) => render::text(&p.stored),
+        Err(_) => render::text(typed),
+    }
+}
+
+/// Messages that name the owner's typed path (`docs/CLI.md` 7).
+fn message(e: &Error, typed: Option<&str>) -> String {
+    let Some(t) = typed else { return e.to_string() };
+    let p = shown_path(t);
+    match e {
+        Error::PathExists => {
+            format!("{p} already exists in the vault. Use --replace to replace it.")
+        }
+        Error::PathCollision => format!(
+            "{p} collides with an existing entry that differs only by letter case or Unicode form. Use pvault list to see it."
+        ),
+        Error::PathUnsupported => {
+            format!("{p} contains a character this version of pvault does not support.")
+        }
+        Error::PathNotFound => format!("{p} is not in the vault."),
+        _ => e.to_string(),
+    }
+}
+
+fn fail(e: &Error, typed: Option<&str>) -> ExitCode {
+    eprintln!("{}", message(e, typed));
+    ExitCode::from(code(e))
+}
+
+/// Terminal and `--secrets-stdin` interaction (`docs/CLI.md` 2).
+struct Owner {
+    stdin: Option<StdinSecrets>,
+    tty: bool,
+}
+
+impl Owner {
+    fn stdin_line(&mut self) -> Result<SecretLine, Error> {
+        let s = self
+            .stdin
+            .as_mut()
+            .ok_or(Error::Input(InputError::NoTerminal))?;
+        match s.next_secret() {
+            Ok(l) if l.terminated() => Ok(l),
+            Ok(_) | Err(InputError::Cancelled) => Err(Error::InputEnded),
+            Err(e) => Err(Error::Input(e)),
+        }
+    }
+}
+
+impl Prompter for Owner {
+    fn secret(&mut self, prompt: &str) -> Result<SecretLine, Error> {
+        if self.stdin.is_some() {
+            return self.stdin_line();
+        }
+        if !self.tty {
+            return Err(Error::Input(InputError::NoTerminal));
+        }
+        terminal::read_secret(prompt).map_err(|e| match e {
+            InputError::Cancelled => Error::Cancelled,
+            e => Error::Input(e),
+        })
+    }
+
+    fn card_text(&mut self, label: &str) -> Result<SecretBytes<PAYLOAD_LEN>, Error> {
+        if self.stdin.is_some() {
+            // One whole line holding exactly 216 symbols.
+            let line = self.stdin_line()?;
+            let mut reader = CardTextReader::new();
+            return match reader.push_line(&line).map_err(Error::CardText)? {
+                CardTextProgress::Complete => reader.payload().map_err(Error::CardText),
+                CardTextProgress::NeedMore => Err(Error::CardText(reader.ended())),
+            };
+        }
+        if !self.tty {
+            return Err(Error::Input(InputError::NoTerminal));
+        }
+        let prompt = format!("{label}: type the card text (hidden; it may span lines): ");
+        let result = terminal::read_hidden(&prompt, |src| {
+            let mut reader = CardTextReader::new();
+            loop {
+                let line = match read_line(src) {
+                    Ok(l) => l,
+                    Err(InputError::Cancelled) => return Ok(Err(reader.ended())),
+                    Err(e) => return Err(e),
+                };
+                match reader.push_line(&line) {
+                    Ok(CardTextProgress::Complete) => return Ok(reader.payload()),
+                    Ok(CardTextProgress::NeedMore) => {}
+                    Err(e) => return Ok(Err(e)),
+                }
+            }
+        })
+        .map_err(Error::Input)?;
+        result.map_err(Error::CardText)
+    }
+
+    fn card_png_path(&mut self, label: &str) -> Result<Option<PathBuf>, Error> {
+        if !self.tty || self.stdin.is_some() {
+            return Ok(None);
+        }
+        let line = terminal::read_visible(&format!(
+            "{label}: enter the path of a PNG photo of the printed card, or press Enter to type its text: "
+        ))
+        .map_err(Error::Input)?;
+        let line = line.trim();
+        Ok((!line.is_empty()).then(|| PathBuf::from(line)))
+    }
+
+    fn confirm(&mut self, prompt: &str, phrase: &str) -> Result<bool, Error> {
+        if !self.tty {
+            return Ok(false);
+        }
+        let line = terminal::read_visible(prompt).map_err(Error::Input)?;
+        Ok(line.trim_end_matches(['\r', '\n']) == phrase)
+    }
+
+    fn acknowledge(&mut self, prompt: &str) -> Result<(), Error> {
+        if self.tty {
+            terminal::read_visible(prompt).map_err(Error::Input)?;
+        }
+        Ok(())
+    }
+
+    fn show_secret(&mut self, text: &str) -> Result<(), Error> {
+        if !self.tty {
+            return Err(Error::NeedsTerminal(
+                "No terminal is available to show the passphrase.",
+            ));
+        }
+        terminal::show(&format!("\n{text}\n")).map_err(Error::Input)?;
+        terminal::read_visible("").map_err(Error::Input)?;
+        // Best effort: clear the screen and scrollback (7.4b remnants).
+        let _ = terminal::show("\x1b[2J\x1b[3J\x1b[H");
+        Ok(())
+    }
+
+    fn notice(&mut self, text: &str) {
+        eprintln!("{text}");
+    }
+
+    fn interactive(&self) -> bool {
+        self.tty && self.stdin.is_none()
+    }
+
+    fn has_terminal(&self) -> bool {
+        self.tty
+    }
+}
+
+fn settings_optional(ui: &mut Owner) -> Option<Settings> {
+    match Settings::open() {
+        Ok(s) => Some(s),
+        Err(e) => {
+            ui.notice(&format!("Warning: {e}"));
+            None
+        }
+    }
+}
+
+fn unlock(
+    vault: &Path,
+    ui: &mut Owner,
+    settings: Option<&Settings>,
+    access: Access,
+) -> Result<Session, Error> {
+    vault::unlock(vault, ui, settings, access)
+}
+
+fn estimate(
+    p: &pvault_core::passphrase::CustomPassphrase,
+    context: &str,
+) -> Result<(estimator::Band, Vec<String>), Error> {
+    let e = estimator::estimate(p, context)?;
+    let mut feedback = Vec::new();
+    if let Some(w) = e.warning() {
+        feedback.push(w.to_string());
+    }
+    feedback.extend(e.suggestions().iter().map(ToString::to_string));
+    Ok((e.band(), feedback))
+}
+
+fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
+    let tty = terminal::has_terminal() && !test_without_terminal();
+    let stdin = if cli.secrets_stdin {
+        match StdinSecrets::open() {
+            Ok(s) => Some(s),
+            Err(e) => return fail(&Error::Input(e), None),
+        }
+    } else {
+        None
+    };
+    let mut ui = Owner { stdin, tty };
+    match cli.command {
+        Command::Init {
+            vault_dir,
+            mode,
+            cards_dir,
+            words,
+            custom,
+            kdf_memory,
+            kdf_iterations,
+            kdf_parallelism,
+            card_a_png,
+            card_b_png,
+        } => {
+            let resume_only = mode.is_none() && cards_dir.is_none();
+            match mode {
+                Some(ModeArg::Bound) => {
+                    eprintln!("Bound mode is not available in this version.");
+                    return ExitCode::from(2);
+                }
+                None if !resume_only => {
+                    eprintln!("--mode portable is required.");
+                    return ExitCode::from(2);
+                }
+                _ => {}
+            }
+            if !resume_only && cards_dir.is_none() {
+                eprintln!("--cards-dir is required.");
+                return ExitCode::from(2);
+            }
+            // O1 (2026-10-06): PNG verification waits for the printing
+            // acknowledgment on the terminal; refused before anything exists.
+            if (card_a_png.is_some() || card_b_png.is_some()) && !ui.tty {
+                return fail(
+                    &Error::NeedsTerminal(
+                        "Verifying a card from a PNG photo needs a terminal for the printing acknowledgment, also with --secrets-stdin. Nothing was written.",
+                    ),
+                    None,
+                );
+            }
+            if kdf_memory < 1024 {
+                eprintln!("Lower memory makes passphrase guessing cheaper.");
+            }
+            let passphrase = if custom {
+                PassphraseChoice::Custom
+            } else {
+                match WordCount::new(words.unwrap_or(12)) {
+                    Ok(c) => PassphraseChoice::Generated(c),
+                    Err(e) => return fail(&Error::Passphrase(e), None),
+                }
+            };
+            let settings = match Settings::open() {
+                Ok(s) => s,
+                Err(e) => return fail(&e, None),
+            };
+            let opts = InitOptions {
+                vault: vault_dir.clone(),
+                cards_dir: cards_dir.unwrap_or_default(),
+                passphrase,
+                argon2: Argon2Params {
+                    m_kib: kdf_memory * 1024,
+                    t: kdf_iterations,
+                    p: kdf_parallelism,
+                },
+                card_a_png,
+                card_b_png,
+                estimate: &estimate,
+            };
+            if resume_only {
+                // Only an existing folder can be resumed; a new vault needs
+                // the options.
+                if !vault_dir.exists() {
+                    eprintln!("--mode portable and --cards-dir are required to create a vault.");
+                    return ExitCode::from(2);
+                }
+            }
+            match vault::init::init(&opts, &settings, &mut ui) {
+                Ok(InitOutcome::Created { vault_id }) => {
+                    eprintln!(
+                        "Vault created: {} (portable, vault ID {}). Keep Card A and Card B apart; together they can open the vault without the passphrase.",
+                        render::path(&vault_dir),
+                        pvault_core::records::hex(&vault_id)
+                    );
+                    ExitCode::SUCCESS
+                }
+                Ok(InitOutcome::Finished { vault_id }) => {
+                    eprintln!(
+                        "The interrupted setup was finished: {} (vault ID {}).",
+                        render::path(&vault_dir),
+                        pvault_core::records::hex(&vault_id)
+                    );
+                    ExitCode::SUCCESS
+                }
+                Ok(InitOutcome::RolledBack) => {
+                    eprintln!("The interrupted setup was removed. Run pvault init again.");
+                    ExitCode::SUCCESS
+                }
+                Err(Error::TargetNotEmpty) if resume_only => {
+                    eprintln!("--mode portable and --cards-dir are required to create a vault.");
+                    ExitCode::from(2)
+                }
+                Err(e) => fail(&e, None),
+            }
+        }
+        Command::Add {
+            vault_dir,
+            source,
+            vault_path,
+            replace,
+        } => {
+            let settings = settings_optional(&mut ui);
+            let mut s = match unlock(&vault_dir, &mut ui, settings.as_ref(), Access::Write) {
+                Ok(s) => s,
+                Err(e) => return fail(&e, None),
+            };
+            match vault::edit::add(
+                &mut s,
+                &source,
+                &vault_path,
+                replace,
+                settings.as_ref(),
+                &mut ui,
+            ) {
+                Ok(o) => {
+                    let p = render::text(&o.stored);
+                    if o.changed {
+                        eprintln!("Stored as: {p}");
+                    }
+                    if o.created_dirs > 0 {
+                        eprintln!("Created {} folders.", o.created_dirs);
+                    }
+                    eprintln!("Added {p} ({} bytes).", o.size);
+                    report_kept(&o.kept);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(&e, Some(&vault_path)),
+            }
+        }
+        Command::List {
+            vault_dir,
+            vault_path,
+        } => {
+            let settings = settings_optional(&mut ui);
+            let s = match unlock(&vault_dir, &mut ui, settings.as_ref(), Access::Read) {
+                Ok(s) => s,
+                Err(e) => return fail(&e, None),
+            };
+            let stdout = std::io::stdout();
+            let mut out = stdout.lock();
+            match vault::export::list(&s, vault_path.as_deref(), &mut out) {
+                Ok(_) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, vault_path.as_deref()),
+            }
+        }
+        Command::Get {
+            vault_dir,
+            vault_path,
+            destination,
+            force,
+        } => {
+            if force {
+                return fail(&Error::ForceRefused, None);
+            }
+            // O3: refused before the passphrase is read and before anything
+            // is created (the settings folder included).
+            if let Err(e) = vault::export::check_destination(&destination) {
+                return fail(&e, None);
+            }
+            let settings = match Settings::open() {
+                Ok(s) => s,
+                Err(e) => return fail(&e, None),
+            };
+            let s = match unlock(&vault_dir, &mut ui, Some(&settings), Access::Read) {
+                Ok(s) => s,
+                Err(e) => return fail(&e, None),
+            };
+            let dest = render::path(&destination);
+            match vault::export::get(&s, &vault_path, &destination, &settings, &mut ui) {
+                Ok(o) => {
+                    eprintln!(
+                        "Exported {} to {dest} ({} bytes).",
+                        render::text(&o.stored),
+                        o.size
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(GetError::Unconfirmed(o)) => {
+                    eprintln!(
+                        "Exported {} to {dest}, but the export could not be confirmed as durable.",
+                        render::text(&o.stored)
+                    );
+                    ExitCode::from(5)
+                }
+                Err(GetError::Unknown) => {
+                    eprintln!("The export's outcome could not be determined; check {dest}.");
+                    ExitCode::from(5)
+                }
+                Err(GetError::Failed(Error::DestinationExists)) => {
+                    eprintln!("{dest} already exists; nothing was written.");
+                    ExitCode::from(1)
+                }
+                Err(GetError::Failed(Error::NameExists(p))) => {
+                    eprintln!("{p} already exists; nothing was written.");
+                    ExitCode::from(1)
+                }
+                Err(GetError::Failed(e)) => fail(&e, Some(&vault_path)),
+            }
+        }
+        Command::Rm {
+            vault_dir,
+            vault_path,
+            recursive,
+        } => {
+            let settings = settings_optional(&mut ui);
+            let mut s = match unlock(&vault_dir, &mut ui, settings.as_ref(), Access::Write) {
+                Ok(s) => s,
+                Err(e) => return fail(&e, None),
+            };
+            match vault::edit::rm(&mut s, &vault_path, recursive, settings.as_ref(), &mut ui) {
+                Ok((n, kept)) => {
+                    eprintln!("Removed {n} entries.");
+                    report_kept(&kept);
+                    ExitCode::SUCCESS
+                }
+                Err(e) => fail(&e, Some(&vault_path)),
+            }
+        }
+        Command::Status { vault_dir } => {
+            let settings = Settings::open().ok();
+            match vault::status::status(&vault_dir, settings.as_ref(), dumps) {
+                Ok((report, warning)) => {
+                    if let Some(w) = warning {
+                        eprintln!("{w}");
+                    }
+                    let mut out = std::io::stdout().lock();
+                    let _ = out.write_all(report.as_bytes());
+                    ExitCode::SUCCESS
+                }
+                Err(Error::HeaderInvalid) => {
+                    eprintln!("The header does not parse.");
+                    ExitCode::from(1)
+                }
+                Err(e) => fail(&e, None),
+            }
+        }
+        Command::CleanPartials => {
+            let settings = match Settings::open() {
+                Ok(s) => s,
+                Err(e) => return fail(&e, None),
+            };
+            match vault::export::clean_partials(&settings, &mut ui) {
+                Ok(r) if r.stale == 0 => {
+                    if r.damaged.is_empty() {
+                        eprintln!("No stale files are recorded.");
+                        ExitCode::SUCCESS
+                    } else {
+                        ExitCode::from(6)
+                    }
+                }
+                Ok(r) if !r.confirmed => ExitCode::from(4),
+                Ok(_) => ExitCode::SUCCESS,
+                Err(e) => fail(&e, None),
+            }
+        }
+    }
+}
+
+/// Crash-test builds only: `PVAULT_TEST_NO_TERMINAL` makes the child behave
+/// as if no terminal existed, so a developer's terminal is never read by a
+/// test. The variable does not exist in release builds (F85).
+#[cfg(feature = "fault-injection")]
+fn test_without_terminal() -> bool {
+    std::env::var_os("PVAULT_TEST_NO_TERMINAL").is_some()
+}
+
+#[cfg(not(feature = "fault-injection"))]
+fn test_without_terminal() -> bool {
+    false
+}
+
+fn report_kept(kept: &[String]) {
+    if !kept.is_empty() {
+        eprintln!(
+            "{} vault files could not be proven unused and were left in place: {}.",
+            kept.len(),
+            kept.iter()
+                .map(|k| render::text(k))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+}
+
+/// Runs the CLI with the process arguments and returns its exit code.
+pub fn main() -> ExitCode {
+    // The custom-passphrase estimator child (SI-51). It hardens itself and
+    // never reaches the argument parser.
+    let mut args = std::env::args_os().skip(1);
+    if let (Some(first), None) = (args.next(), args.next())
+        && first == estimator::CHILD_ARG
+    {
+        return ExitCode::from(u8::try_from(estimator::run_child()).unwrap_or(1));
+    }
+
+    // Before anything else, so no later crash can write secrets to disk
+    // (spec Section 10.3).
+    let dumps = match disable_core_dumps() {
+        Ok(p) => Some(p),
+        Err(err) => {
+            eprintln!("warning: {err}. A crash could write this process's memory to disk.");
+            None
+        }
+    };
+
+    let cli = Cli::parse();
+    let code = run(cli, dumps);
+    let _ = std::io::stderr().flush();
+    code
+}

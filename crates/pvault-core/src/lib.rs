@@ -2,6 +2,7 @@
 //!
 //! The format and behavior are defined in `PVAULT_BUILD_SPEC.md`.
 
+pub mod card;
 pub mod cbor;
 pub mod crypto;
 pub mod errors;
@@ -17,12 +18,15 @@ mod normalize;
 pub mod passphrase;
 pub mod paths;
 pub mod platform;
+pub mod records;
+pub mod render;
 pub mod resources;
 pub mod secrets;
 pub mod shamir;
 pub mod store;
 pub mod tpmid;
 mod ucd17;
+pub mod vault;
 
 #[cfg(test)]
 mod format_vectors;

@@ -19,6 +19,12 @@ exceptions = [
     # carry `Apache-2.0 WITH LLVM-exception` headers. The latter is recorded
     # here even though cargo-deny can inspect only the manifest expression.
     { allow = ["NCSA", "Apache-2.0 WITH LLVM-exception"], crate = "libfuzzer-sys@0.4.13" },
+    # Milestone 4 (A7): product dependencies also reachable through the fuzz
+    # target's path dependency on pvault-core. Keep the same crate-scoped
+    # exceptions as the product policy.
+    { allow = ["ISC"], crate = "rqrr" },
+    { allow = ["Zlib"], crate = "foldhash" },
+    { allow = ["MPL-2.0"], crate = "option-ext" },
 ]
 confidence-threshold = 0.93
 include-dev = true

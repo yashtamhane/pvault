@@ -11,6 +11,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
+use pvault_core::card::{Card, CardMode, PngError, decode_base32, decode_png};
 use pvault_core::crypto::{random, wrap};
 use pvault_core::header::{Header, MAX_HEADER_LEN};
 use pvault_core::journal::{MAX_JOURNAL_LEN, Record};
@@ -25,6 +26,7 @@ struct Counting;
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
 static UNWIPED_FREES: AtomicUsize = AtomicUsize::new(0);
 static LARGEST: AtomicUsize = AtomicUsize::new(0);
+static WIPED_4096_FREES: AtomicUsize = AtomicUsize::new(0);
 
 thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
@@ -53,6 +55,8 @@ unsafe impl GlobalAlloc for Counting {
             let block = unsafe { core::slice::from_raw_parts(ptr, layout.size()) };
             if block.iter().any(|&b| b != 0) {
                 UNWIPED_FREES.fetch_add(1, SeqCst);
+            } else if layout.size() == 4096 {
+                WIPED_4096_FREES.fetch_add(1, SeqCst);
             }
         }
         // SAFETY: forwarded with the pointer and layout the caller allocated.
@@ -68,6 +72,7 @@ fn measure<T>(f: impl FnOnce() -> T) -> (usize, usize) {
     ALLOCATIONS.store(0, SeqCst);
     UNWIPED_FREES.store(0, SeqCst);
     LARGEST.store(0, SeqCst);
+    WIPED_4096_FREES.store(0, SeqCst);
     ARMED.with(|a| a.set(true));
     let out = f();
     drop(out);
@@ -109,6 +114,46 @@ fn secret_code_paths_allocate_only_their_outputs_and_free_only_wiped_blocks() {
         wrap::unwrap(&key, &nonce, &ct)
     });
     assert_eq!((allocs, unwiped), (1, 0), "wrap");
+
+    // Recovery cards: the card itself, decoded text, recovered share and
+    // Base32 output are all pvault-owned secret buffers. Their allocation is
+    // wiped on both success and refusal paths. The formatted seven-line form
+    // uses implementation-dependent Vec growth, so only its hygiene is
+    // asserted rather than a brittle allocation count.
+    let share_y = SecretBytes::take_from(&mut [0x6a; shamir::SECRET_LEN]).unwrap();
+    let share = shamir::Share::new(1, share_y).unwrap();
+    let (allocs, unwiped) =
+        measure(|| Card::new(&[0x11; 16], CardMode::Portable, &[0x22; 8], &share).unwrap());
+    assert_eq!((allocs, unwiped), (1, 0), "card payload");
+    let card = Card::new(&[0x11; 16], CardMode::Portable, &[0x22; 8], &share).unwrap();
+    let (allocs, unwiped) = measure(|| card.base32());
+    assert_eq!((allocs, unwiped), (1, 0), "card Base32");
+    let (allocs, unwiped) = measure(|| card.base32_lines());
+    assert!(allocs > 1, "formatted Base32 should allocate its output");
+    assert_eq!(unwiped, 0, "formatted card Base32");
+    let text = card.base32();
+    let (allocs, unwiped) = measure(|| decode_base32(text.expose_secret()).unwrap());
+    assert_eq!((allocs, unwiped), (2, 0), "Base32 decode");
+    let (allocs, unwiped) = measure(|| card.share().unwrap());
+    assert_eq!((allocs, unwiped), (1, 0), "card share");
+
+    // A 64x64 blank image reaches both pvault-owned decoded-pixel buffers and
+    // then fails with no code. Both exact-size buffers must be wiped. rqrr has
+    // internal allocations that pvault cannot wipe, so this deliberately
+    // checks the owned buffers rather than claiming every dependency buffer.
+    let mut png_bytes = Vec::new();
+    {
+        let mut enc = png::Encoder::new(&mut png_bytes, 64, 64);
+        enc.set_color(png::ColorType::Grayscale);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().unwrap();
+        writer.write_image_data(&[255u8; 4096]).unwrap();
+    }
+    let (_, _) = measure(|| assert!(matches!(decode_png(&png_bytes), Err(PngError::NoCode))));
+    assert!(
+        WIPED_4096_FREES.load(SeqCst) >= 2,
+        "decoded pixel and grayscale buffers were not both wiped"
+    );
 
     // Generation: exactly one exactly-sized output buffer.
     let (allocs, unwiped) = measure(|| passphrase::generate(WordCount::new(16).unwrap()).unwrap());

@@ -30,6 +30,7 @@
 //! path-based child operation; M3-F2 resolved). Windows runtime behavior is
 //! validated only by native CI.
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io;
 use std::path::Path;
@@ -37,8 +38,20 @@ use std::path::Path;
 pub use crate::journal::FileIdentity;
 
 /// Checks that `name` is one plain path component.
-fn component(name: &str) -> io::Result<()> {
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\\') {
+fn component(name: &OsStr) -> io::Result<()> {
+    // A backslash is an ordinary filename byte on Unix, but a path
+    // separator in the Windows object namespace used by `NtCreateFile`.
+    // Keep this native-name rule separate from vault paths, which reject
+    // backslashes on every platform (spec 7.8). Names are native: any Unix
+    // bytes except NUL and `/`, any Windows UTF-16 (`docs/M4_READINESS.md`
+    // 7.2).
+    let b = name.as_encoded_bytes();
+    if b.is_empty()
+        || b == b"."
+        || b == b".."
+        || b.contains(&b'/')
+        || (cfg!(windows) && b.contains(&b'\\'))
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "not a single component",
@@ -71,7 +84,8 @@ impl Dir {
     }
 
     /// Opens child directory `name` (no-follow).
-    pub fn open_dir(&self, name: &str) -> io::Result<Self> {
+    pub fn open_dir(&self, name: impl AsRef<OsStr>) -> io::Result<Self> {
+        let name = name.as_ref();
         component(name)?;
         Ok(Self {
             inner: self.inner.open_dir(name)?,
@@ -79,14 +93,16 @@ impl Dir {
     }
 
     /// Creates child directory `name`, owner-only.
-    pub fn create_dir(&self, name: &str) -> io::Result<()> {
+    pub fn create_dir(&self, name: impl AsRef<OsStr>) -> io::Result<()> {
+        let name = name.as_ref();
         component(name)?;
         self.inner.create_dir(name)
     }
 
     /// Creates `name` exclusively (no-follow, owner-only, write-through on
     /// Windows). Fails if anything exists at that name.
-    pub fn create_new(&self, name: &str) -> io::Result<File> {
+    pub fn create_new(&self, name: impl AsRef<OsStr>) -> io::Result<File> {
+        let name = name.as_ref();
         component(name)?;
         self.inner.create_new(name)
     }
@@ -94,19 +110,22 @@ impl Dir {
     /// Opens an existing **regular file** without following symlinks.
     /// Returns `Ok(None)` if nothing exists at `name`; any other kind of
     /// entry is an error.
-    pub fn open_regular(&self, name: &str, write: bool) -> io::Result<Option<File>> {
+    pub fn open_regular(&self, name: impl AsRef<OsStr>, write: bool) -> io::Result<Option<File>> {
+        let name = name.as_ref();
         component(name)?;
         self.inner.open_regular(name, write)
     }
 
     /// Whether any entry exists at `name` (without following it).
-    pub fn exists(&self, name: &str) -> io::Result<bool> {
+    pub fn exists(&self, name: impl AsRef<OsStr>) -> io::Result<bool> {
+        let name = name.as_ref();
         component(name)?;
         self.inner.exists(name)
     }
 
     /// Atomically replaces `to` with `from`.
-    pub fn rename_replace(&self, from: &str, to: &str) -> io::Result<()> {
+    pub fn rename_replace(&self, from: impl AsRef<OsStr>, to: impl AsRef<OsStr>) -> io::Result<()> {
+        let (from, to) = (from.as_ref(), to.as_ref());
         component(from)?;
         component(to)?;
         self.inner.rename(from, to, true)
@@ -114,14 +133,20 @@ impl Dir {
 
     /// Renames `from` to `to`, failing if `to` exists. There is no
     /// check-then-rename fallback (7.6a).
-    pub fn rename_noreplace(&self, from: &str, to: &str) -> io::Result<()> {
+    pub fn rename_noreplace(
+        &self,
+        from: impl AsRef<OsStr>,
+        to: impl AsRef<OsStr>,
+    ) -> io::Result<()> {
+        let (from, to) = (from.as_ref(), to.as_ref());
         component(from)?;
         component(to)?;
         self.inner.rename(from, to, false)
     }
 
     /// Removes the directory entry `name`.
-    pub fn unlink(&self, name: &str) -> io::Result<()> {
+    pub fn unlink(&self, name: impl AsRef<OsStr>) -> io::Result<()> {
+        let name = name.as_ref();
         component(name)?;
         self.inner.unlink(name)
     }
@@ -143,10 +168,160 @@ impl Dir {
     }
 }
 
+/// Kind of a [`RecordIdentity`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdKind {
+    /// `st_dev`, `st_ino`, optional birth time.
+    Unix,
+    /// Volume serial number, file ID, optional creation time.
+    Windows,
+}
+
+/// Identity of a file **outside** the vault, kept in the per-user records
+/// (`docs/M4_READINESS.md` 7.2). Birth time is optional here, because
+/// destinations can be on any file system; without it an identity never
+/// authorizes a deletion after a restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordIdentity {
+    /// Unix or Windows.
+    pub kind: IdKind,
+    /// `st_dev`, or the volume serial number.
+    pub dev: u64,
+    /// `u64_be(st_ino)` (8 bytes), or the 16-byte file ID.
+    pub ino: Vec<u8>,
+    /// `i64_be(sec) || u32_be(nsec)` (Unix) or `u64_be(CreationTime)`
+    /// (Windows), when the file system provides it.
+    pub btime: Option<Vec<u8>>,
+}
+
+/// Identity of an open file outside the vault.
+pub fn record_identity(file: &File) -> io::Result<RecordIdentity> {
+    imp::record_identity(file)
+}
+
+/// Metadata of an `add` source, captured from its open handle
+/// (`docs/M4_READINESS.md` 10.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceMeta {
+    /// Size in bytes.
+    pub size: u64,
+    /// Modification time `(sec, nsec)` since 1970.
+    pub mtime: (i64, u32),
+    /// Change time `(sec, nsec)` (Unix `st_ctime`; Windows `ChangeTime`).
+    pub ctime: (i64, u32),
+    /// Device or volume serial number.
+    pub dev: u64,
+    /// Inode or file ID bytes.
+    pub ino: Vec<u8>,
+}
+
+/// Why an `add` source was refused.
+#[derive(Debug)]
+pub enum SourceError {
+    /// The final component is a symlink or reparse point.
+    Link,
+    /// Not a regular file.
+    NotRegular,
+    /// Windows: another program has it open for writing or deletion.
+    InUse,
+    /// Any other failure.
+    Io(io::Error),
+}
+
+/// Opens an `add` source: final component not followed, a regular file,
+/// read-only (Windows: deny-write sharing) (`docs/M4_READINESS.md` 10.1).
+pub fn open_source(path: &Path) -> Result<File, SourceError> {
+    imp::open_source(path)
+}
+
+/// Re-reads the source metadata from its handle.
+pub fn source_meta(file: &File) -> io::Result<SourceMeta> {
+    imp::source_meta(file)
+}
+
+impl Dir {
+    /// The names in this directory (not `.` or `..`).
+    pub fn list(&self) -> io::Result<Vec<std::ffi::OsString>> {
+        self.inner.list()
+    }
+
+    /// Whether `other` is this directory or lies inside it.
+    pub fn contains(&self, other: &Dir) -> io::Result<bool> {
+        self.inner.contains(&other.inner)
+    }
+
+    /// `Some(true)` if `name` (not followed) is the file open as `file`,
+    /// `Some(false)` if it is something else, `None` if absent.
+    pub fn held_at(&self, name: impl AsRef<OsStr>, file: &File) -> io::Result<Option<bool>> {
+        let name = name.as_ref();
+        component(name)?;
+        self.inner.held_at(name, file)
+    }
+
+    /// Deletes `name` only if it is the file this process holds open as
+    /// `file` (`docs/M4_READINESS.md` 7.2, same-process rule). Returns
+    /// whether it deleted.
+    pub fn delete_held(&self, name: impl AsRef<OsStr>, file: &File) -> io::Result<bool> {
+        let name = name.as_ref();
+        component(name)?;
+        self.inner.delete_held(name, file)
+    }
+
+    /// Whether this directory is private to the current user
+    /// (`docs/M4_READINESS.md` 7.1).
+    pub fn is_private(&self) -> io::Result<bool> {
+        self.inner.is_private()
+    }
+}
+
 /// Flushes a file's data durably (Linux `fsync`, macOS `F_FULLFSYNC`,
 /// Windows `FlushFileBuffers`).
 pub fn flush_file(file: &File) -> io::Result<()> {
     imp::flush_file(file)
+}
+
+/// Destination file systems for exported plaintext and card files
+/// (decided 2026-10-06, O3: fail closed). Accepted only where pvault can
+/// identify a local file system whose kernel driver enforces owner-only
+/// access on its own: Linux `ext4`, `xfs`, `btrfs` (the 8.5 types) and
+/// `tmpfs` (memory, POSIX permissions); macOS `apfs` and `hfs`; Windows local
+/// `NTFS` and `ReFS` (owner-only DACLs, locality by the 8.5 Q1 to Q4 checks).
+/// Everything else is refused: FAT and exFAT (no owner-only permissions),
+/// FUSE (`fuseblk`, `fuse.*`: the user-space server decides), network file
+/// systems (`nfs`, `cifs`, `smbfs`, ...: the server decides), any other or
+/// unknown type. No permission-setting call is taken as proof. Exact
+/// strings, as reported by the platform.
+pub fn is_private_destination_type(fs_type: &str) -> bool {
+    if cfg!(target_os = "linux") {
+        matches!(fs_type, "ext4" | "xfs" | "btrfs" | "tmpfs")
+    } else if cfg!(target_os = "macos") {
+        matches!(fs_type, "apfs" | "hfs")
+    } else if cfg!(windows) {
+        matches!(fs_type, "NTFS" | "ReFS")
+    } else {
+        false
+    }
+}
+
+/// What a destination's file system is called in the refusal when it
+/// cannot be identified (for example a network share on Windows, which the
+/// 8.5 identification refuses as remote).
+pub const UNIDENTIFIED_FS: &str = "unidentified or network file system";
+
+/// Refuses a destination folder for exported plaintext or card files unless
+/// its file system is identified and on [`is_private_destination_type`]
+/// (O3). Runs before any destination file, record entry or secret.
+pub fn check_private_destination(dir: &Dir) -> Result<(), crate::Error> {
+    let volume = dir.volume();
+    #[cfg(test)]
+    let volume = tests::mocked_volume(volume);
+    match volume {
+        Ok(v) if is_private_destination_type(&v.fs_type) => Ok(()),
+        Ok(v) => Err(crate::Error::DestinationNotPrivate(v.fs_type)),
+        Err(_) => Err(crate::Error::DestinationNotPrivate(
+            UNIDENTIFIED_FS.to_owned(),
+        )),
+    }
 }
 
 /// The 8.5 allowlist for this platform. Exact strings only.
@@ -173,6 +348,8 @@ pub fn is_allowed(fs_type: &str) -> bool {
 pub fn preflight(dir: &Dir) -> Result<Volume, crate::Error> {
     let refuse = |what: &str| crate::Error::UnsupportedFileSystem(what.to_owned());
     let volume = dir.volume().map_err(|_| refuse("unknown"))?;
+    #[cfg(test)]
+    let volume = tests::mocked(volume);
     if !is_allowed(&volume.fs_type) {
         return Err(refuse(&volume.fs_type));
     }
@@ -216,10 +393,11 @@ pub enum Ownership {
 /// equals `expected` (spec 8.1). `Ok(None)` if absent.
 pub fn open_owned(
     dir: &Dir,
-    name: &str,
+    name: impl AsRef<OsStr>,
     expected: &FileIdentity,
     write: bool,
 ) -> io::Result<Result<Option<File>, Ownership>> {
+    let name = name.as_ref();
     let file = match dir.open_regular(name, write) {
         Ok(Some(f)) => f,
         Ok(None) => return Ok(Ok(None)),
@@ -235,7 +413,12 @@ pub fn open_owned(
 /// Removes `name` only if it is the recorded file (spec 8.1). On Windows the
 /// delete acts on the very handle whose identity was verified. The caller
 /// flushes the directory afterwards.
-pub fn remove_if_owned(dir: &Dir, name: &str, expected: &FileIdentity) -> io::Result<Ownership> {
+pub fn remove_if_owned(
+    dir: &Dir,
+    name: impl AsRef<OsStr>,
+    expected: &FileIdentity,
+) -> io::Result<Ownership> {
+    let name = name.as_ref();
     component(name)?;
     dir.inner.remove_owned(name, expected)
 }
@@ -317,6 +500,42 @@ pub fn windows_locality_probe(dir: &Dir) -> (WindowsProbe, Result<Volume, String
 
 #[cfg(test)]
 pub(crate) mod tests {
+    thread_local! {
+        static MOCK_TYPE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Makes [`preflight`](super::preflight) on this thread see `fs_type`
+    /// (F74: a mocked unsupported file system). `None` restores the real one.
+    pub(crate) fn mock_fs_type(fs_type: Option<&str>) {
+        MOCK_TYPE.with(|m| *m.borrow_mut() = fs_type.map(str::to_owned));
+    }
+
+    thread_local! {
+        static MOCK_UNIDENTIFIED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Makes the volume of every folder unidentifiable on this thread (as a
+    /// Windows network share is). `false` restores the real one.
+    pub(crate) fn mock_unidentified(on: bool) {
+        MOCK_UNIDENTIFIED.with(|m| m.set(on));
+    }
+
+    pub(super) fn mocked_volume(
+        v: std::io::Result<super::Volume>,
+    ) -> std::io::Result<super::Volume> {
+        if MOCK_UNIDENTIFIED.with(|m| m.get()) {
+            return Err(std::io::Error::other("mocked: unidentified"));
+        }
+        v.map(mocked)
+    }
+
+    pub(super) fn mocked(mut v: super::Volume) -> super::Volume {
+        if let Some(t) = MOCK_TYPE.with(|m| m.borrow().clone()) {
+            v.fs_type = t;
+        }
+        v
+    }
+
     use super::*;
     use std::io::Write;
 
@@ -359,6 +578,30 @@ pub(crate) mod tests {
         );
         assert_eq!(parse_fdinfo_mnt_id("pos:\t0\n"), None);
         assert_eq!(parse_fdinfo_mnt_id("mnt_id:\t1\nmnt_id:\t2\n"), None);
+    }
+
+    /// O3 on Windows: a local NTFS folder is a private destination; the
+    /// same folder through the loopback administrative share is a network
+    /// destination whose enforcement pvault cannot verify, so it is refused.
+    #[cfg(windows)]
+    #[test]
+    fn windows_destinations_fail_closed() {
+        let local = tempdir();
+        let d = Dir::open(&local).unwrap();
+        check_private_destination(&d).expect("local NTFS is a private destination");
+        let canon = std::fs::canonicalize(&local).unwrap();
+        let text = canon
+            .to_string_lossy()
+            .trim_start_matches(r"\\?\")
+            .to_owned();
+        let (drive, rest) = text.split_once(':').expect("a drive path");
+        let unc = std::path::PathBuf::from(format!(r"\\localhost\{drive}${rest}"));
+        let remote = Dir::open(&unc).expect("the loopback share opens");
+        assert!(matches!(
+            check_private_destination(&remote),
+            Err(crate::Error::DestinationNotPrivate(ref t)) if t == UNIDENTIFIED_FS
+        ));
+        std::fs::remove_dir_all(&local).unwrap();
     }
 
     /// F74 (detection part): a mocked unsupported type refuses.
@@ -405,6 +648,23 @@ pub(crate) mod tests {
         dir.create_new("c").unwrap();
         assert!(dir.rename_noreplace("b", "c").is_err());
         dir.rename_replace("b", "c").unwrap();
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// A backslash is a valid single-component native name on Unix. It is
+    /// not valid in the Windows handle-relative object namespace.
+    #[test]
+    fn native_component_backslash_rule() {
+        let tmp = tempdir();
+        let dir = Dir::open(&tmp).unwrap();
+        let result = dir.create_new("a\\b");
+        if cfg!(unix) {
+            let file = result.expect("Unix accepts backslash in one name");
+            drop(file);
+            assert!(tmp.join("a\\b").is_file());
+        } else {
+            assert!(result.is_err());
+        }
         std::fs::remove_dir_all(&tmp).unwrap();
     }
 

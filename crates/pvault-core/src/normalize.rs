@@ -73,14 +73,24 @@ impl Normalized {
 /// fit in the buffer, which cannot happen for inputs of at most
 /// [`MAX_RAW_BYTES`].
 pub(crate) fn normalize(text: &str, form: Form) -> Option<Normalized> {
-    let mut buf = Zeroizing::new(vec!['\0'; CAPACITY].into_boxed_slice());
+    normalize_with_capacity(text, form, CAPACITY)
+}
+
+/// [`normalize`] with an explicit buffer capacity in characters (vault
+/// paths, which may be longer than passphrases).
+pub(crate) fn normalize_with_capacity(
+    text: &str,
+    form: Form,
+    capacity: usize,
+) -> Option<Normalized> {
+    let mut buf = Zeroizing::new(vec!['\0'; capacity].into_boxed_slice());
 
     // 1. Full decomposition.
     let mut len = 0;
     let mut overflow = false;
     {
         let mut emit = |d: char| {
-            if len < CAPACITY {
+            if len < capacity {
                 buf[len] = d;
                 len += 1;
             } else {

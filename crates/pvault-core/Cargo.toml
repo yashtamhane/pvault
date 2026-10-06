@@ -30,6 +30,10 @@ chacha20.workspace = true
 unicode-normalization.workspace = true
 vsss-rs.workspace = true
 zxcvbn.workspace = true
+qrcode.workspace = true
+rqrr.workspace = true
+png.workspace = true
+directories.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

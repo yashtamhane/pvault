@@ -61,7 +61,7 @@ fn io(e: io::Error) -> Error {
 
 /// Reads a regular file of at most `max` bytes. `Ok(None)` if absent;
 /// `Err(over)` if larger or not a regular file.
-fn read_capped(
+pub(crate) fn read_capped(
     dir: &Dir,
     name: &str,
     max: usize,
@@ -86,14 +86,14 @@ fn read_handle(file: &File, max: usize) -> io::Result<Option<Vec<u8>>> {
 }
 
 /// The SHA-512 of a regular file, or `None` if absent.
-fn file_digest(dir: &Dir, name: &str) -> Result<Option<[u8; 64]>, Error> {
+pub(crate) fn file_digest(dir: &Dir, name: &str) -> Result<Option<[u8; 64]>, Error> {
     let Some(file) = dir.open_regular(name, false).map_err(io)? else {
         return Ok(None);
     };
     hash_handle(&file).map(Some)
 }
 
-fn hash_handle(mut file: &File) -> Result<[u8; 64], Error> {
+pub(crate) fn hash_handle(mut file: &File) -> Result<[u8; 64], Error> {
     let mut hash = Sha512::new();
     let mut buf = [0u8; 8192];
     loop {
@@ -154,6 +154,11 @@ impl Owned {
         self.id
     }
 
+    /// The open file.
+    pub fn file(&self) -> &File {
+        &self.file
+    }
+
     /// Truncates and rewrites the file, then flushes it (resume in place).
     pub fn rewrite(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.truncate()?;
@@ -161,7 +166,7 @@ impl Owned {
         fs::flush_file(&self.file)
     }
 
-    fn truncate(&mut self) -> io::Result<()> {
+    pub(crate) fn truncate(&mut self) -> io::Result<()> {
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0)).map(|_| ())
     }
@@ -442,7 +447,7 @@ fn sealed(
     let bytes = r.encode();
     match r {
         Record::Transition(t) => Ok((t, bytes)),
-        Record::Init(_) => Err(Error::JournalInvalid),
+        Record::Init(_) | Record::Update(_) => Err(Error::JournalInvalid),
     }
 }
 
@@ -566,7 +571,7 @@ pub fn start_tracking(
         token: cleanup_token,
     })?;
     no_journal_residue(dir)?;
-    if dir.exists(&keytable_name(tracking_gen)).map_err(io)? {
+    if dir.exists(keytable_name(tracking_gen)).map_err(io)? {
         return Err(Error::Blocked(
             "a key-table file at the tracking generation",
         ));
@@ -762,7 +767,7 @@ fn remove_old_keytable(
 
 fn read_keytable(dir: &Dir, old: &OldSide<'_>, core: &CoreFields) -> Result<KeyTable, Error> {
     let file = dir
-        .open_regular(&keytable_name(core.keytable_gen), false)
+        .open_regular(keytable_name(core.keytable_gen), false)
         .map_err(|_| Error::KeyTableCorrupt)?
         .ok_or(Error::KeyTableCorrupt)?;
     keytable::read_file(

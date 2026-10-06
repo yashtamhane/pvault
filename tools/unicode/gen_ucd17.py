@@ -23,7 +23,7 @@ import sys
 import zipfile
 from pathlib import Path
 
-GENERATOR_VERSION = "1"
+GENERATOR_VERSION = "2"
 UCD_URL = "https://www.unicode.org/Public/17.0.0/ucd/UCD.zip"
 PINNED = {
     "UCD.zip": "2066d1909b2ea93916ce092da1c0ee4808ea3ef8407c94b4f14f5b7eb263d28e",
@@ -120,6 +120,19 @@ def full_compat(cp, decomp):
     return out
 
 
+def full_canonical(cp, decomp):
+    """Full canonical decomposition: recursive over canonical mappings only
+    (Hangul is algorithmic at run time and handled by the caller)."""
+    if S_BASE <= cp < S_BASE + S_COUNT:
+        return hangul_decompose(cp)
+    if cp not in decomp or decomp[cp][0]:
+        return [cp]
+    out = []
+    for d in decomp[cp][1]:
+        out.extend(full_canonical(d, decomp))
+    return out
+
+
 def parse_full_composition_exclusion(text):
     excluded = set()
     for line in data_lines(text):
@@ -200,6 +213,17 @@ def main():
         if expanded != [cp]:
             full[cp] = expanded
 
+    # Full canonical decomposition (recursive, canonical mappings only), for
+    # NFD in the vault-path collision key (Milestone 4, A1 / M4_READINESS 8).
+    # Added in generator version 2; the tables above are unchanged.
+    canon = {}
+    for cp in decomp:
+        if S_BASE <= cp < S_BASE + S_COUNT:
+            continue
+        expanded = full_canonical(cp, decomp)
+        if expanded != [cp]:
+            canon[cp] = expanded
+
     # Primary composites: canonical two-character decompositions that are
     # not excluded from composition. Hangul is algorithmic at run time.
     compose = []
@@ -228,6 +252,8 @@ def main():
         rust_index("FOLD", fold),
         "\n/// White_Space (PropList.txt), as inclusive ranges.\n",
         rust_ranges("WHITE_SPACE", white),
+        "\n/// Full canonical decompositions (Hangul excluded); generator version 2.\n",
+        rust_index("CANON", canon),
     ]
     tables = "".join(out)
     target = args.out_root / "crates/pvault-core/src/ucd17/tables.rs"
@@ -248,7 +274,8 @@ def main():
         f"  {'crates/pvault-core/src/ucd17/tables.rs':<40} {sha256(tables.encode())}",
         "",
         f"counts: assigned ranges {len(assigned)}, ccc {len(ccc)}, decompositions {len(full)},",
-        f"        compositions {len(compose)}, case foldings {len(fold)}, white-space ranges {len(white)}",
+        f"        compositions {len(compose)}, case foldings {len(fold)}, white-space ranges {len(white)},",
+        f"        canonical decompositions {len(canon)}",
     ]
     (args.out_root / "tools/unicode/MANIFEST.txt").write_text("\n".join(manifest) + "\n")
 

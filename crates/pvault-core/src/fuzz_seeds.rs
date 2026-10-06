@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use crate::card::{Card, CardMode};
 use crate::crypto::cascade::{self, StreamHeader, StreamKeys, StreamKind};
 use crate::header::tests::{cleanup, sample_bound_slots, sample_core};
 use crate::header::{Header, Mode, PassphraseKind, PortableSlots, SlotFields};
@@ -12,6 +13,7 @@ use crate::journal::{InitPhase, InitRecord, Record, TransitionPhase};
 use crate::keytable::KeyTable;
 use crate::keytable::tests::{dir, file, sample};
 use crate::secrets::SecretBytes;
+use crate::shamir::Share;
 
 fn write(dir: &Path, target: &str, name: &str, bytes: &[u8]) {
     let d = dir.join(target);
@@ -126,4 +128,13 @@ fn fuzz_seeds() {
         cascade::encrypt(&keys, &header, &plain[..], &mut ct).unwrap();
         write(out, "stream_parse", name, &ct);
     }
+
+    let share = Share::new(
+        1,
+        SecretBytes::take_from(&mut [0x5a; crate::shamir::SECRET_LEN]).unwrap(),
+    )
+    .unwrap();
+    let card = Card::new(&[0xa1; 16], CardMode::Portable, &[0xc5; 8], &share).unwrap();
+    write(out, "card_parse", "payload", card.payload());
+    write(out, "card_parse", "base32", card.base32().expose_secret());
 }
