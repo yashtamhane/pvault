@@ -78,8 +78,8 @@ use windows_sys::Win32::Security::{
     GetAclInformation, GetLengthSid, GetSecurityDescriptorControl, GetTokenInformation,
     InitializeAcl, InitializeSecurityDescriptor, IsWellKnownSid, OBJECT_INHERIT_ACE,
     OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR,
-    SetSecurityDescriptorControl, SetSecurityDescriptorDacl, TOKEN_QUERY, TOKEN_USER, TokenUser,
-    WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
+    TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ALL_ACCESS, FILE_FLAG_SEQUENTIAL_SCAN, FILE_ID_BOTH_DIR_INFO,
@@ -936,6 +936,9 @@ impl OwnerOnly {
                 && AddAccessAllowedAceEx(acl_ptr, ACL_REVISION, flags, FILE_ALL_ACCESS, user.sid())
                     != 0
                 && InitializeSecurityDescriptor(sd_ptr.cast(), SECURITY_DESCRIPTOR_REVISION) != 0
+                // The owner is the user explicitly: an elevated administrator's
+                // default owner would be the Administrators group.
+                && SetSecurityDescriptorOwner(sd_ptr.cast(), user.sid(), 0) != 0
                 && SetSecurityDescriptorDacl(sd_ptr.cast(), 1, acl_ptr, 0) != 0
                 && SetSecurityDescriptorControl(sd_ptr.cast(), SE_DACL_PROTECTED, SE_DACL_PROTECTED)
                     != 0

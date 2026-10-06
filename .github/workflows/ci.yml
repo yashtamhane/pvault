@@ -83,8 +83,8 @@ jobs:
           dev=$(sudo losetup -f --show "$RUNNER_TEMP/fuse.img")
           echo "PVFUSE_DEV=$dev" >> "$GITHUB_ENV"
           sudo mount.exfat-fuse -o "$ids" "$dev" /mnt/pvfuse
-          findmnt /mnt/pvfat /mnt/pvexfat /mnt/pvfuse
-          test "$(findmnt -no FSTYPE /mnt/pvfuse)" = fuseblk
+          for m in /mnt/pvfat /mnt/pvexfat /mnt/pvfuse; do findmnt --mountpoint "$m"; done
+          test "$(findmnt -no FSTYPE --mountpoint /mnt/pvfuse)" = fuseblk
           echo "PVAULT_TEST_FAT_DIR=/mnt/pvfat" >> "$GITHUB_ENV"
           echo "PVAULT_TEST_EXFAT_DIR=/mnt/pvexfat" >> "$GITHUB_ENV"
           echo "PVAULT_TEST_FUSEBLK_DIR=/mnt/pvfuse" >> "$GITHUB_ENV"
