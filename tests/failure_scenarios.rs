@@ -155,10 +155,12 @@ struct Out {
 }
 
 impl Out {
-    /// Aborted at the failpoint (Unix: SIGABRT; Windows: `abort` exits 3).
+    /// Aborted at the failpoint. Unix: killed by SIGABRT (no exit code).
+    /// Windows: Rust's `abort` is a fast-fail, which ends the process with
+    /// `STATUS_STACK_BUFFER_OVERRUN` (0xC0000409).
     fn crashed(&self) -> bool {
         if cfg!(windows) {
-            self.code == Some(3)
+            self.code == Some(0xC000_0409_u32 as i32)
         } else {
             self.code.is_none()
         }
