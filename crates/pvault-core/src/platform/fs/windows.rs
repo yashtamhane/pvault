@@ -205,7 +205,11 @@ fn attributes(h: HANDLE) -> io::Result<u32> {
         )
     };
     if ok == 0 {
-        return Err(io::Error::last_os_error());
+        // FAT and exFAT do not answer the attribute-tag query (Windows CI,
+        // 2026-10-06). `FILE_BASIC_INFO` carries the same attribute bits,
+        // the reparse-point bit included, and those file systems have no
+        // reparse points.
+        return basic_info(h).map(|b| b.FileAttributes);
     }
     Ok(info.FileAttributes)
 }
