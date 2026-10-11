@@ -894,6 +894,26 @@ on that commit (both terminals), because a gate result must come from one
 build. The gate stays **incomplete and not passed** until then; the
 printed-card photo check (14a) also stays outstanding.
 
+**Observation at `c7abffa` (2026-10-11; Windows 11 25H2, classic `conhost`;
+under investigation, gate still incomplete).** During a generated digital
+`init`, the author never saw the 12-word passphrase. After typing their own
+password and pressing Enter at a prompt whose text was not captured, the
+screen cleared and went to "Deriving keys…", then "Type your passphrase
+from memory:". Screen clearing and the passphrase display are **not
+passed**. Cause not established; see the investigation report of the same
+date. Candidate mechanisms: the passphrase text did not appear while the
+dismissal read waited at an empty prompt; or the dismissal read ended at
+once on an Enter that arrived after the input flush, so the now-working
+clear removed the passphrase before it could be read (at `2135a1f` the
+failed clear left it visible). **Changes in response (approved 2026-10-11,
+with both messages and the 7.6a amendment; `docs/SPEC_ISSUES.md`):** the wait after a shown secret is now
+a labelled, hidden prompt that only an empty line ends; typed input is
+discarded unseen and repeats the instruction without clearing; Windows
+console output is written as UTF-16 (`WriteConsoleW`). No timing workaround
+was added. The clearing code of `c7abffa` used console calls beyond the 7.6a
+scope recorded at the time; the amendment approves them. These do not explain the observation, which stays **open**; the
+Windows gate stays incomplete.
+
 ### 14a. Printed-card photo check (manual acceptance gate for paper cards; prepared, not performed)
 
 This gate covers paper cards only: it shows that printed cards scan from

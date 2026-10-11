@@ -171,14 +171,28 @@ treated as declined (8.3: "non-interactive operation … leaves … blocked").
 
 **Shown secrets.** The generated passphrase is displayed only on the terminal
 device. Without a terminal, generated mode is refused (use `--custom` with
-`--secrets-stdin`). After the owner presses Enter, pvault clears the screen
-on a best-effort basis; terminal scrollback, logs and recordings may still
-hold it (7.4b remnants). On Windows the classic console (`conhost`) prints
+`--secrets-stdin`). The shown secret (a generated passphrase, or generated
+duress words) stays on screen until the owner presses Enter on an **empty
+line** at a labelled, hidden prompt (approved 2026-10-11): "Press Enter when
+you have written it down (nothing needs to be typed): ". Echo is off; any
+other input (typed text, a partial or over-long line) is discarded unseen,
+nothing is cleared, and "Nothing needs to be typed here; that input was
+discarded. Press Enter when you have written it down: " is shown before the
+next read. End of input cancels (exit 7). Only after the empty line does
+pvault clear the screen, on a best-effort basis; terminal scrollback, logs
+and recordings may still hold it (7.4b remnants). Both messages are
+approved (2026-10-11). On Windows the classic console (`conhost`) prints
 control sequences literally unless virtual-terminal processing is on, so
 pvault turns it on for the clearing sequences and restores the previous
 mode; where it cannot, it blanks the whole console screen buffer through the
 console API. Raw control sequences are never printed (fixed 2026-10-11 after
-the Windows checklist showed `←[2J←[3J←[H`). **Recovery-card text is never displayed** (decided
+the Windows checklist showed `←[2J←[3J←[H`). On Windows, everything the
+terminal module writes to the console (shown secrets, prompts) is written as
+UTF-16 through `WriteConsoleW`, so it displays correctly whatever the
+console's output code page (7.6a, amended 2026-10-11). Clearing is best
+effort: if it fails, the screen is left as it is, without a notice, and the
+command continues; the console's previous output mode is restored after
+the clearing sequences. **Recovery-card text is never displayed** (decided
 2026-10-05); cards exist only as files. Card Base32 may be **typed** back,
 hidden, for verification.
 
@@ -295,7 +309,7 @@ pvault init <vault-dir>          (resume; no other options except --tpm and --tp
 **Flow (new vault):**
 1. Bootstrap and preflight (8.3 steps 1 to 7): open the parent, create the folder if absent, identify the file system, create the lock files, take the lock, re-check emptiness, run the preflight. Refusals use the 8.5 and 8.4 messages. The settings folder must allow durable registration (`docs/M4_READINESS.md` 7.1); otherwise `init` refuses here, before writing anything.
 2. Passphrase:
-   - **Generated** (needs the terminal device): the words, the entropy (`n × log2(7776)` bits) and the rating are shown on the terminal. "Write this passphrase down. Press Enter when done."
+   - **Generated** (needs the terminal device): the words, the entropy (`n × log2(7776)` bits) and the rating are shown on the terminal. "Write this passphrase down. Press Enter when done." Then the labelled, hidden wait that only an empty line ends (section 2, "Shown secrets"); the screen is cleared after it.
    - **Custom:** "Enter the new passphrase:" then "Enter it again:" (a mismatch: "The passphrases do not match.", and the pair is asked again; three mismatches end the command, exit 1, nothing written). Refusals and warnings follow SI-51 section 3, the NFC notice when applicable, then the estimate: weak is refused; medium needs the confirmation `ACCEPT MEDIUM PASSPHRASE`; strong continues. Estimator failure refuses the passphrase.
 3. "Deriving keys…" (Argon2id), then the init journal and key table (8.3).
 4. Card files are written to `--cards-dir` (`docs/M4_READINESS.md` 11): `pvault-<vault-id-8hex>-<set-id-8hex>-card-a.svg` and `…-card-b.svg`. Standard error: "Card files written: <path A>, <path B>. Print both, then keep the printed cards in two different places."

@@ -92,6 +92,11 @@ fn main() -> ExitCode {
             "redirected_stdin_needs_secrets_stdin",
             redirected_stdin_needs_secrets_stdin,
         ),
+        #[cfg(unix)]
+        (
+            "generated_passphrase_waits_for_an_empty_line",
+            generated_passphrase_waits_for_an_empty_line,
+        ),
         ("init_crash_at_each_step", init_crash_at_each_step),
         ("add_crash_at_each_step", add_crash_at_each_step),
         ("replace_crash_at_each_step", replace_crash_at_each_step),
@@ -1284,6 +1289,86 @@ fn image_cards(label: &str, base: &Path) {
 }
 
 /// O2 (2026-10-06), `docs/CLI.md` 3, on the real CLI with a terminal and no
+/// The generated passphrase stays on screen until an empty line (approved
+/// 2026-10-11): typed input is not echoed, does not clear the screen and
+/// brings back the instruction; an empty line then clears it. The screen
+/// holds the generated passphrase, so no failure message includes it.
+#[cfg(unix)]
+fn generated_passphrase_waits_for_an_empty_line() {
+    let env = Env::new();
+    let cards = env.cards();
+    std::fs::create_dir_all(&cards).unwrap();
+    let mut args = vec![
+        arg("init"),
+        arg(&env.vault()),
+        arg("--mode"),
+        arg("portable"),
+        arg("--cards"),
+        arg("paper"),
+        arg("--cards-dir"),
+        arg(&cards),
+    ];
+    args.extend(FAST.iter().map(arg));
+    let tty = pty::open();
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args(&args)
+        .env(CHILD_ENV, "1")
+        .env("PVAULT_CONFIG_DIR", env.root().join("settings"))
+        .env_remove("PVAULT_FAILPOINT")
+        .env_remove("PVAULT_TEST_NO_TERMINAL")
+        .stdin(Stdio::from(tty.slave.try_clone().unwrap()))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    pty::make_controlling(&mut cmd, &tty.slave);
+    let mut child = cmd.spawn().unwrap();
+    let screen = pty::Screen::start(&tty.master);
+    let clear = "\x1b[2J";
+    let mut wait_for = |needle: &str, what: &str| {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !screen.text().contains(needle) {
+            let ended = child.try_wait().unwrap().is_some();
+            if ended || Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                // The screen holds the generated passphrase: not printed.
+                panic!("{what}: not shown (process ended: {ended})");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_for("nothing needs to be typed): ", "the labelled wait");
+    let text = screen.text();
+    assert!(
+        text.contains("Your passphrase:"),
+        "the passphrase was shown"
+    );
+    assert!(
+        !text.contains(clear),
+        "not cleared before the owner's Enter"
+    );
+    assert!(!pty::echo_on(&tty.slave), "echo is off during the wait");
+    (&tty.master).write_all(b"some typed text\n").unwrap();
+    wait_for("that input was discarded.", "the repeated instruction");
+    let text = screen.text();
+    assert!(
+        !text.contains("some typed text"),
+        "typed input was not echoed"
+    );
+    assert!(
+        !text.contains(clear),
+        "typed input did not clear the screen"
+    );
+    assert!(
+        text.contains("Your passphrase:"),
+        "the passphrase is still shown"
+    );
+    (&tty.master).write_all(b"\n").unwrap();
+    wait_for(clear, "the clearing after an empty line");
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(tty);
+}
+
 /// Spec 10 item 6 (`docs/CLI.md` 2; Windows checklist step 9): without
 /// `--secrets-stdin`, a command that reads secrets is refused (exit 6) when
 /// standard input is redirected, even with a terminal present: no prompt is

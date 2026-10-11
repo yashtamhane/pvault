@@ -288,6 +288,11 @@ fn fail(e: &Error, typed: Option<&str>) -> ExitCode {
     ExitCode::from(code(e))
 }
 
+/// The wait after a shown secret (`docs/CLI.md` 2).
+const DISMISS: &str = "Press Enter when you have written it down (nothing needs to be typed): ";
+/// Shown after any input other than an empty line.
+const DISMISS_AGAIN: &str = "Nothing needs to be typed here; that input was discarded. Press Enter when you have written it down: ";
+
 /// Terminal and `--secrets-stdin` interaction (`docs/CLI.md` 2).
 struct Owner {
     stdin: Option<StdinSecrets>,
@@ -399,7 +404,13 @@ impl Prompter for Owner {
             ));
         }
         terminal::show(&format!("\n{text}\n")).map_err(Error::Input)?;
-        terminal::read_visible("").map_err(Error::Input)?;
+        // Approved 2026-10-11: a labelled wait, with echo off, that only an
+        // empty line ends. Anything typed is discarded unseen, the secret
+        // stays on screen, and the instruction is repeated.
+        terminal::wait_for_dismissal(DISMISS, DISMISS_AGAIN).map_err(|e| match e {
+            InputError::Cancelled => Error::Cancelled,
+            e => Error::Input(e),
+        })?;
         // Best effort: clear the screen and scrollback (7.4b remnants).
         terminal::clear_screen();
         Ok(())

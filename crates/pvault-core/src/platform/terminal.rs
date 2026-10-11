@@ -22,12 +22,49 @@
 //! the prompt ends. This reduces the chance that stray queued lines answer a
 //! later prompt; it does not prove which prompt was visible when a line was
 //! typed, and it cannot stop input that arrives after the flush.
+//!
+//! **Output and clearing** (Windows; 7.6a amended 2026-10-11): text goes to
+//! the console as UTF-16 (`WriteConsoleW`). Clearing adds virtual-terminal
+//! processing to the output mode and restores the previous mode, or blanks
+//! the screen buffer through the console API. Clearing is best effort: a
+//! failure leaves the screen as it is.
 
 use crate::input::{ByteSource, InputError, SecretLine, read_line};
 
 /// Prompts on the terminal and reads one secret line with echo off.
 pub fn read_secret(prompt: &str) -> Result<SecretLine, InputError> {
     read_hidden(prompt, |source| read_line(source))
+}
+
+/// After a secret was shown: waits, with echo off, until the owner presses
+/// Enter on an **empty** line (approved 2026-10-11). `prompt` labels the
+/// wait; any other input (typed text, a partial or over-long line) is
+/// discarded unseen, nothing is cleared, and `again` is shown before the
+/// next read. End of input is [`InputError::Cancelled`].
+pub fn wait_for_dismissal(prompt: &str, again: &str) -> Result<(), InputError> {
+    dismissal(
+        |p| imp::read_hidden(p, |source| read_line(source)),
+        prompt,
+        again,
+    )
+}
+
+/// The dismissal loop over a hidden-line reader (shared by the platform
+/// implementations and the tests).
+fn dismissal(
+    mut read: impl FnMut(&str) -> Result<SecretLine, InputError>,
+    prompt: &str,
+    again: &str,
+) -> Result<(), InputError> {
+    let mut label = prompt;
+    loop {
+        match read(label) {
+            Ok(line) if line.terminated() && line.is_empty() => return Ok(()),
+            // Anything typed is dropped (and wiped) without being shown.
+            Ok(_) | Err(InputError::TooLong) => label = again,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// Prompts on the terminal with echo off, then lets `read` take as many
@@ -238,6 +275,20 @@ mod imp {
         read_hidden_from(&tty, prompt, read)
     }
 
+    /// [`super::wait_for_dismissal`] on a given terminal (tests).
+    #[cfg(test)]
+    pub(crate) fn wait_for_dismissal_from(
+        tty: &File,
+        prompt: &str,
+        again: &str,
+    ) -> Result<(), InputError> {
+        super::dismissal(
+            |p| read_hidden_from(tty, p, |source| read_line(source)),
+            prompt,
+            again,
+        )
+    }
+
     /// Reads one secret from an already open terminal.
     #[cfg(test)]
     pub(crate) fn read_secret_from(tty: &File, prompt: &str) -> Result<SecretLine, InputError> {
@@ -290,8 +341,7 @@ mod imp {
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod imp {
-    use std::fs::File;
-    use std::io::{self, Write};
+    use std::io;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering::SeqCst};
 
@@ -305,7 +355,7 @@ mod imp {
         CONSOLE_SCREEN_BUFFER_INFO, COORD, ENABLE_ECHO_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
         FillConsoleOutputAttribute, FillConsoleOutputCharacterW, FlushConsoleInputBuffer,
         GetConsoleMode, GetConsoleScreenBufferInfo, ReadConsoleW, SetConsoleCtrlHandler,
-        SetConsoleCursorPosition, SetConsoleMode,
+        SetConsoleCursorPosition, SetConsoleMode, WriteConsoleW,
     };
     use windows_sys::core::BOOL;
     use zeroize::Zeroizing;
@@ -463,11 +513,43 @@ mod imp {
         open("CONIN$").is_ok() && open("CONOUT$").is_ok()
     }
 
+    /// Writes `text` to a console output handle as UTF-16 (`WriteConsoleW`),
+    /// so it shows correctly whatever the console's output code page; a byte
+    /// write would be decoded in that code page. The UTF-16 copy is wiped
+    /// afterwards, because shown text can be a secret.
+    fn write_console(handle: HANDLE, text: &str) -> io::Result<()> {
+        let units: Zeroizing<Vec<u16>> = Zeroizing::new(text.encode_utf16().collect());
+        let mut done = 0usize;
+        while done < units.len() {
+            let rest = &units[done..];
+            let count = u32::try_from(rest.len()).unwrap_or(u32::MAX);
+            let mut written = 0u32;
+            // SAFETY: `handle` is an open console output handle; `rest` is
+            // valid for `count` UTF-16 units; `written` is writable; the
+            // reserved argument is null.
+            let ok = unsafe {
+                WriteConsoleW(
+                    handle,
+                    rest.as_ptr().cast(),
+                    count,
+                    &mut written,
+                    core::ptr::null(),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if written == 0 {
+                return Err(io::Error::from(io::ErrorKind::WriteZero));
+            }
+            done += written as usize;
+        }
+        Ok(())
+    }
+
     pub(super) fn show(text: &str) -> Result<(), InputError> {
         let conout = open("CONOUT$").map_err(|_| InputError::NoTerminal)?;
-        File::from(conout)
-            .write_all(text.as_bytes())
-            .map_err(InputError::Io)
+        write_console(conout.as_raw_handle() as HANDLE, text).map_err(InputError::Io)
     }
 
     /// The classic console (`conhost`) prints control sequences literally
@@ -479,8 +561,7 @@ mod imp {
         let Ok(conout) = open("CONOUT$") else {
             return;
         };
-        let mut out = File::from(conout);
-        let handle = out.as_raw_handle() as HANDLE;
+        let handle = conout.as_raw_handle() as HANDLE;
         let mut mode = 0u32;
         // SAFETY: `handle` is an open console output handle and `mode` is
         // writable.
@@ -489,8 +570,7 @@ mod imp {
         }
         // SAFETY: as above; only an output mode flag changes.
         if unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) } != 0 {
-            let _ = out.write_all(b"\x1b[2J\x1b[3J\x1b[H");
-            let _ = out.flush();
+            let _ = write_console(handle, "\x1b[2J\x1b[3J\x1b[H");
             // SAFETY: restores the mode read above on the same handle.
             unsafe { SetConsoleMode(handle, mode) };
         } else {
@@ -531,15 +611,15 @@ mod imp {
     ) -> Result<T, InputError> {
         let conout = open("CONOUT$").map_err(|_| InputError::NoTerminal)?;
         let conin = open("CONIN$").map_err(|_| InputError::NoTerminal)?;
-        let mut out = File::from(conout);
+        let out = conout.as_raw_handle() as HANDLE;
         let handle = conin.as_raw_handle() as HANDLE;
         let guard = EchoOff::engage(handle).map_err(InputError::Io)?;
-        out.write_all(prompt.as_bytes()).map_err(InputError::Io)?;
+        write_console(out, prompt).map_err(InputError::Io)?;
         let mut source = source(handle);
         let result = read(&mut source);
         drop(guard);
         drop(source);
-        let _ = out.write_all(b"\r\n");
+        let _ = write_console(out, "\r\n");
         result
     }
 
@@ -551,9 +631,7 @@ mod imp {
         if unsafe { FlushConsoleInputBuffer(handle) } == 0 {
             return Err(InputError::Io(io::Error::last_os_error()));
         }
-        File::from(conout)
-            .write_all(prompt.as_bytes())
-            .map_err(InputError::Io)?;
+        write_console(conout.as_raw_handle() as HANDLE, prompt).map_err(InputError::Io)?;
         let mut source = source(handle);
         read_line(&mut source)
     }
@@ -597,7 +675,7 @@ mod tests {
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    use super::imp::{read_hidden_from, read_secret_from};
+    use super::imp::{read_hidden_from, read_secret_from, wait_for_dismissal_from};
     use crate::card::{CardTextError, CardTextProgress, CardTextReader, PAYLOAD_LEN};
     use crate::input::{InputError, read_line};
     use crate::secrets::SecretBytes;
@@ -824,6 +902,79 @@ mod tests {
         (&master).write_all(b"\n").unwrap();
         let payload = reader.join().unwrap().unwrap().unwrap();
         assert_eq!(payload.expose_secret(), card.payload());
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// The wait after a shown secret (approved 2026-10-11): typed input does
+    /// not end it, is not echoed and brings back the instruction; only an
+    /// empty line ends it. The typed text here is not a secret.
+    #[test]
+    fn dismissal_needs_an_empty_line() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let Pty { master, slave } = pty();
+        let watcher = slave.try_clone().unwrap();
+        let waiter = std::thread::spawn(move || {
+            wait_for_dismissal_from(
+                &slave,
+                "Press Enter when done: ",
+                "Nothing to type. Again: ",
+            )
+        });
+        let mut shown = Vec::new();
+        read_until(&master, &mut shown, |s| {
+            contains(s, b"Press Enter when done: ")
+        });
+        assert!(!echo_on(&watcher), "echo is off during the wait");
+        (&master).write_all(b"typed text, not a secret\n").unwrap();
+        read_until(&master, &mut shown, |s| {
+            contains(s, b"Nothing to type. Again: ")
+        });
+        assert!(!waiter.is_finished(), "typed input did not end the wait");
+        assert!(!echo_on(&watcher), "echo is still off");
+        // Only after the repeated instruction is visible: the empty line.
+        (&master).write_all(b"\n").unwrap();
+        waiter.join().unwrap().unwrap();
+        assert!(echo_on(&watcher), "echo restored");
+        read_until(&master, &mut shown, |s| {
+            let tail = s.rsplit(|&b| b == b':').next().unwrap_or_default();
+            tail.contains(&b'\n')
+        });
+        assert!(
+            !contains(&shown, b"typed text"),
+            "typed input was not echoed"
+        );
+    }
+
+    #[test]
+    fn dismissal_ends_on_an_empty_line_at_once() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let Pty { master, slave } = pty();
+        let watcher = slave.try_clone().unwrap();
+        let waiter =
+            std::thread::spawn(move || wait_for_dismissal_from(&slave, "Done: ", "Again: "));
+        let mut shown = Vec::new();
+        read_until(&master, &mut shown, |s| contains(s, b"Done: "));
+        (&master).write_all(b"\n").unwrap();
+        waiter.join().unwrap().unwrap();
+        assert!(echo_on(&watcher), "echo restored");
+        assert!(!contains(&shown, b"Again: "), "no repeated instruction");
+    }
+
+    #[test]
+    fn dismissal_end_of_input_is_cancellation() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let Pty { master, slave } = pty();
+        let watcher = slave.try_clone().unwrap();
+        let waiter =
+            std::thread::spawn(move || wait_for_dismissal_from(&slave, "Done: ", "Again: "));
+        let mut shown = Vec::new();
+        read_until(&master, &mut shown, |s| contains(s, b"Done: "));
+        (&master).write_all(&[0x04]).unwrap(); // VEOF at the start of a line
+        assert!(matches!(waiter.join().unwrap(), Err(InputError::Cancelled)));
+        assert!(echo_on(&watcher), "echo restored");
     }
 
     #[test]
