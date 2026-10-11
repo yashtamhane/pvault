@@ -298,6 +298,12 @@ jobs:
         with:
           toolchain: stable
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      # The seed test builds pvault-core with its default features, which on
+      # Linux include `tpm` (D1). The fuzz targets themselves do not use it.
+      - name: TPM libraries (bound mode's `tpm` feature, D1)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libtss2-dev pkg-config
       - name: Seeds
         run: PVAULT_FUZZ_SEEDS="$PWD/fuzz/corpus" cargo test -p pvault-core --lib --locked fuzz_seeds -- --ignored
       - name: Fuzz each target
