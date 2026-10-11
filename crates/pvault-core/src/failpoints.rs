@@ -3,8 +3,11 @@
 //! - `failpoint!("name")` aborts the process when the environment variable
 //!   `PVAULT_FAILPOINT` equals `name`. Crash tests run a child process with
 //!   that variable and restart in the parent.
-//! - `fail_io!("name")` does the same, and in unit tests can instead return
-//!   an injected I/O error ([`inject`]), for the 8.5 failure-boundary tests.
+//! - `fail_io!("name")` does the same, and can instead return an injected
+//!   I/O error: in unit tests through [`inject`], for the 8.5
+//!   failure-boundary tests; in a child process when `PVAULT_FAILPOINT` is
+//!   `name!io`, or a comma-separated list of such entries (several reported
+//!   failures in one run), for scenario tests of reported failures.
 //!
 //! Both exist only in unit-test builds and in builds with the non-default
 //! `fault-injection` feature. Everywhere else they expand to nothing, so no
@@ -47,6 +50,12 @@ pub(crate) fn inject(name: &'static str) {
 /// Aborts like [`hit`], or returns an injected error.
 #[cfg(any(test, feature = "fault-injection"))]
 pub(crate) fn hit_io(name: &str) -> std::io::Result<()> {
+    if std::env::var_os("PVAULT_FAILPOINT").is_some_and(|v| {
+        v.to_str()
+            .is_some_and(|v| v.split(',').any(|e| e.strip_suffix("!io") == Some(name)))
+    }) {
+        return Err(std::io::Error::other("injected failure"));
+    }
     hit(name);
     #[cfg(test)]
     {

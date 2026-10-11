@@ -911,7 +911,11 @@ a labelled, hidden prompt that only an empty line ends; typed input is
 discarded unseen and repeats the instruction without clearing; Windows
 console output is written as UTF-16 (`WriteConsoleW`). No timing workaround
 was added. The clearing code of `c7abffa` used console calls beyond the 7.6a
-scope recorded at the time; the amendment approves them. These do not explain the observation, which stays **open**; the
+scope recorded at the time; the amendment approves them. A detectable
+clearing failure and a failed restoration of the console output mode are
+now reported with separate warnings on standard error (approved
+2026-10-11); the absence of a warning does not prove the passphrase was
+erased. These do not explain the observation, which stays **open**; the
 Windows gate stays incomplete.
 
 ### 14a. Printed-card photo check (manual acceptance gate for paper cards; prepared, not performed)

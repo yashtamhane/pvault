@@ -189,10 +189,20 @@ console API. Raw control sequences are never printed (fixed 2026-10-11 after
 the Windows checklist showed `←[2J←[3J←[H`). On Windows, everything the
 terminal module writes to the console (shown secrets, prompts) is written as
 UTF-16 through `WriteConsoleW`, so it displays correctly whatever the
-console's output code page (7.6a, amended 2026-10-11). Clearing is best
-effort: if it fails, the screen is left as it is, without a notice, and the
-command continues; the console's previous output mode is restored after
-the clearing sequences. **Recovery-card text is never displayed** (decided
+console's output code page (7.6a, amended 2026-10-11). The console's
+previous output mode is restored after the clearing sequences. **Clearing
+failures** (approved 2026-10-11): if pvault cannot clear the screen (no
+terminal, a failed write or console call), the screen is left as it is,
+standard error shows "Warning: pvault could not clear the displayed
+passphrase. It may remain visible in the console or scrollback.", and the
+command continues. If the console output mode changed for the clearing
+(Windows) cannot be restored, standard error shows a separate warning,
+"Warning: pvault could not restore the console output mode.
+Escape-sequence processing may remain enabled."; when both fail, both are
+shown, the clearing warning first. No warning does **not** mean the secret
+was erased: a terminal may ignore the clearing sequences or keep its
+scrollback, and pvault cannot tell; logs, recordings and other copies are
+never reached. **Recovery-card text is never displayed** (decided
 2026-10-05); cards exist only as files. Card Base32 may be **typed** back,
 hidden, for verification.
 

@@ -26,8 +26,12 @@
 //! **Output and clearing** (Windows; 7.6a amended 2026-10-11): text goes to
 //! the console as UTF-16 (`WriteConsoleW`). Clearing adds virtual-terminal
 //! processing to the output mode and restores the previous mode, or blanks
-//! the screen buffer through the console API. Clearing is best effort: a
-//! failure leaves the screen as it is.
+//! the screen buffer through the console API. A clearing failure and a
+//! failed restoration of the output mode are returned separately to the
+//! caller, which warns the owner about each; a successful clear does not
+//! prove erasure (7.4b remnants).
+
+use std::io;
 
 use crate::input::{ByteSource, InputError, SecretLine, read_line};
 
@@ -93,11 +97,98 @@ pub fn has_terminal() -> bool {
     imp::has_terminal()
 }
 
-/// Clears the terminal screen and, where the terminal supports it, its
-/// scrollback, after a shown secret (best effort; 7.4b remnants). Never
-/// writes control sequences to a console that would print them literally.
-pub fn clear_screen() {
-    imp::clear_screen();
+/// The outcome of [`clear_screen`]; the caller warns about each failure.
+#[derive(Debug)]
+pub struct Clearing {
+    /// An error means the clearing could not be carried out (no terminal, a
+    /// failed write, a failed console call), so the secret may still be on
+    /// screen. `Ok` means only that the request was delivered: a terminal
+    /// may ignore the sequences or keep scrollback, and logs, recordings and
+    /// other copies are not reached (7.4b remnants), so success never proves
+    /// that the secret was erased.
+    pub cleared: io::Result<()>,
+    /// An error means the console's output mode was changed for the clearing
+    /// sequences and could not be set back (Windows), so virtual-terminal
+    /// processing may stay on. Always `Ok` where no mode is changed (Unix).
+    pub mode_restored: io::Result<()>,
+}
+
+/// Asks the terminal to clear the screen and, where the terminal supports
+/// it, its scrollback, after a shown secret. Never writes control sequences
+/// to a console that would print them literally.
+pub fn clear_screen() -> Clearing {
+    // Test builds only: the first injection point simulates a clearing
+    // failure and the second a failed restoration, on every platform, so the
+    // caller's warnings are tested where pseudo-terminals exist. (Plain
+    // comments: doc comments are kept in the library's metadata, where F85
+    // forbids failpoint names.)
+    let mut clearing = match fail_io!("terminal.clear") {
+        Ok(()) => imp::clear_screen(),
+        Err(e) => Clearing {
+            cleared: Err(e),
+            mode_restored: Ok(()),
+        },
+    };
+    if let Err(e) = fail_io!("terminal.restore-mode") {
+        clearing.mode_restored = Err(e);
+    }
+    clearing
+}
+
+/// Erase display, erase scrollback, cursor home (ECMA-48 ED 2, ED 3 and
+/// CUP).
+const CLEAR_SEQUENCES: &str = "\x1b[2J\x1b[3J\x1b[H";
+
+/// `ENABLE_VIRTUAL_TERMINAL_PROCESSING`, an output-mode flag of the Windows
+/// console (checked against `windows-sys` in the Windows module).
+#[cfg(any(windows, test))]
+const VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+/// The console calls that clearing needs on Windows, behind a trait so the
+/// order of the calls, the mode restoration and the failure reporting are
+/// tested on every platform.
+#[cfg(any(windows, test))]
+trait ClearConsole {
+    fn mode(&mut self) -> io::Result<u32>;
+    fn set_mode(&mut self, mode: u32) -> io::Result<()>;
+    fn write(&mut self, text: &str) -> io::Result<()>;
+    /// Blanks every cell of the screen buffer and homes the cursor.
+    fn blank(&mut self) -> io::Result<()>;
+}
+
+/// The classic console (`conhost`) prints control sequences literally
+/// unless virtual-terminal processing is on for its output handle. So: turn
+/// it on for the sequences and then restore the previous mode, also when the
+/// write failed; where it cannot be turned on, blank the screen buffer
+/// (which holds the console's scrollback) instead. A failed restoration is
+/// reported apart from the clearing: the clear may still have been
+/// delivered, and only virtual-terminal processing may stay on.
+#[cfg(any(windows, test))]
+fn clear_console(console: &mut impl ClearConsole) -> Clearing {
+    let mode = match console.mode() {
+        Ok(mode) => mode,
+        Err(e) => {
+            return Clearing {
+                cleared: Err(e),
+                mode_restored: Ok(()),
+            };
+        }
+    };
+    if console
+        .set_mode(mode | VIRTUAL_TERMINAL_PROCESSING)
+        .is_err()
+    {
+        return Clearing {
+            cleared: console.blank(),
+            mode_restored: Ok(()),
+        };
+    }
+    let cleared = console.write(CLEAR_SEQUENCES);
+    let mode_restored = console.set_mode(mode);
+    Clearing {
+        cleared,
+        mode_restored,
+    }
 }
 
 #[cfg(unix)]
@@ -261,10 +352,20 @@ mod imp {
         tty.flush().map_err(InputError::Io)
     }
 
-    /// Erase display, erase scrollback, cursor home (ECMA-48 ED 2, ED 3
-    /// and CUP), interpreted by Unix terminals.
-    pub(super) fn clear_screen() {
-        let _ = show("\x1b[2J\x1b[3J\x1b[H");
+    /// Unix terminals interpret the clearing sequences themselves.
+    pub(super) fn clear_screen() -> super::Clearing {
+        let cleared = open_tty()
+            .map_err(|_| io::Error::from(io::ErrorKind::NotFound))
+            .and_then(|mut tty| clear_to(&mut tty));
+        super::Clearing {
+            cleared,
+            mode_restored: Ok(()),
+        }
+    }
+
+    pub(super) fn clear_to(out: &mut impl Write) -> io::Result<()> {
+        out.write_all(super::CLEAR_SEQUENCES.as_bytes())?;
+        out.flush()
     }
 
     pub(super) fn read_hidden<T>(
@@ -552,53 +653,95 @@ mod imp {
         write_console(conout.as_raw_handle() as HANDLE, text).map_err(InputError::Io)
     }
 
-    /// The classic console (`conhost`) prints control sequences literally
-    /// unless virtual-terminal processing is on for its output handle. So:
-    /// turn it on for the sequences and restore the previous mode; where it
-    /// cannot be turned on, overwrite the whole screen buffer (which holds
-    /// the console's scrollback) through the console API instead.
-    pub(super) fn clear_screen() {
-        let Ok(conout) = open("CONOUT$") else {
-            return;
-        };
-        let handle = conout.as_raw_handle() as HANDLE;
-        let mut mode = 0u32;
-        // SAFETY: `handle` is an open console output handle and `mode` is
-        // writable.
-        if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
-            return;
+    const _: () = assert!(super::VIRTUAL_TERMINAL_PROCESSING == ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+
+    /// A console output handle, for [`super::clear_console`].
+    struct ConsoleOut(HANDLE);
+
+    impl super::ClearConsole for ConsoleOut {
+        fn mode(&mut self) -> io::Result<u32> {
+            let mut mode = 0u32;
+            // SAFETY: `self.0` is an open console output handle and `mode`
+            // is writable.
+            if unsafe { GetConsoleMode(self.0, &mut mode) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(mode)
         }
-        // SAFETY: as above; only an output mode flag changes.
-        if unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) } != 0 {
-            let _ = write_console(handle, "\x1b[2J\x1b[3J\x1b[H");
-            // SAFETY: restores the mode read above on the same handle.
-            unsafe { SetConsoleMode(handle, mode) };
-        } else {
-            fill_blank(handle);
+
+        fn set_mode(&mut self, mode: u32) -> io::Result<()> {
+            // SAFETY: `self.0` is an open console output handle; only output
+            // mode flags read from it, plus virtual-terminal processing, are
+            // set.
+            if unsafe { SetConsoleMode(self.0, mode) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        fn write(&mut self, text: &str) -> io::Result<()> {
+            write_console(self.0, text)
+        }
+
+        fn blank(&mut self) -> io::Result<()> {
+            let handle = self.0;
+            let mut info = core::mem::MaybeUninit::<CONSOLE_SCREEN_BUFFER_INFO>::uninit();
+            // SAFETY: `handle` is an open console output handle; `info` is
+            // writable and initialized on success.
+            if unsafe { GetConsoleScreenBufferInfo(handle, info.as_mut_ptr()) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the call above succeeded.
+            let info = unsafe { info.assume_init() };
+            let width = u32::try_from(info.dwSize.X).unwrap_or(0);
+            let height = u32::try_from(info.dwSize.Y).unwrap_or(0);
+            let cells = width.saturating_mul(height);
+            if cells == 0 {
+                return Err(io::Error::other(
+                    "the console reported an empty screen buffer",
+                ));
+            }
+            let origin = COORD { X: 0, Y: 0 };
+            let mut written = 0u32;
+            // SAFETY: `handle` is an open console output handle; the count
+            // stays within the buffer the console reported; `written` is
+            // writable.
+            if unsafe {
+                FillConsoleOutputCharacterW(handle, u16::from(b' '), cells, origin, &mut written)
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if written < cells {
+                return Err(io::Error::from(io::ErrorKind::WriteZero));
+            }
+            // SAFETY: as above.
+            if unsafe {
+                FillConsoleOutputAttribute(handle, info.wAttributes, cells, origin, &mut written)
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if written < cells {
+                return Err(io::Error::from(io::ErrorKind::WriteZero));
+            }
+            // SAFETY: `handle` is an open console output handle and `origin`
+            // lies within its buffer.
+            if unsafe { SetConsoleCursorPosition(handle, origin) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
         }
     }
 
-    /// Blanks every cell of the console screen buffer and homes the cursor.
-    fn fill_blank(handle: HANDLE) {
-        let mut info = core::mem::MaybeUninit::<CONSOLE_SCREEN_BUFFER_INFO>::uninit();
-        // SAFETY: `handle` is an open console output handle; `info` is
-        // writable and initialized on success.
-        if unsafe { GetConsoleScreenBufferInfo(handle, info.as_mut_ptr()) } == 0 {
-            return;
-        }
-        // SAFETY: the call above succeeded.
-        let info = unsafe { info.assume_init() };
-        let width = u32::try_from(info.dwSize.X).unwrap_or(0);
-        let height = u32::try_from(info.dwSize.Y).unwrap_or(0);
-        let cells = width.saturating_mul(height);
-        let origin = COORD { X: 0, Y: 0 };
-        let mut written = 0u32;
-        // SAFETY: `handle` is an open console output handle; the counts stay
-        // within the buffer the console reported; `written` is writable.
-        unsafe {
-            FillConsoleOutputCharacterW(handle, u16::from(b' '), cells, origin, &mut written);
-            FillConsoleOutputAttribute(handle, info.wAttributes, cells, origin, &mut written);
-            SetConsoleCursorPosition(handle, origin);
+    /// Clears through [`super::clear_console`] on `CONOUT$`.
+    pub(super) fn clear_screen() -> super::Clearing {
+        match open("CONOUT$") {
+            Ok(conout) => super::clear_console(&mut ConsoleOut(conout.as_raw_handle() as HANDLE)),
+            Err(e) => super::Clearing {
+                cleared: Err(e),
+                mode_restored: Ok(()),
+            },
         }
     }
 
@@ -656,10 +799,158 @@ mod imp {
         Err(InputError::NoTerminal)
     }
 
-    pub(super) fn clear_screen() {}
+    pub(super) fn clear_screen() -> super::Clearing {
+        super::Clearing {
+            cleared: Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
+            mode_restored: Ok(()),
+        }
+    }
 
     pub(super) fn has_terminal() -> bool {
         false
+    }
+}
+
+/// Clearing failures and the console-mode restoration (all platforms; the
+/// Windows console calls are replaced by a recording fake).
+#[cfg(test)]
+mod clear_tests {
+    use std::io;
+
+    use super::{
+        CLEAR_SEQUENCES, ClearConsole, Clearing, VIRTUAL_TERMINAL_PROCESSING as VT, clear_console,
+    };
+
+    /// The mode the fake console starts with (processed output, wrap).
+    const MODE: u32 = 0x3;
+
+    /// Records each call; the operations named in `fail` return errors.
+    struct Fake {
+        fail: &'static [&'static str],
+        calls: Vec<String>,
+    }
+
+    impl Fake {
+        fn call(&mut self, name: &'static str, detail: String) -> io::Result<()> {
+            self.calls
+                .push(format!("{name} {detail}").trim_end().to_owned());
+            if self.fail.contains(&name) {
+                Err(io::Error::other(name))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl ClearConsole for Fake {
+        fn mode(&mut self) -> io::Result<u32> {
+            self.call("mode", String::new()).map(|()| MODE)
+        }
+
+        fn set_mode(&mut self, mode: u32) -> io::Result<()> {
+            let name = if mode == MODE { "restore" } else { "enable" };
+            self.call(name, format!("{mode:#x}"))
+        }
+
+        fn write(&mut self, text: &str) -> io::Result<()> {
+            assert_eq!(text, CLEAR_SEQUENCES);
+            self.call("write", String::new())
+        }
+
+        fn blank(&mut self) -> io::Result<()> {
+            self.call("blank", String::new())
+        }
+    }
+
+    fn run(fail: &'static [&'static str]) -> (Clearing, Vec<String>) {
+        let mut fake = Fake {
+            fail,
+            calls: Vec::new(),
+        };
+        let clearing = clear_console(&mut fake);
+        (clearing, fake.calls)
+    }
+
+    #[test]
+    fn sequences_are_written_with_processing_on_and_the_mode_restored() {
+        let (c, calls) = run(&[]);
+        assert!(c.cleared.is_ok() && c.mode_restored.is_ok());
+        let enable = format!("enable {:#x}", MODE | VT);
+        assert_eq!(calls, ["mode", &enable, "write", "restore 0x3"]);
+    }
+
+    #[test]
+    fn a_failed_write_is_reported_and_the_mode_still_restored() {
+        let (c, calls) = run(&["write"]);
+        assert!(c.cleared.is_err() && c.mode_restored.is_ok());
+        assert_eq!(calls.last().map(String::as_str), Some("restore 0x3"));
+    }
+
+    #[test]
+    fn without_processing_the_buffer_is_blanked_and_the_mode_left_alone() {
+        let (c, calls) = run(&["enable"]);
+        assert!(c.cleared.is_ok() && c.mode_restored.is_ok());
+        let enable = format!("enable {:#x}", MODE | VT);
+        assert_eq!(calls, ["mode", &enable, "blank"]);
+    }
+
+    #[test]
+    fn a_failed_blank_is_reported() {
+        let (c, calls) = run(&["enable", "blank"]);
+        assert!(c.cleared.is_err() && c.mode_restored.is_ok());
+        assert!(!calls.iter().any(|c| c == "write"), "no sequences written");
+    }
+
+    #[test]
+    fn an_unreadable_mode_is_reported_and_nothing_changed() {
+        let (c, calls) = run(&["mode"]);
+        assert!(c.cleared.is_err() && c.mode_restored.is_ok());
+        assert_eq!(calls, ["mode"]);
+    }
+
+    /// The clear was delivered; the failed restoration is reported on its
+    /// own.
+    #[test]
+    fn a_failed_restoration_is_reported_apart_from_the_clearing() {
+        let (c, calls) = run(&["restore"]);
+        assert!(c.cleared.is_ok() && c.mode_restored.is_err());
+        assert_eq!(calls.last().map(String::as_str), Some("restore 0x3"));
+    }
+
+    #[test]
+    fn a_failed_write_and_restoration_are_both_reported() {
+        let (c, _) = run(&["write", "restore"]);
+        assert!(c.cleared.is_err() && c.mode_restored.is_err());
+    }
+
+    /// The injected failures return before the terminal is opened.
+    #[test]
+    fn injected_failures_are_reported() {
+        crate::failpoints::inject("terminal.clear");
+        let c = super::clear_screen();
+        assert!(c.cleared.is_err() && c.mode_restored.is_ok());
+        crate::failpoints::inject("terminal.clear");
+        crate::failpoints::inject("terminal.restore-mode");
+        let c = super::clear_screen();
+        assert!(c.cleared.is_err() && c.mode_restored.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_write_failures_are_reported() {
+        struct Broken;
+        impl io::Write for Broken {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                Err(io::Error::from(io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        assert!(super::imp::clear_to(&mut Broken).is_err());
+        let mut out = Vec::new();
+        super::imp::clear_to(&mut out).unwrap();
+        assert_eq!(out, CLEAR_SEQUENCES.as_bytes());
     }
 }
 

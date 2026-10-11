@@ -97,6 +97,11 @@ fn main() -> ExitCode {
             "generated_passphrase_waits_for_an_empty_line",
             generated_passphrase_waits_for_an_empty_line,
         ),
+        #[cfg(unix)]
+        (
+            "clearing_failures_are_reported",
+            clearing_failures_are_reported,
+        ),
         ("init_crash_at_each_step", init_crash_at_each_step),
         ("add_crash_at_each_step", add_crash_at_each_step),
         ("replace_crash_at_each_step", replace_crash_at_each_step),
@@ -1295,49 +1300,10 @@ fn image_cards(label: &str, base: &Path) {
 /// holds the generated passphrase, so no failure message includes it.
 #[cfg(unix)]
 fn generated_passphrase_waits_for_an_empty_line() {
-    let env = Env::new();
-    let cards = env.cards();
-    std::fs::create_dir_all(&cards).unwrap();
-    let mut args = vec![
-        arg("init"),
-        arg(&env.vault()),
-        arg("--mode"),
-        arg("portable"),
-        arg("--cards"),
-        arg("paper"),
-        arg("--cards-dir"),
-        arg(&cards),
-    ];
-    args.extend(FAST.iter().map(arg));
-    let tty = pty::open();
-    let mut cmd = Command::new(std::env::current_exe().unwrap());
-    cmd.args(&args)
-        .env(CHILD_ENV, "1")
-        .env("PVAULT_CONFIG_DIR", env.root().join("settings"))
-        .env_remove("PVAULT_FAILPOINT")
-        .env_remove("PVAULT_TEST_NO_TERMINAL")
-        .stdin(Stdio::from(tty.slave.try_clone().unwrap()))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    pty::make_controlling(&mut cmd, &tty.slave);
-    let mut child = cmd.spawn().unwrap();
-    let screen = pty::Screen::start(&tty.master);
+    let mut init = GeneratedInit::start(None);
     let clear = "\x1b[2J";
-    let mut wait_for = |needle: &str, what: &str| {
-        let deadline = Instant::now() + Duration::from_secs(120);
-        while !screen.text().contains(needle) {
-            let ended = child.try_wait().unwrap().is_some();
-            if ended || Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                // The screen holds the generated passphrase: not printed.
-                panic!("{what}: not shown (process ended: {ended})");
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    };
-    wait_for("nothing needs to be typed): ", "the labelled wait");
-    let text = screen.text();
+    init.wait_for("nothing needs to be typed): ", "the labelled wait");
+    let text = init.screen.text();
     assert!(
         text.contains("Your passphrase:"),
         "the passphrase was shown"
@@ -1346,10 +1312,13 @@ fn generated_passphrase_waits_for_an_empty_line() {
         !text.contains(clear),
         "not cleared before the owner's Enter"
     );
-    assert!(!pty::echo_on(&tty.slave), "echo is off during the wait");
-    (&tty.master).write_all(b"some typed text\n").unwrap();
-    wait_for("that input was discarded.", "the repeated instruction");
-    let text = screen.text();
+    assert!(
+        !pty::echo_on(&init.tty.slave),
+        "echo is off during the wait"
+    );
+    (&init.tty.master).write_all(b"some typed text\n").unwrap();
+    init.wait_for("that input was discarded.", "the repeated instruction");
+    let text = init.screen.text();
     assert!(
         !text.contains("some typed text"),
         "typed input was not echoed"
@@ -1362,11 +1331,147 @@ fn generated_passphrase_waits_for_an_empty_line() {
         text.contains("Your passphrase:"),
         "the passphrase is still shown"
     );
-    (&tty.master).write_all(b"\n").unwrap();
-    wait_for(clear, "the clearing after an empty line");
-    let _ = child.kill();
-    let _ = child.wait();
-    drop(tty);
+    (&init.tty.master).write_all(b"\n").unwrap();
+    init.wait_for(clear, "the clearing after an empty line");
+    let stderr = init.finish();
+    assert!(
+        !stderr.contains("Warning: pvault could not"),
+        "no clearing or restoration warning after a delivered clear"
+    );
+}
+
+/// `docs/CLI.md` 2 (approved 2026-10-11): when the screen cannot be cleared
+/// after a shown secret, or the console output mode changed for the
+/// clearing cannot be restored, the owner is warned on standard error, each
+/// failure with its own warning (both when both fail), and the command
+/// continues. The failures are injected at `terminal.clear` and
+/// `terminal.restore-mode`.
+#[cfg(unix)]
+fn clearing_failures_are_reported() {
+    const CLEAR: &str = "Warning: pvault could not clear the displayed passphrase. \
+                         It may remain visible in the console or scrollback.";
+    const RESTORE: &str = "Warning: pvault could not restore the console output mode. \
+                           Escape-sequence processing may remain enabled.";
+    for (failpoint, clear_fails, restore_fails) in [
+        ("terminal.clear!io", true, false),
+        ("terminal.restore-mode!io", false, true),
+        ("terminal.clear!io,terminal.restore-mode!io", true, true),
+    ] {
+        let mut init = GeneratedInit::start(Some(failpoint));
+        init.wait_for("nothing needs to be typed): ", "the labelled wait");
+        (&init.tty.master).write_all(b"\n").unwrap();
+        init.wait_for("after printing", "the next step after the warnings");
+        assert_eq!(
+            init.screen.text().contains("\x1b[2J"),
+            !clear_fails,
+            "{failpoint}: cleared only when clearing did not fail"
+        );
+        let stderr = init.finish();
+        assert_eq!(
+            stderr.contains(CLEAR),
+            clear_fails,
+            "{failpoint}: the clearing warning"
+        );
+        assert_eq!(
+            stderr.contains(RESTORE),
+            restore_fails,
+            "{failpoint}: the restoration warning"
+        );
+        if clear_fails && restore_fails {
+            assert!(
+                stderr.find(CLEAR) < stderr.find(RESTORE),
+                "{failpoint}: the clearing warning comes first"
+            );
+        }
+    }
+}
+
+/// A generated paper `init` on a pseudo-terminal that is its controlling
+/// terminal and standard input, as for an interactive owner.
+#[cfg(unix)]
+struct GeneratedInit {
+    _env: Env,
+    child: std::process::Child,
+    tty: pty::Pty,
+    screen: pty::Screen,
+}
+
+#[cfg(unix)]
+impl GeneratedInit {
+    fn start(failpoint: Option<&str>) -> Self {
+        let env = Env::new();
+        let cards = env.cards();
+        std::fs::create_dir_all(&cards).unwrap();
+        let mut args = vec![
+            arg("init"),
+            arg(&env.vault()),
+            arg("--mode"),
+            arg("portable"),
+            arg("--cards"),
+            arg("paper"),
+            arg("--cards-dir"),
+            arg(&cards),
+        ];
+        args.extend(FAST.iter().map(arg));
+        let tty = pty::open();
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(&args)
+            .env(CHILD_ENV, "1")
+            .env("PVAULT_CONFIG_DIR", env.root().join("settings"))
+            .env_remove("PVAULT_FAILPOINT")
+            .env_remove("PVAULT_TEST_NO_TERMINAL")
+            .stdin(Stdio::from(tty.slave.try_clone().unwrap()))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(fp) = failpoint {
+            cmd.env("PVAULT_FAILPOINT", fp);
+        }
+        pty::make_controlling(&mut cmd, &tty.slave);
+        let child = cmd.spawn().unwrap();
+        let screen = pty::Screen::start(&tty.master);
+        GeneratedInit {
+            _env: env,
+            child,
+            tty,
+            screen,
+        }
+    }
+
+    fn wait_for(&mut self, needle: &str, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !self.screen.text().contains(needle) {
+            let ended = self.child.try_wait().unwrap().is_some();
+            if ended || Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                // The screen holds the generated passphrase: not printed.
+                panic!("{what}: not shown (process ended: {ended})");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Ends the child and returns its standard error, which never holds a
+    /// secret (`docs/CLI.md` 1.1).
+    fn finish(&mut self) -> String {
+        use std::io::Read;
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let mut stderr = String::new();
+        if let Some(mut pipe) = self.child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        stderr
+    }
+}
+
+#[cfg(unix)]
+impl Drop for GeneratedInit {
+    /// A failed assertion still ends the child before its folder goes.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// Spec 10 item 6 (`docs/CLI.md` 2; Windows checklist step 9): without

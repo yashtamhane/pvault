@@ -292,6 +292,12 @@ fn fail(e: &Error, typed: Option<&str>) -> ExitCode {
 const DISMISS: &str = "Press Enter when you have written it down (nothing needs to be typed): ";
 /// Shown after any input other than an empty line.
 const DISMISS_AGAIN: &str = "Nothing needs to be typed here; that input was discarded. Press Enter when you have written it down: ";
+/// Standard error, when the screen could not be cleared after a shown secret
+/// (`docs/CLI.md` 2; approved 2026-10-11).
+const CLEAR_FAILED: &str = "Warning: pvault could not clear the displayed passphrase. It may remain visible in the console or scrollback.";
+/// Standard error, when the console output mode changed for the clearing
+/// could not be restored (Windows; `docs/CLI.md` 2; approved 2026-10-11).
+const RESTORE_FAILED: &str = "Warning: pvault could not restore the console output mode. Escape-sequence processing may remain enabled.";
 
 /// Terminal and `--secrets-stdin` interaction (`docs/CLI.md` 2).
 struct Owner {
@@ -411,8 +417,16 @@ impl Prompter for Owner {
             InputError::Cancelled => Error::Cancelled,
             e => Error::Input(e),
         })?;
-        // Best effort: clear the screen and scrollback (7.4b remnants).
-        terminal::clear_screen();
+        // Each failure has its own warning and neither is fatal. Success only
+        // means the terminal was asked to clear; it does not prove erasure
+        // (scrollback, logs and recordings; 7.4b remnants).
+        let clearing = terminal::clear_screen();
+        if clearing.cleared.is_err() {
+            self.notice(CLEAR_FAILED);
+        }
+        if clearing.mode_restored.is_err() {
+            self.notice(RESTORE_FAILED);
+        }
         Ok(())
     }
 
