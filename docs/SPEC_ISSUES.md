@@ -911,7 +911,7 @@ other SI-12 recommendations.
   - New bundle, salt, `set_id` and cards.
   - A new passphrase for bound → portable.
   - Write-ahead journal, delivery verification, dual-MAC commit, and old-index retirement only under 9.2b.
-- **Remaining uncertainty:** the confirmation phrases. Review the draft before Milestone 6.
+- **Remaining uncertainty:** the confirmation phrases. Review the draft before Milestone 6. **Phrases decided 2026-10-11 (M6-K5):** `CONVERT TO PORTABLE <8 hex>` and `CONVERT TO BOUND <8 hex>` (first 8 hex characters of the vault ID). The rest of the 6.9 draft is still to be confirmed (`docs/M6_READINESS.md` P3).
 - **Affected:** Milestone 6; F32, F68, F82.
 
 ### SI-32 Duress setup — Accepted (drafted)
@@ -939,7 +939,7 @@ other SI-12 recommendations.
 
 **Proposal:**
 1. **`new_gen`** = `old_gen` + 1 with a checked add. At `u64::MAX`, commits are refused ("generation limit reached"), which is unreachable in practice.
-2. **Argon2 parameters at recovery or conversion:** the current defaults, which must pass 4.3 on this machine, recorded in the new core.
+2. **Argon2 parameters at recovery or conversion:** the current defaults, which must pass 4.3 on this machine, recorded in the new core. **Decided 2026-10-11 (M6-K2):** the defaults, or the owner's values through `init`'s bounded `--kdf-*` options with the same checks and low-memory warning, checked before any write.
 3. **Handle allocation:**
    1. Pick a uniformly random handle in `0x01800000..=0x01BFFFFF` from the OS RNG.
    2. Probe it with `NV_ReadPublic`; absent means it is a candidate. Try at most 32 times, then fail with "no free NV handle".
@@ -2114,5 +2114,17 @@ Decided 2026-10-06 (details and results in `docs/M4_READINESS.md` 17):
 **Milestone 5 native CI** (2026-10-11; implemented under E2; accepted as recorded below): commit `dab6264` implements Milestone 5. Its first CI run did not start (account billing). After the repository was made public, the fuzz smoke job failed at its seed step because it lacked `tpm2-tss` (the seed test builds `pvault-core` with the default `tpm` feature on Linux); commit `c4a4480` installs `libtss2-dev` there, with no test, assertion or timing change. **Run 38157453235** on `c4a44806f7b0`: all 12 jobs succeeded. Substantive libtest tests (stable and 1.89 identical): Linux 266, macOS 246, Windows 233. These exclude the isolated-process runner and its completeness check, and count the isolated tests once: Linux 33 isolated tests, 20 of them on `swtpm` with the emulator required; macOS 13; Windows 9. Scenario suites: 17, 14 and 12 passed, plus the dedicated image step (real FAT, exFAT and Linux `fuseblk` images; macOS APFS with ownership ignored and enforced). Details: `docs/M5_READINESS.md` 14. Still required or open: the Milestone 4 manual gates, real-hardware validation before any bound-mode release, E1, V3's cause, the runner's process-start window, the accepted `tpm2-tss` memory limitation, and the open licensing questions in `THIRD_PARTY_NOTICES.md`.
 
 **Milestone 5 accepted (author, 2026-10-11) as emulator-tested work under E2.** Basis: implementation commit `c4a4480` (Milestone 5 in `dab6264`, the fuzz-job dependency fix in `c4a4480`); evidence commit `9a7a6dd`; native CI runs 38157453235 (on `c4a4480`) and 38159526520 (on `9a7a6dd`), all 12 jobs green in each; the spec 13 row 5 criteria as amended on 2026-10-06, verified on `swtpm`; and the `tpm2-tss` session-secret report with its decision. **What acceptance does not mean:** it is not real-TPM validation (no real TPM was used); it does not establish complete secret-memory wiping (the `tpm2-tss` residue stays an accepted limitation, spec 10 item 8); and it does not make bound mode or the project release-ready. Owner-authorized real-hardware validation stays required before any bound-mode release. Still open: E1 (a timing failure observed under concurrent emulated load), V3's unknown original cause, the isolated-test runner's single process-start window, and the licensing questions in `THIRD_PARTY_NOTICES.md` (EFF word list with GPLv3; IETF test-vector excerpts). **Milestone 4 remains unaccepted**; both manual gates (the Windows console checklist and the printed-card photo check) are outstanding. Milestone 6 is not started.
+
+**Milestone 6 sequencing: E0** (author, 2026-10-11): Milestone 6 work is limited to documentation and decisions until both Milestone 4 manual gates pass. No Milestone 6 code is written and no new sequencing exception is granted (`docs/M6_READINESS.md` 1). Both Milestone 4 gates stay outstanding; Milestone 5 stays accepted as emulator-tested work only.
+
+**Milestone 6 decisions M6-K1 to M6-K5** (author, 2026-10-11; under E0, no Milestone 6 work started; called K1 to K5 in review, renamed because `docs/CLI.md` 9 numbers its conflicts K1, K2, …; details in `docs/M6_READINESS.md` 5a). These settle five questions only; the remaining Milestone 6 proposals (P2 to P10, the CLI drafts) are not approved.
+
+| # | Decision |
+| --- | --- |
+| M6-K1 | A replacement main passphrase (portable recovery, `recover --to-portable`, `convert` bound → portable) is generated or custom under SI-51's creation rules exactly as at `init`. Spec 6.3 b, 6.8 and 6.9 aligned; SI-51 unchanged |
+| M6-K2 | Argon2 for the new salt at recovery and conversion: the defaults, or `init`'s bounded `--kdf-*` options with the same checks and low-memory warning, before any write. Spec 6.3 b and 6.9 aligned; SI-35 item 2 |
+| M6-K3 | A PNG photo of an **old** card that exists before the command (`verify-card`, `recover`, `fsck --repair --recovery`) needs no terminal. O1 is unchanged for photos of new printouts checked during delivery |
+| M6-K4 | New-card delivery options are `--new-*` in both `recover` and `convert`, each with the meaning and rules of its `init` counterpart (`docs/RECOVERY_DELIVERY_PROPOSAL.md` 6.2 aligned) |
+| M6-K5 | `convert` confirmations: `CONVERT TO PORTABLE <8 hex>` and `CONVERT TO BOUND <8 hex>`, the first 8 hex characters of the vault ID. Spec 6.9 and SI-31 aligned |
 
 **G1** (decided and implemented 2026-10-06, Milestone 4): on macOS a volume mounted with ownership ignored (`MNT_IGNORE_OWNERSHIP`, common for external drives) reports `apfs` or `hfs` but enforces no ownership or permissions. Export destinations and card folders there are refused (exit 6) before any secret is read or written, and a settings folder there is not private. Tests on mocked flags and on real APFS images (`docs/M4_READINESS.md` 17).

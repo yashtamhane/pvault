@@ -515,10 +515,13 @@ Open keytable.<core.keytable_gen>.pv, verify its digest against the core, decryp
 
 ```
 a. Generate new_bundle (three fresh independent keys).
-b. Portable: generate a NEW passphrase (shown once) and new salt.
+b. Portable: create a NEW passphrase, generated (shown once) or custom, under SI-51's
+   creation rules exactly as at `init` (decided 2026-10-11, M6-K1), and a new salt.
    Bound: keep the owner's passphrase; generate a new salt.
-   Argon2 parameters for the new salt: the current defaults, which must pass 4.3 on this
-   machine (SI-35 item 2; Milestone 6).
+   Argon2 parameters for the new salt: the current defaults, or the owner's values through
+   `init`'s bounded options with the same checks and low-memory warning; either way they
+   must pass 4.3 on this machine, before any write (SI-35 item 2; decided 2026-10-11,
+   M6-K2; Milestone 6).
 c. Bound: new Shamir 2-of-3 split -> S1', S2', S3'. Portable: new 2-of-2 split -> A', B'.
 d. Bound: first measure the TPM identity (9.3, decision N2); if it cannot be measured,
    refuse before step e and offer `recover --to-portable`. Then choose a free handle
@@ -621,7 +624,8 @@ When the new slots are bound and bound duress is unavailable (9.3), options 1 an
 
 1. Obtain and verify the old bundle exactly as in 6.1, bound path (passphrase + card). No TPM is used.
 2. Prepare as in 6.3, for portable mode:
-   - a new bundle, a new salt and a **newly generated** passphrase (shown once);
+   - a new bundle, a new salt and a **new** passphrase, generated (shown once) or custom
+     under SI-51's creation rules (M6-K1), with Argon2 parameters as in 6.3 b (M6-K2);
    - a new Card A / Card B set with a new `set_id`;
    - no TPM index is created, so the journal carries no new index fields;
    - journal `op: "recover"`, `target_mode: "portable"`.
@@ -635,10 +639,10 @@ When the new slots are bound and bound duress is unavailable (9.3), options 1 an
 
 `convert` uses the same two-phase structure as recovery, but starts from an ordinary unlock.
 
-1. **Unlock.** Ordinary unlock of the current vault (5.2 / 5.3), including the duress check. Typed confirmation: `CONVERT TO PORTABLE` or `CONVERT TO BOUND`. Refused on file systems that fail 8.5.
+1. **Unlock.** Ordinary unlock of the current vault (5.2 / 5.3), including the duress check. Typed confirmation on the terminal: `CONVERT TO PORTABLE <8 hex>` or `CONVERT TO BOUND <8 hex>`, where `<8 hex>` is the first 8 hex characters of the vault ID (decided 2026-10-11, M6-K5). Refused on file systems that fail 8.5.
 2. **Prepare** (nothing old is modified):
-   - Generate a new bundle, a new salt, a new `set_id` and a new card set for the target mode.
-   - **bound → portable:** generate a **new** passphrase (shown once), because it becomes the only barrier. No TPM index is created.
+   - Generate a new bundle, a new salt (Argon2 parameters as in 6.3 b, M6-K2), a new `set_id` and a new card set for the target mode.
+   - **bound → portable:** create a **new** passphrase, generated (shown once) or custom under SI-51's creation rules (M6-K1), because it becomes the only barrier. No TPM index is created.
    - **portable → bound:** keep the owner's passphrase. Create the new index exactly as in 6.3 d to f, with the write-ahead journal written before the index is defined. This requires a usable TPM on this machine whose identity can be measured (9.3, decision N2); otherwise `convert` is refused before any write.
    - Re-encrypt the key table under the new bundle into `keytable.<new_gen>.pv`.
    - Handle duress as in 6.7, producing a tag for the target mode.

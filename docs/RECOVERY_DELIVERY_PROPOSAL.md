@@ -155,9 +155,17 @@ programs. An owner whose file no longer reads can still type its Base32 text
 | `init`, paper: delivery and rehearsal | 4 | Not accepted: a file is not evidence of a printout | PNG photo or typed text (unchanged) |
 | `verify-card` | 6 | `--card-a-file`, `--card-b-file` (portable), `--card-file` (bound) | PNG, typed text |
 | `recover` | 6 | As `verify-card` | PNG, typed text |
-| `convert` delivery verification | 6 | As `init` for the chosen delivery mode | As `init` |
+| `convert` delivery verification | 6 | As `init` for the chosen delivery mode, under `--new-*` option names (M6-K4) | As `init` |
 
 Paths are not secrets; file contents are handled like typed card text.
+
+**Decided 2026-10-11 (`docs/SPEC_ISSUES.md`, M6-K3 and M6-K4):** a PNG photo
+of an **old** card that exists before the command (`verify-card`,
+`recover`) needs no terminal; O1 still applies to photos of **new**
+printouts checked during delivery. The new cards of `recover` and `convert`
+are delivered through `--new-*` options (`--new-cards`, `--new-cards-dir`,
+`--new-card-a-png`, …), each with the meaning and rules of its `init`
+counterpart.
 
 ### 6.2a Pair validation
 
