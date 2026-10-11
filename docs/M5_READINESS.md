@@ -10,6 +10,10 @@ final decision table. No Milestone 5 code,
 dependency, CI change or spec decision is made here; every proposal below is
 for the author's approval. Acceptance criteria are quoted, not changed.
 
+**Milestone 5 accepted (author, 2026-10-11) as emulator-tested work only**
+(section 14, "Acceptance"; `docs/SPEC_ISSUES.md`). Milestone 4 remains
+unaccepted.
+
 **Milestone 4 status when this was written:** implemented and **not
 accepted**. Native CI passed on commit `b6baa13` (run 37541676635), and a
 manual same-volume digital-delivery check passed on macOS
@@ -772,9 +776,21 @@ gates) or a new, explicit exception (section 1).
 ## 14. Implementation under E2 (2026-10-06 to 2026-10-11; commits `dab6264` and `c4a4480`)
 
 Milestone 5 is implemented under exception E2 (`docs/SPEC_ISSUES.md`),
-against the approved D1 to D12 and the acceptance-plan amendment. **Neither
-Milestone 4 nor Milestone 5 is accepted**; both Milestone 4 manual gates
-remain outstanding; no real TPM was accessed (development on `swtpm` only).
+against the approved D1 to D12 and the acceptance-plan amendment. Milestone
+5 was **accepted on 2026-10-11 as emulator-tested work only** ("Acceptance"
+below); **Milestone 4 is not accepted** and both of its manual gates remain
+outstanding; no real TPM was accessed (development on `swtpm` only).
+
+**Acceptance (author, 2026-10-11).** Basis: implementation commit
+`c4a4480`, evidence commit `9a7a6dd`, and native CI runs 38157453235 and
+38159526520 (all 12 jobs green in each), against the spec 13 row 5 criteria
+as amended, verified on `swtpm`, with the `tpm2-tss` report decided (15).
+Acceptance is **not** real-TPM validation, does **not** establish complete
+secret-memory wiping, and does **not** make bound mode release-ready:
+owner-authorized real-hardware validation stays required before any
+bound-mode release. Every limitation recorded below stays open (E1, V3's
+cause, the runner's process-start window, the accepted `tpm2-tss` memory
+limitation) and so do the licensing questions in `THIRD_PARTY_NOTICES.md`.
 
 **Commit and native CI:** committed as `dab6264` (2026-10-11). Its first
 native CI run (38154441494) did not start: GitHub refused every job for an
