@@ -33,8 +33,11 @@ use crate::records::{RollbackOutcome, Settings};
 use crate::resources::{self, SystemMemory};
 use crate::secrets::{SecretBuf, SecretBytes};
 use crate::store::{self, JOURNAL, JOURNAL_TMP};
+use crate::tpm::{Tpm, TpmOptions};
 
+pub(crate) mod bound;
 pub mod discard;
+pub mod duress;
 pub mod edit;
 pub mod export;
 pub mod init;
@@ -238,6 +241,15 @@ pub struct Session {
     pub(crate) table: KeyTable,
     /// The `update` cleanup could not be finished (readiness 9.5).
     pub(crate) unresolved: bool,
+    /// `HKDF(master_pw, "pvault/v1/duress-differs")`: lets `duress set`
+    /// prove that a new duress passphrase is not the main one (6.10) without
+    /// keeping `master_pw`.
+    pub(crate) main_check: SecretBytes<32>,
+    /// The main passphrase is custom and generated-word handling refuses it
+    /// (the N3 class; D7).
+    pub(crate) main_words_refused: bool,
+    /// The TPM options of the command (bound vaults).
+    pub(crate) tpm: TpmOptions,
 }
 
 impl std::fmt::Debug for Session {
@@ -284,14 +296,21 @@ pub(crate) fn derive_and_check_duress(
     header: &Header,
     raw: &SecretLine,
     run_duress: bool,
+    tpm: Option<&mut Box<dyn Tpm>>,
 ) -> Result<SecretBytes<32>, Error> {
     let core = header.core();
     let handled = handle(core.passphrase_kind, raw.as_bytes())?;
     let master = kdf::master_pw(&handled, &core.salt, core.argon2)?;
     drop(handled);
-    let tag = match header.slots() {
-        SlotFields::Portable(p) => p.duress_tag,
-        SlotFields::Bound(_) => return Err(Error::BoundVault),
+    let (tag, bound) = match header.slots() {
+        SlotFields::Portable(p) => (p.duress_tag, None),
+        SlotFields::Bound(b) => (b.duress_tag, Some(b.index)),
+    };
+    // Bound: the tag binds the live EK digest (9.6). It is measured only when
+    // a tag exists; a TPM that cannot be measured is a non-match.
+    let ek = match (run_duress, tag.is_some(), bound, tpm) {
+        (true, true, Some(_), Some(t)) => t.ek_digest().ok(),
+        _ => None,
     };
     if let (true, Some(tag)) = (run_duress, tag) {
         let duress_key = match core.passphrase_kind {
@@ -308,10 +327,17 @@ pub(crate) fn derive_and_check_duress(
                 }
             },
         };
-        if let Some(k) = duress_key
-            && bool::from(duress_tag(&k, &core.vault_id).ct_eq(&tag))
-        {
-            return Err(Error::HeaderInvalid); // `Unlock failed.`; no action
+        let expected = match (&duress_key, bound, ek) {
+            (Some(k), None, _) => Some(duress_tag(k, &core.vault_id)),
+            (Some(k), Some(index), Some(ek)) => {
+                Some(bound::duress_tag(k, &core.vault_id, &index, &ek))
+            }
+            _ => None,
+        };
+        if expected.is_some_and(|e| bool::from(e.ct_eq(&tag))) {
+            // Inactive until the Milestone 9 trigger (D6): `Unlock failed.`,
+            // nothing changed.
+            return Err(Error::HeaderInvalid);
         }
     }
     Ok(master)
@@ -368,26 +394,48 @@ pub(crate) fn rollback(settings: Option<&Settings>, header: &Header, ui: &mut dy
     }
 }
 
-/// The ordinary unlock (5.3 and 5.7).
+/// The ordinary unlock (5.3 and 5.7) of a portable vault, or of a bound
+/// vault on the default TPM (`/dev/tpmrm0`).
 pub fn unlock(
     vault: &Path,
     ui: &mut dyn Prompter,
     settings: Option<&Settings>,
     access: Access,
 ) -> Result<Session, Error> {
+    unlock_with(vault, ui, settings, access, &TpmOptions::default())
+}
+
+/// The ordinary unlock (5.2, 5.3 and 5.7) with the command's TPM options.
+pub fn unlock_with(
+    vault: &Path,
+    ui: &mut dyn Prompter,
+    settings: Option<&Settings>,
+    access: Access,
+    tpm_opts: &TpmOptions,
+) -> Result<Session, Error> {
     // 1. Lock.
     let dir = Dir::open(vault).map_err(Error::Io)?;
     let mut lock = VaultLock::exclusive(&dir)?;
-    // 2. Header (4.3, 4.4); a bound vault is refused by its public mode.
+    // 2. Header (4.3, 4.4). A bound vault needs the TPM (D10); lockout is
+    // public TPM state and is reported before the passphrase (F19).
     let header = header_of(&dir)?;
-    if header.core().mode != Mode::Portable {
-        return Err(Error::BoundVault);
-    }
+    let mut tpm = match header.core().mode {
+        Mode::Portable => None,
+        Mode::Bound => {
+            let mut t = bound::connect(tpm_opts)?;
+            if t.state()?.in_lockout() {
+                return Err(Error::TpmLockout);
+            }
+            Some(t)
+        }
+    };
     // 3. Argon2 limits.
     resources::check_argon2(&header.core().argon2, &SystemMemory)?;
     // 4. Passphrase and word-list check; 5. Argon2id; 6. duress check.
     let raw = ui.secret("Passphrase: ")?;
-    let master = derive_and_check_duress(&header, &raw, true)?;
+    let main_words_refused = header.core().passphrase_kind == PassphraseKind::Custom
+        && passphrase::handle_words(raw.as_bytes()).is_err();
+    let master = derive_and_check_duress(&header, &raw, true, tpm.as_mut())?;
     drop(raw);
     // 7. Pending journal.
     let pend = pending(&dir)?;
@@ -396,8 +444,13 @@ pub fn unlock(
         Pending::Other(op) => return Err(Error::PendingJournal(op)),
         Pending::None | Pending::Update | Pending::TempOnly => {}
     }
-    // Slot unwrap and both MACs.
-    let bundle = open_bundle(&header, &master)?;
+    // Slot unwrap (bound: S1 and S2 from the TPM) and both MACs.
+    let bundle = match tpm.as_deref_mut() {
+        Some(t) => bound::open_bundle(&header, &master, t)?,
+        None => open_bundle(&header, &master)?,
+    };
+    drop(tpm);
+    let main_check = kdf::hkdf_key(&master, b"pvault/v1/duress-differs")?;
     drop(master);
     let mut header = header;
     let mut unresolved = false;
@@ -426,5 +479,8 @@ pub fn unlock(
         bundle,
         table,
         unresolved,
+        main_check,
+        main_words_refused,
+        tpm: tpm_opts.clone(),
     })
 }

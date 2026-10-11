@@ -12,6 +12,7 @@ use pvault_core::card::{CardTextProgress, CardTextReader, PAYLOAD_LEN};
 use pvault_core::crypto::kdf::Argon2Params;
 use pvault_core::errors::Error;
 use pvault_core::estimator;
+use pvault_core::header::Mode;
 use pvault_core::input::{InputError, SecretLine, StdinSecrets, read_line};
 use pvault_core::passphrase::WordCount;
 use pvault_core::platform::terminal;
@@ -19,6 +20,7 @@ use pvault_core::platform::{CoreDumpProtection, disable_core_dumps};
 use pvault_core::records::{Delivery, Settings};
 use pvault_core::render;
 use pvault_core::secrets::SecretBytes;
+use pvault_core::tpm::{TpmOptions, TpmTarget};
 use pvault_core::vault::export::GetError;
 use pvault_core::vault::init::{InitOptions, InitOutcome, PassphraseChoice};
 use pvault_core::vault::{self, Access, Prompter, Session};
@@ -31,8 +33,34 @@ struct Cli {
     /// order.
     #[arg(long, global = true)]
     secrets_stdin: bool,
+    /// The TPM for bound vaults: `device` (default, /dev/tpmrm0) or
+    /// `swtpm:PORT` (a local emulator). Not a secret.
+    #[arg(long, global = true, value_parser = parse_tpm)]
+    tpm: Option<TpmTarget>,
+    /// The TPM owner authorization will be supplied (hidden prompt, or the
+    /// documented --secrets-stdin line).
+    #[arg(long, global = true)]
+    tpm_owner_auth: bool,
     #[command(subcommand)]
     command: Command,
+}
+
+fn parse_tpm(s: &str) -> Result<TpmTarget, String> {
+    TpmTarget::parse(s).ok_or_else(|| "expected device or swtpm:PORT".to_owned())
+}
+
+#[derive(Debug, Subcommand)]
+enum DuressAction {
+    /// Create a duress passphrase (inactive in this version).
+    Set {
+        /// The vault folder.
+        vault_dir: PathBuf,
+    },
+    /// Remove the duress passphrase.
+    Disable {
+        /// The vault folder.
+        vault_dir: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -57,13 +85,17 @@ enum ModeArg {
     Bound,
 }
 
+// Parsed once per process; boxing `init`'s options would add an allocation
+// for nothing (the variant is largest on Windows, where `PathBuf` is bigger).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Create a vault (or resume an interrupted setup).
     Init {
         /// The vault folder.
         vault_dir: PathBuf,
-        /// Vault mode. Milestone 4 builds portable vaults only.
+        /// Vault mode (required for a new vault). Bound needs Linux with a
+        /// TPM.
         #[arg(long, value_enum)]
         mode: Option<ModeArg>,
         /// Recovery cards: printed (paper) or kept as files (digital).
@@ -107,6 +139,17 @@ enum Command {
         /// acknowledgment. Needs a terminal (also with --secrets-stdin).
         #[arg(long)]
         card_b_png: Option<PathBuf>,
+        /// Bound, digital: the folder for the bound card file.
+        #[arg(long)]
+        card_dir: Option<PathBuf>,
+        /// Bound, paper: verify the bound card from a PNG photo.
+        #[arg(long)]
+        card_png: Option<PathBuf>,
+    },
+    /// Set up or remove a duress passphrase.
+    Duress {
+        #[command(subcommand)]
+        action: DuressAction,
     },
     /// Add a file.
     Add {
@@ -193,7 +236,17 @@ fn code(e: &Error) -> u8 {
         | Error::RecordDamaged(_)
         | Error::NoReplaceUnsupported
         | Error::DestinationNotPrivate(_)
-        | Error::Unsupported(_) => 6,
+        | Error::Unsupported(_)
+        | Error::BoundVault
+        | Error::TpmUnavailable(_)
+        | Error::TpmIdentity
+        | Error::TpmHierarchyDisabled
+        | Error::TpmLockout
+        | Error::TpmNoFreeHandle
+        | Error::TpmSession
+        | Error::DuressUnavailable(_) => 6,
+        Error::TpmOwnerAuthRequired | Error::DuressConfigured | Error::TpmIndexElsewhere(_) => 4,
+        Error::TpmDefineUnknown => 5,
         Error::Input(InputError::NoTerminal | InputError::StdinIsTerminal) => 6,
         Error::ForceRefused | Error::SameCardFolder => 2,
         Error::Cancelled => 7,
@@ -368,8 +421,9 @@ fn unlock(
     ui: &mut Owner,
     settings: Option<&Settings>,
     access: Access,
+    tpm: &TpmOptions,
 ) -> Result<Session, Error> {
-    vault::unlock(vault, ui, settings, access)
+    vault::unlock_with(vault, ui, settings, access, tpm)
 }
 
 fn estimate(
@@ -396,6 +450,10 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
         None
     };
     let mut ui = Owner { stdin, tty };
+    let tpm_opts = TpmOptions {
+        target: cli.tpm.clone().unwrap_or(TpmTarget::Device),
+        owner_auth_declared: cli.tpm_owner_auth,
+    };
     match cli.command {
         Command::Init {
             vault_dir,
@@ -412,6 +470,8 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
             kdf_parallelism,
             card_a_png,
             card_b_png,
+            card_dir,
+            card_png,
         } => {
             // A resume (`pvault init <vault>`) takes no card options.
             let resume_only = mode.is_none()
@@ -421,18 +481,21 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
                 && card_b_dir.is_none()
                 && accept_risk.is_empty()
                 && card_a_png.is_none()
-                && card_b_png.is_none();
+                && card_b_png.is_none()
+                && card_dir.is_none()
+                && card_png.is_none();
             match mode {
-                Some(ModeArg::Bound) => {
-                    eprintln!("Bound mode is not available in this version.");
-                    return ExitCode::from(2);
+                // D10: refused before anything is created.
+                Some(ModeArg::Bound) if !pvault_core::tpm::supported() => {
+                    return fail(&Error::BoundVault, None);
                 }
                 None if !resume_only => {
-                    eprintln!("--mode portable is required.");
+                    eprintln!("--mode portable or --mode bound is required.");
                     return ExitCode::from(2);
                 }
                 _ => {}
             }
+            let bound = matches!(mode, Some(ModeArg::Bound));
             let digital = cards == Some(CardsArg::Digital);
             if !resume_only {
                 let usage = |m: &str| {
@@ -442,9 +505,13 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
                 match cards {
                     None => return usage("--cards paper or --cards digital is required."),
                     Some(CardsArg::Paper) => {
-                        if card_a_dir.is_some() || card_b_dir.is_some() || !accept_risk.is_empty() {
+                        if card_a_dir.is_some()
+                            || card_b_dir.is_some()
+                            || card_dir.is_some()
+                            || !accept_risk.is_empty()
+                        {
                             return usage(
-                                "--card-a-dir, --card-b-dir and --accept-risk belong to --cards digital.",
+                                "--card-a-dir, --card-b-dir, --card-dir and --accept-risk belong to --cards digital.",
                             );
                         }
                         if cards_dir.is_none() {
@@ -452,22 +519,45 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
                         }
                     }
                     Some(CardsArg::Digital) => {
-                        if cards_dir.is_some() || card_a_png.is_some() || card_b_png.is_some() {
+                        if cards_dir.is_some()
+                            || card_a_png.is_some()
+                            || card_b_png.is_some()
+                            || card_png.is_some()
+                        {
                             return usage(
-                                "--cards-dir, --card-a-png and --card-b-png belong to --cards paper.",
+                                "--cards-dir, --card-a-png, --card-b-png and --card-png belong to --cards paper.",
                             );
                         }
-                        if card_a_dir.is_none() || card_b_dir.is_none() {
+                        if bound && card_dir.is_none() {
+                            return usage(
+                                "--card-dir is required with --mode bound --cards digital.",
+                            );
+                        }
+                        if !bound && (card_a_dir.is_none() || card_b_dir.is_none()) {
                             return usage(
                                 "--card-a-dir and --card-b-dir are required with --cards digital.",
                             );
                         }
                     }
                 }
+                // One bound card; two portable cards (D8).
+                if bound
+                    && (card_a_dir.is_some()
+                        || card_b_dir.is_some()
+                        || card_a_png.is_some()
+                        || card_b_png.is_some())
+                {
+                    return usage(
+                        "--card-a-dir, --card-b-dir, --card-a-png and --card-b-png belong to --mode portable.",
+                    );
+                }
+                if !bound && (card_dir.is_some() || card_png.is_some()) {
+                    return usage("--card-dir and --card-png belong to --mode bound.");
+                }
             }
             // O1 (2026-10-06): PNG verification waits for the printing
             // acknowledgment on the terminal; refused before anything exists.
-            if (card_a_png.is_some() || card_b_png.is_some()) && !ui.tty {
+            if (card_a_png.is_some() || card_b_png.is_some() || card_png.is_some()) && !ui.tty {
                 return fail(
                     &Error::NeedsTerminal(
                         "Verifying a card from a PNG photo needs a terminal for the printing acknowledgment, also with --secrets-stdin. Nothing was written.",
@@ -479,7 +569,14 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
             // acknowledgment cannot be given; refused before anything exists
             // (the settings folder included).
             if digital && !accept_risk.contains(&RiskArg::DigitalCards) && !ui.tty {
-                eprintln!("{}", vault::init::DIGITAL_RISKS);
+                eprintln!(
+                    "{}",
+                    if bound {
+                        vault::init::DIGITAL_RISKS_BOUND
+                    } else {
+                        vault::init::DIGITAL_RISKS
+                    }
+                );
                 return fail(
                     &Error::AckRequired(
                         "Digital recovery cards need your acknowledgment: give --accept-risk digital-cards, or type STORE CARDS DIGITALLY on a terminal. Nothing was written.",
@@ -523,6 +620,10 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
                 card_a_png,
                 card_b_png,
                 estimate: &estimate,
+                mode: if bound { Mode::Bound } else { Mode::Portable },
+                card_dir,
+                card_png,
+                tpm: tpm_opts.clone(),
             };
             if resume_only {
                 // Only an existing folder can be resumed; a new vault needs
@@ -577,7 +678,13 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
             replace,
         } => {
             let settings = settings_optional(&mut ui);
-            let mut s = match unlock(&vault_dir, &mut ui, settings.as_ref(), Access::Write) {
+            let mut s = match unlock(
+                &vault_dir,
+                &mut ui,
+                settings.as_ref(),
+                Access::Write,
+                &tpm_opts,
+            ) {
                 Ok(s) => s,
                 Err(e) => return fail(&e, None),
             };
@@ -609,7 +716,13 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
             vault_path,
         } => {
             let settings = settings_optional(&mut ui);
-            let s = match unlock(&vault_dir, &mut ui, settings.as_ref(), Access::Read) {
+            let s = match unlock(
+                &vault_dir,
+                &mut ui,
+                settings.as_ref(),
+                Access::Read,
+                &tpm_opts,
+            ) {
                 Ok(s) => s,
                 Err(e) => return fail(&e, None),
             };
@@ -638,7 +751,13 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
                 Ok(s) => s,
                 Err(e) => return fail(&e, None),
             };
-            let s = match unlock(&vault_dir, &mut ui, Some(&settings), Access::Read) {
+            let s = match unlock(
+                &vault_dir,
+                &mut ui,
+                Some(&settings),
+                Access::Read,
+                &tpm_opts,
+            ) {
                 Ok(s) => s,
                 Err(e) => return fail(&e, None),
             };
@@ -680,7 +799,13 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
             recursive,
         } => {
             let settings = settings_optional(&mut ui);
-            let mut s = match unlock(&vault_dir, &mut ui, settings.as_ref(), Access::Write) {
+            let mut s = match unlock(
+                &vault_dir,
+                &mut ui,
+                settings.as_ref(),
+                Access::Write,
+                &tpm_opts,
+            ) {
                 Ok(s) => s,
                 Err(e) => return fail(&e, None),
             };
@@ -695,7 +820,7 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
         }
         Command::Status { vault_dir } => {
             let settings = Settings::open().ok();
-            match vault::status::status(&vault_dir, settings.as_ref(), dumps) {
+            match vault::status::status(&vault_dir, settings.as_ref(), dumps, &tpm_opts) {
                 Ok((report, warning)) => {
                     if let Some(w) = warning {
                         eprintln!("{w}");
@@ -708,6 +833,32 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
                     eprintln!("The header does not parse.");
                     ExitCode::from(1)
                 }
+                Err(e) => fail(&e, None),
+            }
+        }
+        Command::Duress { action } => {
+            let (vault_dir, set) = match action {
+                DuressAction::Set { vault_dir } => (vault_dir, true),
+                DuressAction::Disable { vault_dir } => (vault_dir, false),
+            };
+            let settings = settings_optional(&mut ui);
+            let mut s = match unlock(
+                &vault_dir,
+                &mut ui,
+                settings.as_ref(),
+                Access::Write,
+                &tpm_opts,
+            ) {
+                Ok(s) => s,
+                Err(e) => return fail(&e, None),
+            };
+            let r = if set {
+                vault::duress::set(&mut s, settings.as_ref(), &mut ui)
+            } else {
+                vault::duress::disable(&mut s, settings.as_ref(), &mut ui)
+            };
+            match r {
+                Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(&e, None),
             }
         }
@@ -783,6 +934,14 @@ pub fn main() -> ExitCode {
         return ExitCode::from(u8::try_from(estimator::run_child()).unwrap_or(1));
     }
 
+    // The TPM stack's logs carry secrets at debug level and add detail to
+    // `Unlock failed.` at every level: off, before any TPM operation.
+    // SAFETY: nothing has started a thread yet (the estimator child returned
+    // above without reaching here).
+    #[allow(unsafe_code)]
+    unsafe {
+        pvault_core::platform::quiet_tpm_stack();
+    }
     // Before anything else, so no later crash can write secrets to disk
     // (spec Section 10.3).
     let dumps = match disable_core_dumps() {

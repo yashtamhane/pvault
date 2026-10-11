@@ -180,8 +180,8 @@ Scenario tests create vaults with `--kdf-memory 256 --kdf-iterations 3
 | Item | Linux | macOS | Windows |
 | --- | --- | --- | --- |
 | Unit, scenario, crash tests | CI | CI | CI |
-| Export and card destinations that cannot be verified as owner-only (O3): refused before any secret or file | Loopback FAT/exFAT and `exfat-fuse` (`fuseblk`) images in CI (`fat_exfat_images`); `/proc` (`unverifiable_destinations_are_refused`) | `hdiutil` FAT/exFAT images in CI and locally (passed 2026-10-06); `/dev` (passed locally) | `diskpart` VHDX FAT/exFAT and the loopback share `\\localhost\C$` in CI (not yet run) |
-| F74 on a real FAT/exFAT vault | Loopback image in CI | `hdiutil` image in CI and locally (passed) | `diskpart` VHDX in CI (not yet run); mocked type in unit tests |
+| Export and card destinations that cannot be verified as owner-only (O3): refused before any secret or file | Loopback FAT/exFAT and `exfat-fuse` (`fuseblk`) images in CI (`fat_exfat_images`); `/proc` (`unverifiable_destinations_are_refused`) | `hdiutil` FAT/exFAT images in CI and locally (passed 2026-10-06); `/dev` (passed locally) | `diskpart` VHDX FAT/exFAT and the loopback share `\\localhost\C$` in CI (passed in runs 37466829422 and 37541676635) |
+| F74 on a real FAT/exFAT vault | Loopback image in CI | `hdiutil` image in CI and locally (passed) | `diskpart` VHDX in CI (passed in runs 37466829422 and 37541676635: refused with exit 6, no stable file identity, O4); mocked type in unit tests |
 | Owner-only permissions and ACLs | Mode bits | Mode bits | DACL read back in CI |
 | Interactive console | pty tests | pty tests | **Manual gate** (section 14) |
 | PNG verification with the terminal acknowledgment (O1) | pty scenario (real CLI) | pty scenario (real CLI; passed locally) | **Manual gate** (section 14, steps 13 and 14) |
@@ -990,8 +990,8 @@ its files in these runs.
 
 Linux (loopback `vfat`/`exfat`, mounted `uid`/`gid`/`umask=077`) and Windows
 (`diskpart` VHDX, FAT32 and exFAT) run the same `fat_exfat_images` scenario in
-native CI with `PVAULT_TEST_REQUIRE_IMAGES` (a missing image fails). Neither
-has run yet; the Windows step is unverified until CI runs it. On Windows the
+native CI with `PVAULT_TEST_REQUIRE_IMAGES` (a missing image fails); both
+passed in runs 37466829422 and 37541676635 (below). On Windows the
 terminal-confirmed cleanup parts are reported as skipped (no pseudo-terminal).
 
 **Supported destinations for exported plaintext and card files (O3, fail closed):**
@@ -1091,7 +1091,8 @@ and was confirmed to fail with the check disabled; macOS CI attaches the same
 images and requires the test.
 
 **SI-52, paper or digital recovery cards (revision 4; implemented in
-Milestone 4, 2026-10-06; native CI not yet run).** Design:
+Milestone 4, 2026-10-06; commit `b6baa13`; native CI passed in run
+37541676635, below; manual gates outstanding).** Design:
 `docs/RECOVERY_DELIVERY_PROPOSAL.md`; summary: spec 7.4d; commands:
 `docs/CLI.md` 6.1, 6.7, 6.8; lifecycle: 11.5; record: 7.6.
 
@@ -1111,12 +1112,101 @@ Milestone 4, 2026-10-06; native CI not yet run).** Design:
 
 **Not implemented:** R6, the optional real-drive measurement (not a gate).
 
-The native CI evidence above is for commit `4ae2254`, before the SI-52
-implementation. Before its commit, the digital mode was validated locally
-(macOS) only, as follows.
+**Native CI evidence for SI-52 (run 37541676635, commit `b6baa13`,
+2026-10-06: all 12 jobs succeeded).**
+<https://github.com/yashtamhane/pvault/actions/runs/37541676635>. Counts
+are distinct tests from each job's main `cargo test --workspace --locked`
+step, read from the job logs; later steps rerun tests and are listed
+separately.
 
-**Local validation of the SI-52 implementation (macOS 27, 2026-10-06,
-uncommitted tree):** `cargo fmt --check`; `cargo clippy --workspace
+| Platform | Distinct libtest tests, stable: passed / failed / ignored | Same with Rust 1.89 | Scenario suites in the main step: passed / skipped |
+| --- | --- | --- | --- |
+| Linux (ubuntu-latest) | 238 / 0 / 6 | 238 / 0 / 6 | 14 / 2 |
+| macOS (macos-latest) | 237 / 0 / 6 | 237 / 0 / 6 | 14 / 2 |
+| Windows (windows-latest) | 224 / 0 / 6 | 224 / 0 / 6 | 12 / 2 |
+
+- The two skipped suites in every main step are `fat_exfat_images` and
+  `ownership_ignored_mounts_are_refused`, which need mounted images; the
+  dedicated image step runs them. Windows has two suites fewer
+  (`native_termination_and_cancellation` and
+  `digital_card_check_after_commit` need a Unix pseudo-terminal).
+- Digital suites in the main step on all three platforms:
+  `digital_cards_through_the_cli` and `digital_crash_at_each_step` (all 7
+  failpoints, resume and `clean-partials`), plus
+  `digital_card_check_after_commit` on Linux and macOS. In-process digital
+  tests (`digital_init_keeps_the_card_files`,
+  `digital_acknowledgments_and_folders`, `rehearsal_uses_the_delivered_cards`,
+  `digital_files_retained_after_committing`, `discard_card_is_owner_directed`,
+  `card_check_after_commit`, `card_file_reader_format_1`,
+  `independent_card_file_vector`, `pair_validation`, `card_record_versions`)
+  passed on all three platforms.
+- Reruns, not distinct counts: `--benches` (Linux 199, macOS 198, Windows
+  188 passed; 5 ignored each), the Windows locality probe (2 passed), and
+  native-name coverage on Linux and Windows (1 unit test and 1 scenario
+  suite each, no skips).
+- Other jobs: rustfmt, cargo-deny 0.20.2 (product and fuzz), Unicode table
+  regeneration, swtpm smoke test, release build checks (F85: the
+  `fault-injection` release build refused, no failpoint name in the release
+  artifacts), fuzz smoke (seeds, then 60 s per target for all five targets,
+  including `card_parse` with the card-file reader; no findings).
+
+**Dedicated image results (run 37541676635, `PVAULT_TEST_REQUIRE_IMAGES`).**
+These are real disposable file-system images, separate from the counts
+above:
+
+| Platform | Images | Result |
+| --- | --- | --- |
+| Linux | Loopback `vfat`, `exfat` (kernel) and exFAT through FUSE (`fuseblk`) | `fat_exfat_images` passed: on each image the export and the paper and digital card folders were refused (exit 6) with nothing created; the vault on `fuseblk` refused (no stable file identity). `ownership_ignored_mounts_are_refused` skipped (macOS only, by design) |
+| macOS | `hdiutil` FAT32, exFAT; APFS attached with `-owners off` and `-owners on` | Both suites passed: card folders refused on FAT32, exFAT and the ownership-ignored APFS volume; on the ownership-enforced volume an export and a digital Card A folder were accepted (two volumes, no same-volume acknowledgment needed) |
+| Windows | `diskpart` VHDX, FAT32 and exFAT | `fat_exfat_images` passed: vault refused (no stable file identity), paper and digital card folders refused (exit 6), nothing created. `ownership_ignored_mounts_are_refused` skipped (macOS only, by design) |
+
+**Simulated eject coverage (R5), not a real ejection.** CI and the local
+runs simulate ejecting and re-inserting a drive by removing and recreating
+a card folder with the same file content between "Vault created" and
+`CHECK`. This shows that `init` holds no open handle in the folder (Windows
+refuses to remove a folder with an open file) and that the check reads the
+files afresh; it does not eject a device, does not exercise operating-system
+caches of removable media, and does not test physical separation of the two
+cards. In process this runs on all three platforms
+(`card_check_after_commit`); through the real CLI on a pseudo-terminal only
+on Linux and macOS (`digital_card_check_after_commit`). A real eject on
+Windows is manual checklist step 20a.
+
+**Manual testing of digital delivery.** Separate from the CI evidence above
+and from the manual acceptance gates.
+
+*Mac same-volume workflow check (2026-10-06, passed; performed by the
+author, guided step by step).* macOS 27.0 (Apple silicon), a release build
+of commit `b6baa13` (`cargo build --release --locked -p pvault-cli`), run
+interactively in Terminal. Disposable data only: `~/pvault-digital-check`
+with `card-a`, `card-b` and an isolated settings folder
+(`PVAULT_CONFIG_DIR`), all `0700`, on the internal APFS data volume
+(ownership enforced). A custom test passphrase; Argon2id lowered to 256 MiB,
+t=3, p=1 for speed.
+
+| Step | Action | Observed |
+| --- | --- | --- |
+| 1 | Digital `init`, both card folders on the internal volume, no `--accept-risk` | "Lower memory …" note; the full risk text; `STORE CARDS DIGITALLY` and `SAME DRIVE` typed on the terminal and accepted; the same-volume warning ("Different volumes are not proof of different devices …") and both "on the same drive as the vault" warnings; no sync warning; the passphrase estimated medium and accepted with `ACCEPT MEDIUM PASSPHRASE`; "Card files saved … Checking them now."; **no printing acknowledgment**; one type-back mismatch, then a correct retry (interactive: three attempts); "Your recovery card files: … pvault will not delete them."; "Vault created" |
+| 2 | Optional card check after the commit (R5), `CHECK` typed **without ejecting anything** | "The vault has already been created. …"; "Card check passed: … read back and recover this vault."; exit 0 |
+| 3 | Inspect without opening the SVG files | Each folder held one card file, `-rw-------`, owned by the user (19,968 and 20,435 bytes); SHA-256 recorded; `status` showed the card set matching the file names, `Pending operation: none`, `apfs, supported`; `clean-partials`: "No stale files are recorded." (records released), exit 0 |
+| 4 | `list --card-a-file … --card-b-file …`; `list` with a wrong and with the correct passphrase | Card-file options refused by the parser (exit 2, no prompt); `Unlock failed.` (exit 1); the correct passphrase opened the empty vault (exit 0); both card files unchanged (checksums OK) |
+| 5 | `discard-card` on a non-card file; on Card B with `--vault`, declined, then confirmed | Non-card file: "This is not an unmodified pvault card file (format 1)." (exit 1), file kept. Card B: role, vault ID, card set and "labeled as created" date shown; "Not verified: the header of … names this card's set as its current card set. These header fields were read without any secret …"; "pvault cannot verify whether this is a current card. …"; `NO`: "Not confirmed. Nothing was deleted." (exit 4); `DISCARD RECOVERY CARD 7e55bc2f`: deleted, remnants warning, exit 0. Only Card B was gone; Card A was byte-identical |
+| 6 | Cleanup | The folder listing showed only test data; `~/pvault-digital-check` removed; `~/Library/Application Support/pvault` was never created (isolation held); both paths then reported "No such file or directory" |
+
+What this check does **not** show: physical separation of the two cards
+(both were on one internal drive, the supported same-volume case with its
+acknowledgment), a real ejection and re-insertion (the R5 check ran without
+one), removable or external drives, other file systems, or Windows. Copies
+of the deleted test cards may remain in local snapshots or backups, as the
+remnants warning states; the data was disposable. This check is not a
+substitute for either manual gate.
+
+**Manual gates, outstanding:** the Windows console checklist (14, including
+digital steps 16 to 20b) and the printed-card photo check (14a, paper
+delivery only).
+
+**Local validation of the SI-52 implementation before the commit (macOS 27,
+2026-10-06):** `cargo fmt --check`; `cargo clippy --workspace
 --all-targets -D warnings` (native), and for `x86_64-pc-windows-msvc` and
 `x86_64-unknown-linux-gnu` (library and binaries, and all targets in a copy
 without the Criterion benchmark): clean. `cargo test --workspace` with Rust

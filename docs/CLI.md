@@ -98,8 +98,13 @@ stable file identity). Copy the vault to a supported drive to change it."
 
 ## 2. Secrets, confirmations and the terminal
 
-**Secrets** are the passphrase (typed, confirmed or typed back) and recovery
-card text (Base32). They are **never** accepted as command-line arguments or
+**TPM stack output:** the CLI turns the TPM software stack's own logging off
+at startup (`TSS2_LOG`, overridden; Milestone 5), because at debug level it
+logs session keys and parameters before encryption, and its error lines would
+add detail to `Unlock failed.` (spec 5.6; `docs/M5_READINESS.md` 15).
+
+**Secrets** are the passphrase (typed, confirmed or typed back), recovery
+card text (Base32) and the TPM owner authorization (`--tpm-owner-auth`). They are **never** accepted as command-line arguments or
 from environment variables, and no option or variable for them exists (F79).
 
 | Source | When | Rules |
@@ -180,9 +185,9 @@ hidden, for verification.
 | 1 | The operation failed. Includes `Unlock failed.`, damaged data and I/O errors |
 | 2 | Usage error (unknown command or option, bad argument) |
 | 3 | The vault is in use by another pvault process |
-| 4 | Blocked until the owner acts: a pending journal, unowned leftovers, a stale export, a declined confirmation, a missing risk acknowledgment (6.1), a `discard-card` without a terminal |
-| 5 | The outcome is uncertain: for a vault, run `fsck` (outcome unknown, durability unknown, indeterminate state, unresolved cleanup); for an export, the file was published but its durability is unconfirmed |
-| 6 | Refused by the environment: unsupported file system (for a vault change, or an export or card destination without owner-only permissions), memory policy or resource limit, no terminal for a required prompt, unusable settings folder |
+| 4 | Blocked until the owner acts: a pending journal, unowned leftovers, a stale export, a declined confirmation, a missing risk acknowledgment (6.1), a `discard-card` without a terminal, a TPM owner authorization that is needed but was not declared with `--tpm-owner-auth` under `--secrets-stdin`, `duress set` while duress is configured |
+| 5 | The outcome is uncertain: for a vault, run `fsck` (outcome unknown, durability unknown, indeterminate state, unresolved cleanup); for an export, the file was published but its durability is unconfirmed; a TPM index definition whose outcome is unknown (the journal is kept, 6.1) |
+| 6 | Refused by the environment: unsupported file system (for a vault change, or an export or card destination without owner-only permissions), memory policy or resource limit, no terminal for a required prompt, unusable settings folder; bound mode on a platform without TPM support; a TPM that cannot be reached, whose identity cannot be measured (N2), whose storage hierarchy is disabled, that is in dictionary-attack lockout or that has no free NV handle; a TPM session that cannot be established securely; duress unavailable on this TPM |
 | 7 | Cancelled by the owner inside pvault: declining at a prompt that cancels (for example `ACCEPT MEDIUM PASSPHRASE`), or end of input at a hidden terminal prompt (Unix: Ctrl-D on an empty line). The Windows console delivers Ctrl-Z as the character U+001A, which is input (refused as a control character), not cancellation |
 
 **Native termination is not cancellation** (decided 2026-10-06, O2). Ctrl-C,
@@ -203,6 +208,8 @@ than the message.
 | Option | Meaning |
 | --- | --- |
 | `--secrets-stdin` | Read secrets from standard input, one per line, in the documented order (section 2) |
+| `--tpm <device\|swtpm:PORT>` | The TPM used by bound vaults (decided 2026-10-06, D9). `device` (the default) is `/dev/tpmrm0`. `swtpm:PORT` is a local emulator on `127.0.0.1`, commands on `PORT` and control on `PORT + 1` (tests and development). Not a secret; there is no environment variable for it. Ignored for portable vaults |
+| `--tpm-owner-auth` | Declares that the TPM's owner authorization will be supplied: with `--secrets-stdin`, as one line at the position given for each command (6.1); otherwise as a hidden terminal prompt ("TPM owner authorization:"). The value is a secret: it never appears in arguments, the environment, messages or logs, and it is never stored. Without this flag, an interactive command asks for it (hidden) only when the TPM reports that owner authorization is set; a `--secrets-stdin` command then refuses (exit 4) before anything is written |
 | `--help`, `-h` | Help |
 | `--version`, `-V` | Version |
 
@@ -227,9 +234,14 @@ Card files are read only by digital `init` (delivery and rehearsal) and by
 Milestone 6 `recover` command; `verify-card`, `recover` and `convert` accept
 card files from Milestone 6 (`docs/RECOVERY_DELIVERY_PROPOSAL.md` 6.2, 6.3).
 
-Not available in Milestone 4 (spec 5.7 commands of later milestones, which
-the parser does not accept yet): `recover`, `verify-card`, `convert`,
-`duress`, `fsck`, `mount`, owner Revoke, Erase, K2.
+Milestone 5 adds bound vaults (Linux, 6.1), `duress set` and `duress disable`
+(6.9; inactive until Milestone 9), and the TPM lines of `status` (6.6). Bound
+vaults use the same authentication as portable ones (spec 5.7): the ordinary
+unlock reads S2 from the TPM.
+
+Not available yet (spec 5.7 commands of later milestones, which the parser
+does not accept): `recover`, `verify-card`, `convert`, `fsck`, `mount`, owner
+Revoke, Erase, K2.
 
 ## 6. Commands
 
@@ -247,13 +259,23 @@ pvault init <vault-dir> --mode portable --cards digital
             [--words <10-16> | --custom]
             [--kdf-memory <MiB>] [--kdf-iterations <n>] [--kdf-parallelism <n>]
 
-pvault init <vault-dir>          (resume; no other options)
+pvault init <vault-dir> --mode bound --cards paper --cards-dir <dir>
+            [--card-png <file>] [--words <10-16> | --custom] [kdf options]
+            [--tpm <device|swtpm:PORT>] [--tpm-owner-auth]
+
+pvault init <vault-dir> --mode bound --cards digital --card-dir <dir>
+            [--accept-risk digital-cards] [--words <10-16> | --custom] [kdf options]
+            [--tpm <device|swtpm:PORT>] [--tpm-owner-auth]
+
+pvault init <vault-dir>          (resume; no other options except --tpm and --tpm-owner-auth)
 ```
 
 | Argument or option | Meaning |
 | --- | --- |
 | `<vault-dir>` | The vault folder. Created if absent (8.3 bootstrap); if it exists it must be empty apart from zero-length `vault.gate` / `vault.lock` |
-| `--mode portable` | Required. Milestone 4 builds portable mode only; `--mode bound` gives "Bound mode is not available in this version." (section 9, K1) |
+| `--mode portable\|bound` | Required; no default (decided 2026-10-06, D9; section 9, K1). `bound` needs Linux with TPM support (D10); elsewhere: "Bound mode needs a Linux computer with a TPM in this version." (exit 6), before anything is created |
+| `--card-dir <dir>` | Bound and digital only, required there: the folder for the single bound card file (D8). Same rules as `--card-a-dir`; there is no second card, so no same-volume acknowledgment |
+| `--card-png <file>` | Bound and paper only: verify the printed bound card from a PNG photo (the rules of `--card-a-png`) |
 | `--cards paper\|digital` | Required for a new vault (decided 2026-10-06, SI-52 R1); no default. Missing: "--cards paper or --cards digital is required." (exit 2). **Paper:** printed cards; the card files are temporary and deleted after the commit. **Digital:** the card files are the recovery cards and are kept (below) |
 | `--cards-dir <dir>` | Paper only, required there. An existing folder **outside** the vault for the two card files (7.4b). No default. It must be on a supported destination file system (1.3); otherwise `init` refuses (exit 6) before anything is created, the vault folder included, and before any secret is read (O3) |
 | `--words <n>` | Generated passphrase of `n` words, 10 to 16. Default 12 |
@@ -363,6 +385,38 @@ probably invalid. pvault does not delete them now; check them with pvault
 discard-card." After a restart no command deletes a digital card file (resume
 below, 6.7, 6.8).
 
+**Bound flow** (Milestone 5, decided 2026-10-06; spec 7.4d, 8.3, 9.1 to 9.3).
+Before the bootstrap and before any secret is read, pvault connects to the TPM
+(`--tpm`) and checks it:
+
+1. The TPM identity must be measurable (H-2 EK, spec 8.1; C4). Otherwise:
+   "This computer's TPM identity cannot be established, so a bound vault
+   cannot be created here. You can create a portable vault instead." (exit 6,
+   N2).
+2. The storage hierarchy must be enabled (C2) and the TPM must not be in
+   lockout (C3); otherwise the matching message (section 7), exit 6.
+3. If owner authorization is set (C1) and none can be supplied (no terminal
+   and no `--tpm-owner-auth`): exit 4.
+
+Then the portable flow's steps 1 to 3 (bootstrap, passphrase, key
+derivation), followed by, if needed, "TPM owner authorization:" (hidden;
+under `--secrets-stdin` the line after the two passphrase lines). The
+`prepared` journal records the chosen handle, both precomputed Names, the
+policy nonce and the encrypted identity token; only then is the index
+defined, S2 written and both Names confirmed. One card is written (paper
+`…-bound.svg` in `--cards-dir`, or digital in `--card-dir`); delivery and the
+rehearsal combine S1 from the passphrase with S3 from the delivered card.
+After the type-back, an interactive `init` offers the duress step (6.9): "Type
+SET DURESS to create a duress passphrase now, or press Enter to skip:". The
+optional card check after the commit (R5) asks for the passphrase again,
+because the bound card alone recovers nothing.
+
+A failure before the `committing` record removes the index it defined
+(under 9.2b, with the owner authorization if set) and rolls the setup back. An
+index definition whose outcome is unknown keeps the journal: "The TPM index
+definition did not complete; its outcome is unknown. The setup journal was
+kept; run pvault init on the folder again." (exit 5).
+
 **Non-interactive `init`** (`--secrets-stdin`; custom passphrases only). Every
 branch, with the exact lines consumed:
 
@@ -379,7 +433,11 @@ branch, with the exact lines consumed:
 
 Total: 3 to 5 lines (paper). **Digital: exactly 3 lines** (passphrase, again,
 type-back); no card line is ever read, and there is no printing
-acknowledgment. Paper card lines **cannot be prepared in advance**: the cards
+acknowledgment. **Bound** (Milestone 5): passphrase, again, then the owner
+authorization line **only with `--tpm-owner-auth`**, then (paper) one card
+line or none with `--card-png`, then the type-back: 3 to 5 lines; digital
+bound: 3 or 4. The duress step is never offered without an interactive
+terminal. Paper card lines **cannot be prepared in advance**: the cards
 are generated during the run. The supplier of standard input must wait for
 the "Card files written" line on standard error (or for the files), read the
 card text from the SVG files or the printouts, and only then write lines 3
@@ -392,7 +450,9 @@ committed header, 8.3 restart table):
 - With a header that matches the journal: "This vault's setup was interrupted after it was saved. Enter the passphrase to finish:" (Path A; no duress check). Then the post-commit completion.
 - Without a header: "This folder holds an interrupted setup. Enter the passphrase used for it:" (the journal's `passphrase_kind` selects the handling). Authenticated artifacts are removed, and the setup is rolled back: "The interrupted setup was removed. Run pvault init again." Unowned candidates are listed with name, file identity and size; removing them needs the terminal confirmation `DELETE INIT LEFTOVERS <first 8 hex of setup_id>`.
 - **Digital card files after a restart are never deleted.** On resume, records whose card set is the vault's current card set (authenticated header) are released: "Your recovery card files are: <paths>. Keep them on different drives in different places." Others are kept and named: "Card files of the interrupted setup (card set <16 hex>) were kept: <paths>. They are probably invalid, but pvault does not delete them after a restart; check them with pvault discard-card."
-- `--secrets-stdin` on resume: exactly one line, the passphrase. Confirmations (residue removal, stale card files) come only from the terminal device; without one they are declined and the command reports what blocks it (exit 4).
+- **Bound setup without a header** (8.3 restart table): after the journal authenticates, the journaled index is resolved on the present TPM. The encrypted identity token must match the live TPM; then an absent index, or an index whose Name is neither journaled Name, is left alone and reported ("not ours"), and an index with a journaled Name and the exact public area is removed (owner authorization if set). On another TPM, or when the identity cannot be measured: "This setup's TPM index is on another TPM or cannot be checked here (handle 0x<8 hex>). Nothing was deleted; run pvault init on the computer that created it." (exit 4).
+- **Bound setup with a header:** Path A reads S2 from the TPM (no duress check); the index is kept.
+- `--secrets-stdin` on resume: exactly one line, the passphrase; a bound setup without a header adds the owner authorization line when `--tpm-owner-auth` is given. Confirmations (residue removal, stale card files) come only from the terminal device; without one they are declined and the command reports what blocks it (exit 4).
 
 ### 6.2 `pvault add`
 
@@ -466,7 +526,7 @@ Mode:                portable
 Generation:          <n>   (key table <n>)
 Argon2id:            <m> MiB, t=<t>, p=<p>   (this computer: OK | needs more memory)
 Passphrase kind:     generated | custom
-Duress:              off | configured
+Duress:              off | configured (inactive: no duress action in this version)
 Card set:            <16 hex>
 Pending operation:   none | <op> <phase> (not verified)
 File system:         <type>, supported | <type>, read-only for pvault
@@ -477,7 +537,18 @@ Protection:          core dumps <off | best effort>, memory locking <available |
 - A header that does not parse: "The header does not parse." (exit 1). Allowed for `status` by 5.8.
 - An exclusive holder: "The vault is in use by another pvault process." (exit 3).
 - A lower generation than recorded: the 9.7 warning.
-- "Duress: configured" on a vault made by a later version is shown as is; Milestone 4 itself cannot configure duress (section 9, K6).
+- Duress is configured with `duress set` (6.9) but is **inactive** until the duress action exists (Milestone 9, decided 2026-10-06, D6): a match is `Unlock failed.` and changes nothing, and `status` says so.
+- **Bound vaults** add, after `Mode:` (Milestone 5; D4):
+
+  ```text
+  TPM:                 <device | swtpm:PORT>, reachable | unavailable (<reason>)
+  Owner authorization: set | not set
+  Storage hierarchy:   enabled | disabled
+  Lockout:             no | yes   (failed authorizations <n> of <max>)
+  TPM identity:        measurable | not measurable
+  ```
+
+  and when C1 to C4 fail the duress line reads `configured (inactive …); unavailable on this TPM: <reasons>`, or `off (unavailable on this TPM: <reasons>)` (F81). Unavailable duress is reported **only** here, never during an unlock. A reachable TPM is queried with public commands only (`GetCapability`, `NV_ReadPublic` and an EK `CreatePrimary` with empty authorization); nothing is defined or deleted.
 
 ### 6.7 `pvault clean-partials`
 
@@ -541,6 +612,36 @@ chooses the file and unlocks nothing.
 Verified current membership needs both cards and Path B (`verify-card`,
 Milestone 6); `discard-card` does not attempt it.
 
+### 6.9 `pvault duress set` and `pvault duress disable`
+
+```text
+pvault duress set <vault-dir>
+pvault duress disable <vault-dir>
+```
+
+Approved for Milestone 5 (2026-10-06, D5 to D7; spec 6.10). Both commit
+through the `update` journal (a new key table generation and header, spec
+8.3); the vault's data is unchanged.
+
+- **`duress set`:** the ordinary unlock (with the duress check); refused while
+  a tag is configured ("Duress is already configured. Run pvault duress
+  disable first.", exit 4); needs the terminal device (the duress passphrase
+  is generated and shown only there; exit 6 without one); bound vaults need
+  C1 to C4 (otherwise "Duress is unavailable on this TPM: <reasons>.", exit 6).
+  A 12-word duress passphrase is shown once, must differ from the main
+  passphrase, and is typed back ("Type the duress passphrase from memory:",
+  hidden; three attempts interactively, one under `--secrets-stdin`). When
+  the main passphrase is custom and generated-word handling refuses it, the
+  N3 timing notice is printed (section 7). Success: "Duress passphrase set. It
+  is inactive in this version: entering it fails like a wrong passphrase and
+  changes nothing."
+- **`duress disable`:** the ordinary unlock, then the terminal confirmation
+  `DISABLE DURESS`; the tag is removed. Without a terminal or when declined:
+  exit 4, nothing changed.
+- `--secrets-stdin` lines: `set`: the passphrase, then the duress type-back
+  line; `disable`: the passphrase.
+- The tag's presence is visible to anyone who can read the header (spec 9.6).
+
 ## 7. Messages
 
 Existing, unchanged: every message of spec 4.3, 5.8, 7.3, 7.8, 8.4, 8.5 and the
@@ -583,7 +684,9 @@ New in Milestone 4 (wording for approval):
 | Rollback record (9.7) | `This vault is older than a copy opened on this computer before (generation <g> < <r>). It may be an old copy.` (warning) / `Rollback detection is unavailable: <reason>.` (warning) / `The rollback record is full; this vault is not tracked.` (warning) |
 | Leftover confirmation | `Type DELETE VAULT LEFTOVERS <8 hex> to delete exactly these files:` |
 | Unprovable stale file | `pvault cannot prove that <path> is the file it created; delete it yourself if it is.` (exports add `It may contain exported plaintext.`; card files add `It may hold a recovery card.`) |
-| Duress setup (M4) | No message: there is no option. A duress match is `Unlock failed.` and changes nothing |
+| Duress (Milestone 5) | `Duress passphrase set. It is inactive in this version: entering it fails like a wrong passphrase and changes nothing.` / `Duress is already configured. Run pvault duress disable first.` / `Duress is unavailable on this TPM: <reasons>.` / `Duress disabled.` / N3: `Your custom passphrase is one that generated-word handling refuses. With a duress passphrase set, unlocking with it takes about one Argon2id run less than other inputs, so someone timing unlock attempts can tell. Choosing a passphrase that generated-word handling accepts avoids this.` A duress match is `Unlock failed.` and changes nothing |
+| TPM (Milestone 5) | `Bound mode needs a Linux computer with a TPM in this version.` / `The TPM could not be reached (<target>).` / `This computer's TPM identity cannot be established, so a bound vault cannot be created here. You can create a portable vault instead.` / `The TPM's storage hierarchy is disabled, so its NV indices cannot be used.` / `The TPM is in dictionary-attack lockout. Try again after it recovers.` / `No free TPM NV handle was found.` / `A secure TPM session could not be established; nothing was done.` / `The TPM owner authorization was not accepted.` / `The TPM requires owner authorization; give --tpm-owner-auth to supply it.` / `The TPM index definition did not complete; its outcome is unknown. The setup journal was kept; run pvault init on the folder again.` / `TPM cleanup capacity is full; resolve a recorded index on its original TPM.` / `This setup's TPM index is on another TPM or cannot be checked here (handle 0x<8 hex>). Nothing was deleted; run pvault init on the computer that created it.` (exit 4) / `Removed this setup's TPM index (handle 0x<8 hex>).` / `TPM handle 0x<8 hex> now holds an index that is not this setup's; it was left alone.` / `The TPM index of this setup could not be removed now. The setup journal was kept; run pvault init on the folder again to finish removing it.` |
+| Bound card (Milestone 5) | `Card file written: <path>. Print it, then keep the printed card away from this computer.` / `Card file saved: <path> (Bound card). Checking it now.` / `Your recovery card file: <path> (Bound card). Keep it on a drive in a different place; pvault will not delete it.` / the bound risk text (`Digital recovery card: this card file together with your passphrase opens this vault without the TPM. …`) / R5: `Enter the passphrase to check the card:`, `Card check passed: <path> (Bound card) reads back and, with your passphrase, recovers this vault.` |
 
 ## 8. Locking and journals in commands
 
@@ -594,12 +697,12 @@ New in Milestone 4 (wording for approval):
 
 | # | Spec | Conflict | Proposal |
 | --- | --- | --- | --- |
-| K1 | 1 ("Bound mode (default)") | Milestone 4 has portable mode only; a bound default cannot work yet | `--mode` is required in Milestone 4; the CLI default is decided when bound mode exists (with spec 16 item 3) |
+| K1 | 1 ("Bound mode (default)") | A bound default would fail on every platform without TPM support, and the wizard default is undecided (spec 16 item 3) | Decided 2026-10-06 (D9): `--mode` stays required in the CLI for v1 development; bound mode exists on Linux from Milestone 5 (D10) |
 | K2 | 10.6, 7.3 | The spec does not say where a generated passphrase is shown when there is no terminal | Shown only on the terminal device; generated mode needs a terminal |
 | K3 | 7.3 (medium band), 10.6 | `ACCEPT MEDIUM PASSPHRASE` is a confirmation; confirmations come only from the terminal | Non-interactive custom passphrases must estimate strong |
 | K4 | 8.4 ("must stop and direct the owner to fsck") | Resolving an `update` journal inside `add`/`rm`/`list`/`get` is a new exception | Part of the SI-40 decision (`docs/M4_READINESS.md` section 9) |
 | K5 | 10.2 (`status` shows the protection state) | `status` cannot know the memory-locking result of another process | `status` reports this computer's capability (a test lock) and the core-dump state |
-| K6 | 8.3 ("optional duress") | Milestone 4 offers no duress setup (decided 2026-10-05) | Temporary limitation; documented in the spec |
+| K6 | 8.3 ("optional duress"), 9.6 (duress action) | Duress setup exists from Milestone 5, but the duress action is a Milestone 9 feature behind the Milestone 8 gate | Decided 2026-10-06 (D5, D6): `duress set`/`disable` and the `init` step are built; a configured duress passphrase is inactive (a match is `Unlock failed.` and changes nothing) and `status` says so |
 | K7 | 7.9 (`.pvpartial` beside the destination) | Some destination names leave no room for the 10-character suffix; the limit and its units depend on the destination file system | Refused when exclusive creation reports the name as too long (6.4); no limit is guessed |
 | K9 | 10.6 (secrets one per line) | Card text on a printed card spans 7 lines, and a non-interactive `init` cannot know card text before the cards exist | Terminal card entry may span lines (section 2); under `--secrets-stdin` a card is one line, supplied after the cards are written (6.1) |
 | K10 | 7.4b, 7.9 (no display of secrets; terminal output) | Stored paths may contain C1 and bidirectional controls, which a terminal would interpret | Safe rendering of every printed path (1.2) |

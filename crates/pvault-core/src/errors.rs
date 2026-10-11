@@ -159,9 +159,77 @@ pub enum Error {
     Indeterminate,
 
     // ---- Milestone 4 (`docs/CLI.md` 7) ----
-    /// A bound vault given to a portable-only command (F17, portable part).
-    #[error("This version of pvault opens portable vaults only; this vault is bound.")]
+    /// A bound vault, or `--mode bound`, where this build has no TPM
+    /// support (D10: bound mode is Linux-only in v1).
+    #[error("Bound mode needs a Linux computer with a TPM in this version.")]
     BoundVault,
+
+    // ---- Milestone 5: TPM (`docs/CLI.md` 7; spec 9.1 to 9.3) ----
+    /// The TPM could not be reached (connection or startup failure).
+    #[error("The TPM could not be reached ({0}).")]
+    TpmUnavailable(String),
+
+    /// The H-2 EK cannot be measured (C4; decision N2).
+    #[error(
+        "This computer's TPM identity cannot be established, so a bound vault cannot be created here. You can create a portable vault instead."
+    )]
+    TpmIdentity,
+
+    /// The storage hierarchy is disabled (C2).
+    #[error("The TPM's storage hierarchy is disabled, so its NV indices cannot be used.")]
+    TpmHierarchyDisabled,
+
+    /// Dictionary-attack lockout (C3; F19). Public TPM state (5.8).
+    #[error("The TPM is in dictionary-attack lockout. Try again after it recovers.")]
+    TpmLockout,
+
+    /// No free handle after 32 attempts (SI-35, D3).
+    #[error("No free TPM NV handle was found.")]
+    TpmNoFreeHandle,
+
+    /// A salted, parameter-encrypted session could not be established or
+    /// used; nothing was done (fail closed, D2).
+    #[error("A secure TPM session could not be established; nothing was done.")]
+    TpmSession,
+
+    /// The owner authorization was rejected (`TPM_RC_BAD_AUTH`).
+    #[error("The TPM owner authorization was not accepted.")]
+    TpmOwnerAuthRejected,
+
+    /// Owner authorization is set but cannot be requested (D9).
+    #[error("The TPM requires owner authorization; give --tpm-owner-auth to supply it.")]
+    TpmOwnerAuthRequired,
+
+    /// `NV_DefineSpace` on a handle that is already defined (raced, F87).
+    /// Nothing was created.
+    #[error("The chosen TPM NV handle was taken by another program.")]
+    TpmHandleTaken,
+
+    /// An `NV_DefineSpace` whose outcome is unknown (F88). The journal is
+    /// kept.
+    #[error(
+        "The TPM index definition did not complete; its outcome is unknown. The setup journal was kept; run pvault init on the folder again."
+    )]
+    TpmDefineUnknown,
+
+    /// A journaled index cannot be resolved on this TPM (another TPM, or the
+    /// identity cannot be measured). Nothing was deleted.
+    #[error(
+        "This setup's TPM index is on another TPM or cannot be checked here (handle 0x{0:08x}). Nothing was deleted; run pvault init on the computer that created it."
+    )]
+    TpmIndexElsewhere(u32),
+
+    /// Bound `duress set` while C1 to C4 do not all hold.
+    #[error("Duress is unavailable on this TPM: {0}.")]
+    DuressUnavailable(String),
+
+    /// `duress set` while a tag is configured.
+    #[error("Duress is already configured. Run pvault duress disable first.")]
+    DuressConfigured,
+
+    /// Any other TPM failure; no detail that depends on a secret.
+    #[error("The TPM command failed ({0}).")]
+    Tpm(String),
 
     /// A journal of a kind the command does not resolve.
     #[error("This vault has an unfinished {0}. Run fsck to finish it.")]

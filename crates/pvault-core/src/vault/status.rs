@@ -60,6 +60,7 @@ pub fn status(
     vault: &Path,
     settings: Option<&Settings>,
     dumps: Option<CoreDumpProtection>,
+    tpm: &crate::tpm::TpmOptions,
 ) -> Result<(String, Option<String>), Error> {
     let dir = Dir::open(vault).map_err(Error::Io)?;
     let _lock = lock::status_shared(&dir)?.ok_or(Error::VaultInUse)?;
@@ -69,6 +70,51 @@ pub fn status(
     let w = &mut out;
     let _ = writeln!(w, "Vault ID:            {}", hex(&core.vault_id));
     let _ = writeln!(w, "Mode:                {}", core.mode.as_str());
+    // Bound vaults (D4): public TPM queries only; nothing is defined or
+    // deleted. Unavailable duress is reported here and nowhere else.
+    let mut duress_unavailable = None;
+    if let SlotFields::Bound(_) = header.slots() {
+        match super::bound::connect(tpm).and_then(|mut t| {
+            let state = t.state()?;
+            let ek = t.ek_digest().is_ok();
+            Ok((state, ek))
+        }) {
+            Ok((state, ek)) => {
+                let yes_no = |b: bool, y: &'static str, n: &'static str| if b { y } else { n };
+                let _ = writeln!(w, "TPM:                 {}, reachable", tpm.target);
+                let _ = writeln!(
+                    w,
+                    "Owner authorization: {}",
+                    yes_no(state.owner_auth_set(), "set", "not set")
+                );
+                let _ = writeln!(
+                    w,
+                    "Storage hierarchy:   {}",
+                    yes_no(state.storage_enabled(), "enabled", "disabled")
+                );
+                let _ = writeln!(
+                    w,
+                    "Lockout:             {}   (failed authorizations {} of {})",
+                    yes_no(state.in_lockout(), "yes", "no"),
+                    state.lockout_counter,
+                    state.max_auth_fail
+                );
+                let _ = writeln!(
+                    w,
+                    "TPM identity:        {}",
+                    yes_no(ek, "measurable", "not measurable")
+                );
+                let why = state.duress_unavailable(ek);
+                if !why.is_empty() {
+                    duress_unavailable = Some(why.join(", "));
+                }
+            }
+            Err(e) => {
+                let _ = writeln!(w, "TPM:                 {}, unavailable ({e})", tpm.target);
+                duress_unavailable = Some("the TPM is unavailable".to_owned());
+            }
+        }
+    }
     let _ = writeln!(
         w,
         "Generation:          {}   (key table {})",
@@ -95,11 +141,17 @@ pub fn status(
         SlotFields::Portable(p) => p.duress_tag.is_some(),
         SlotFields::Bound(b) => b.duress_tag.is_some(),
     };
-    let _ = writeln!(
-        w,
-        "Duress:              {}",
-        if duress { "configured" } else { "off" }
-    );
+    // Inactive until the Milestone 9 trigger exists (D6).
+    let duress_text = match (duress, duress_unavailable) {
+        (false, None) => "off".to_owned(),
+        // F81: a bound vault reports why duress could not be set here.
+        (false, Some(why)) => format!("off (unavailable on this TPM: {why})"),
+        (true, None) => "configured (inactive: no duress action in this version)".to_owned(),
+        (true, Some(why)) => format!(
+            "configured (inactive: no duress action in this version); unavailable on this TPM: {why}"
+        ),
+    };
+    let _ = writeln!(w, "Duress:              {duress_text}");
     let _ = writeln!(w, "Card set:            {}", hex(&core.card_set_id));
     let _ = writeln!(w, "Pending operation:   {}", pending_text(&dir)?);
     let fs = match dir.volume() {

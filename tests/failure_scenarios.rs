@@ -18,6 +18,12 @@ use std::time::{Duration, Instant};
 
 const CHILD_ENV: &str = "PVAULT_TEST_CLI";
 const PW: &[u8] = b"correct horse battery staple violin quantum harbor 9172\n";
+
+/// [`PW`] without its newline, for redacting failure reports.
+#[cfg(unix)]
+fn pw_text() -> &'static str {
+    std::str::from_utf8(PW).unwrap().trim_end()
+}
 const FAST: [&str; 6] = [
     "--kdf-memory",
     "256",
@@ -54,6 +60,15 @@ fn main() -> ExitCode {
             digital_cards_through_the_cli,
         ),
         ("digital_crash_at_each_step", digital_crash_at_each_step),
+        #[cfg(target_os = "linux")]
+        ("bound_vault_through_the_cli", bound_vault_through_the_cli),
+        #[cfg(target_os = "linux")]
+        ("bound_crash_at_each_step", bound_crash_at_each_step),
+        #[cfg(target_os = "linux")]
+        (
+            "tpm_library_logging_is_off_from_the_start",
+            tpm_library_logging_is_off_from_the_start,
+        ),
         #[cfg(unix)]
         (
             "digital_card_check_after_commit",
@@ -255,16 +270,13 @@ impl Env {
         let _ = input.write_all(stdin);
         drop(input);
         for (prompt, reply) in answers {
-            let deadline = Instant::now() + Duration::from_secs(180);
-            while !screen.text().contains(prompt) {
-                assert!(
-                    child.try_wait().unwrap().is_none(),
-                    "ended before {prompt:?}: {}",
-                    screen.text()
-                );
-                assert!(Instant::now() < deadline, "no prompt {prompt:?}");
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            pty::wait_for_prompt(
+                &mut child,
+                &screen,
+                prompt,
+                Duration::from_secs(180),
+                &[pw_text()],
+            );
             (&tty.master)
                 .write_all(format!("{reply}\n").as_bytes())
                 .unwrap();
@@ -488,17 +500,13 @@ impl Env {
             first.extend_from_slice(PW);
         }
         input.write_all(&first).unwrap();
-        let prompt = "save the PNG photos at the paths you gave, then press Enter";
-        let deadline = Instant::now() + Duration::from_secs(180);
-        while !screen.text().contains(prompt) {
-            assert!(
-                child.try_wait().unwrap().is_none(),
-                "init ended before the acknowledgment: {}",
-                screen.text()
-            );
-            assert!(Instant::now() < deadline, "no acknowledgment prompt");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        pty::wait_for_prompt(
+            &mut child,
+            &screen,
+            "save the PNG photos at the paths you gave, then press Enter",
+            Duration::from_secs(180),
+            &[pw_text()],
+        );
         // The prompt is waiting: only now do the photos come into being.
         let (a, b) = self.card_files().expect("cards written before the prompt");
         let (pa, pb) = photos(&a, &b);
@@ -610,40 +618,59 @@ fn card_png(svg: &str) -> Vec<u8> {
 #[cfg(unix)]
 #[allow(unsafe_code)]
 mod pty {
-    use std::fs::File;
+    use std::ffi::{CStr, OsStr};
+    use std::fs::{File, OpenOptions};
     use std::io::Read;
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::process::CommandExt;
-    use std::process::Command;
+    use std::process::{Child, Command};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     pub struct Pty {
         pub master: File,
         pub slave: File,
     }
 
+    /// A pseudo-terminal whose descriptors are close-on-exec from the start
+    /// (`File` opens always set `O_CLOEXEC`; `openpty` cannot), so a process
+    /// that another scenario starts meanwhile, such as a long-lived `swtpm`,
+    /// does not inherit this terminal (M5_READINESS V3).
     pub fn open() -> Pty {
-        let (mut master, mut slave) = (-1, -1);
-        // SAFETY: both out-pointers are valid; the optional arguments are
-        // null.
-        let rc = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-            )
+        // `ptsname` returns a static buffer; only this function calls it.
+        static NAME: Mutex<()> = Mutex::new(());
+        let open = |path: &OsStr| {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOCTTY)
+                .open(path)
+                .unwrap()
         };
-        assert_eq!(rc, 0, "openpty failed");
-        // SAFETY: `openpty` returned two new descriptors owned by nothing
-        // else.
-        unsafe {
-            Pty {
-                master: File::from_raw_fd(master),
-                slave: File::from_raw_fd(slave),
-            }
+        let master = open("/dev/ptmx".as_ref());
+        let fd = master.as_raw_fd();
+        // SAFETY: `fd` is an open pseudo-terminal master.
+        assert_eq!(unsafe { libc::grantpt(fd) }, 0, "grantpt failed");
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::unlockpt(fd) }, 0, "unlockpt failed");
+        let name = {
+            let _name = NAME.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: `fd` is an unlocked master; the static result is
+            // copied while `NAME` is held.
+            let p = unsafe { libc::ptsname(fd) };
+            assert!(!p.is_null(), "ptsname failed");
+            // SAFETY: `ptsname` returned a NUL-terminated string.
+            unsafe { CStr::from_ptr(p) }.to_owned()
+        };
+        let slave = open(OsStr::from_bytes(name.to_bytes()));
+        for f in [&master, &slave] {
+            // SAFETY: reading the descriptor flags of an open descriptor.
+            let flags = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags & libc::FD_CLOEXEC != 0, "not close-on-exec");
         }
+        Pty { master, slave }
     }
 
     pub fn make_controlling(cmd: &mut Command, slave: &File) {
@@ -697,6 +724,80 @@ mod pty {
             String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
         }
     }
+
+    /// Waits up to `timeout` for `prompt` on the child's terminal. If the
+    /// child ends first or the time runs out, stops it and panics with what
+    /// can be known: its state while still running, its exit status, its
+    /// standard error and the terminal transcript, each with every string in
+    /// `secrets` replaced (M5_READINESS V3).
+    pub fn wait_for_prompt(
+        child: &mut Child,
+        screen: &Screen,
+        prompt: &str,
+        timeout: Duration,
+        secrets: &[&str],
+    ) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if screen.text().contains(prompt) {
+                return;
+            }
+            let ended = child.try_wait().unwrap();
+            if ended.is_some() || Instant::now() >= deadline {
+                let state = match ended {
+                    Some(_) => "ended before the prompt".to_owned(),
+                    None => format!("still running after {timeout:?}; {}", run_state(child.id())),
+                };
+                let _ = child.kill();
+                let status = child.wait();
+                let stderr = stderr_of(child);
+                let redact = |text: &str| {
+                    secrets
+                        .iter()
+                        .filter(|s| !s.is_empty())
+                        .fold(text.to_owned(), |t, s| t.replace(s, "<secret>"))
+                };
+                panic!(
+                    "no prompt {prompt:?}: {state}; exit status {status:?}\n--- standard error ---\n{}\n--- terminal ---\n{}",
+                    redact(&stderr),
+                    redact(&screen.text())
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Where a running process is (Linux: scheduler state and wait channel,
+    /// for example a terminal read or a file-system wait).
+    fn run_state(pid: u32) -> String {
+        if !cfg!(target_os = "linux") {
+            return "no process state on this platform".to_owned();
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let state = stat
+            .rsplit(") ")
+            .next()
+            .and_then(|r| r.split(' ').next())
+            .unwrap_or("?");
+        let wchan = std::fs::read_to_string(format!("/proc/{pid}/wchan")).unwrap_or_default();
+        format!("scheduler state {state}, wait channel {wchan:?}")
+    }
+
+    /// The child's standard error, read for at most 5 s (a process it
+    /// started could keep the pipe open).
+    fn stderr_of(child: &mut Child) -> String {
+        let Some(mut pipe) = child.stderr.take() else {
+            return "(not captured)".to_owned();
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let _ = pipe.read_to_end(&mut out);
+            let _ = tx.send(String::from_utf8_lossy(&out).into_owned());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| "(still open after 5 s)".to_owned())
+    }
 }
 
 const LOCKS: [&str; 2] = ["vault.gate", "vault.lock"];
@@ -746,12 +847,24 @@ fn basic_commands_and_copied_vault() {
             arg("paper"),
             arg("--cards-dir"),
             arg(&env.cards()),
+            // Never the default device: a closed local port (no real TPM).
+            arg("--tpm"),
+            arg("swtpm:9"),
         ],
         b"",
         None,
     );
-    bound.expect(2, "bound mode");
-    assert!(bound.says("Bound mode is not available in this version."));
+    bound.expect(6, "bound mode without a reachable TPM");
+    if cfg!(target_os = "linux") {
+        assert!(
+            bound.says("The TPM could not be reached (swtpm:9)."),
+            "{}",
+            bound.stderr
+        );
+    } else {
+        assert!(bound.says("Bound mode needs a Linux computer with a TPM in this version."));
+    }
+    assert!(!env.root().join("v2").exists(), "nothing created");
     env.run(
         &[
             arg("list"),
@@ -1187,13 +1300,15 @@ fn native_termination_and_cancellation() {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         pty::make_controlling(&mut cmd, &tty.slave);
-        let child = cmd.spawn().unwrap();
+        let mut child = cmd.spawn().unwrap();
         let screen = pty::Screen::start(&tty.master);
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !screen.text().contains("Passphrase: ") {
-            assert!(Instant::now() < deadline, "{name}: no prompt");
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        pty::wait_for_prompt(
+            &mut child,
+            &screen,
+            "Passphrase: ",
+            Duration::from_secs(60),
+            &[pw_text()],
+        );
         // Echo is off while the prompt waits.
         assert!(!pty::echo_on(&tty.slave), "{name}: echo off at the prompt");
         (&tty.master).write_all(&[key]).unwrap();
@@ -1646,7 +1761,7 @@ fn digital_card_check_after_commit() {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         pty::make_controlling(&mut cmd, &tty.slave);
-        let child = cmd.spawn().unwrap();
+        let mut child = cmd.spawn().unwrap();
         let screen = pty::Screen::start(&tty.master);
         let mut before = before;
         let mut seen = 0;
@@ -1654,19 +1769,14 @@ fn digital_card_check_after_commit() {
             ("Enter the new passphrase: ", pw),
             ("Enter it again: ", pw),
             ("Type your passphrase from memory: ", pw),
+            // Milestone 5: the optional duress step of an interactive init;
+            // Enter skips it.
+            ("Type SET DURESS", ""),
             ("Type CHECK after re-inserting", check),
         ] {
-            let deadline = Instant::now() + Duration::from_secs(180);
-            while !screen.text().contains(prompt) {
-                assert!(
-                    Instant::now() < deadline,
-                    "no prompt {prompt:?}: {}",
-                    screen.text()
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            pty::wait_for_prompt(&mut child, &screen, prompt, Duration::from_secs(180), &[pw]);
             seen += 1;
-            if seen == 4
+            if seen == 5
                 && let Some(f) = before.take()
             {
                 f();
@@ -2195,4 +2305,341 @@ fn native_paths_are_rendered_safely() {
             listed.stderr
         );
     }
+}
+
+/// A fresh `swtpm` for one scenario (Linux; D12). Never a real TPM.
+#[cfg(target_os = "linux")]
+struct Emulator {
+    child: std::process::Child,
+    _dir: tempfile::TempDir,
+    port: u16,
+}
+
+#[cfg(target_os = "linux")]
+impl Emulator {
+    fn start() -> Option<Self> {
+        if Command::new("swtpm").arg("--version").output().is_err() {
+            assert!(
+                std::env::var_os("PVAULT_TEST_REQUIRE_SWTPM").is_none(),
+                "swtpm is required (PVAULT_TEST_REQUIRE_SWTPM)"
+            );
+            return None;
+        }
+        for _ in 0..16 {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = l.local_addr().unwrap().port();
+            drop(l);
+            if port == u16::MAX || std::net::TcpListener::bind(("127.0.0.1", port + 1)).is_err() {
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let mut child = Command::new("swtpm")
+                .args(["socket", "--tpm2", "--tpmstate"])
+                .arg(format!("dir={}", dir.path().display()))
+                .arg("--server")
+                .arg(format!("type=tcp,port={port},bindaddr=127.0.0.1"))
+                .arg("--ctrl")
+                .arg(format!("type=tcp,port={},bindaddr=127.0.0.1", port + 1))
+                .args(["--flags", "not-need-init,startup-clear"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                    return Some(Self {
+                        child,
+                        _dir: dir,
+                        port,
+                    });
+                }
+                if child.try_wait().ok().flatten().is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        panic!("swtpm did not start");
+    }
+
+    fn arg(&self) -> String {
+        format!("swtpm:{}", self.port)
+    }
+
+    fn tool(&self, args: &[&str]) -> String {
+        let out = Command::new(args[0])
+            .args(&args[1..])
+            .env(
+                "TPM2TOOLS_TCTI",
+                format!("swtpm:host=127.0.0.1,port={}", self.port),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// The NV indices defined on this emulator.
+    fn nv_handles(&self) -> Vec<String> {
+        self.tool(&["tpm2_getcap", "handles-nv-index"])
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("- ").map(str::to_owned))
+            .collect()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Emulator {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Env {
+    /// Digital bound `init` arguments (one card folder `<root>/c`).
+    fn bound_args(&self, tpm: &Emulator, extra: &[&str]) -> Vec<OsString> {
+        let _ = std::fs::create_dir(self.root().join("c"));
+        let mut args = vec![
+            arg("init"),
+            arg(&self.vault()),
+            arg("--mode"),
+            arg("bound"),
+            arg("--cards"),
+            arg("digital"),
+            arg("--card-dir"),
+            arg(&self.root().join("c")),
+            arg("--accept-risk"),
+            arg("digital-cards"),
+            arg("--custom"),
+            arg("--tpm"),
+            arg(&tpm.arg()),
+        ];
+        args.extend(FAST.iter().map(arg));
+        args.extend(extra.iter().map(arg));
+        args
+    }
+
+    fn bound_pv(&self, tpm: &Emulator, cmd: &str, rest: &[&str]) -> Out {
+        let mut args = vec![arg(cmd), arg(&self.vault())];
+        args.extend(rest.iter().map(arg));
+        args.extend([arg("--tpm"), arg(&tpm.arg())]);
+        self.run(&args, PW, None)
+    }
+}
+
+/// The TPM library's logging stays off however the environment asks for
+/// it (`docs/M5_READINESS.md` 15): every bound command runs with
+/// `TSS2_LOG=all+TRACE`, at which `tpm2-tss` logs from its first call
+/// (including session keys and parameters before encryption), and with
+/// `TSS2_LOGFILE` naming a file. The CLI overrides both before anything
+/// else, so no file appears and standard error has no TPM-stack line.
+#[cfg(target_os = "linux")]
+fn tpm_library_logging_is_off_from_the_start() {
+    let Some(tpm) = Emulator::start() else {
+        skip_all("swtpm is not installed");
+        return;
+    };
+    let env = Env::new();
+    let log = env.root().join("tss.log");
+    let vars = [
+        ("TSS2_LOG", OsStr::new("all+TRACE")),
+        ("TSS2_LOGFILE", log.as_os_str()),
+    ];
+    let quiet = |out: &Out, what: &str| {
+        assert!(
+            !log.exists(),
+            "{what}: the TPM library wrote {}",
+            log.display()
+        );
+        for marker in [
+            ":esys", ":tcti", ":sys:", ":marshal", "TRACE:", "DEBUG:", "WARNING:", "ERROR:",
+        ] {
+            assert!(
+                !out.stderr.contains(marker),
+                "{what}: {marker:?} in {}",
+                out.stderr
+            );
+        }
+    };
+    let out = env.run_env(
+        &env.bound_args(&tpm, &[]),
+        &[PW, PW, PW].concat(),
+        None,
+        &vars,
+    );
+    out.expect(0, "bound init");
+    quiet(&out, "init");
+    let with_tpm = |cmd: &str| vec![arg(cmd), arg(&env.vault()), arg("--tpm"), arg(&tpm.arg())];
+    let out = env.run_env(&with_tpm("status"), b"", None, &vars);
+    out.expect(0, "status");
+    quiet(&out, "status");
+    let out = env.run_env(&with_tpm("list"), PW, None, &vars);
+    out.expect(0, "list");
+    quiet(&out, "list");
+    // A wrong passphrase makes the TPM fail an authorization: the library
+    // would log an error line here at any level but NONE.
+    let out = env.run_env(
+        &with_tpm("list"),
+        b"wrong passphrase entirely\n",
+        None,
+        &vars,
+    );
+    out.expect(1, "wrong passphrase");
+    assert_eq!(out.stderr.trim(), "Unlock failed.", "{}", out.stderr);
+    quiet(&out, "wrong passphrase");
+}
+
+/// Bound mode through the real CLI on `swtpm` (Milestone 5): digital bound
+/// `init` (three lines), everyday commands with `--tpm`, `status`, F1 and
+/// F2 through the CLI, and `--tpm-owner-auth` (D9).
+#[cfg(target_os = "linux")]
+fn bound_vault_through_the_cli() {
+    let Some(tpm) = Emulator::start() else {
+        skip_all("swtpm is not installed");
+        return;
+    };
+    let env = Env::new();
+    let out = env.run(&env.bound_args(&tpm, &[]), &[PW, PW, PW].concat(), None);
+    out.expect(0, "bound init");
+    assert!(
+        out.says("Card file saved") && out.says("Your recovery card file"),
+        "{}",
+        out.stderr
+    );
+    // The TPM stack's own logging is off (spec 5.6; tpm2-tss logs secrets
+    // at debug level): no esys/tcti lines, also while probing free handles.
+    assert!(
+        !out.stderr.contains("esys") && !out.stderr.contains("tcti"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(tpm.nv_handles().len(), 1, "one index");
+    let src = env.source("a.txt", b"bound data");
+    env.bound_pv(&tpm, "add", &[src.to_str().unwrap(), "a.txt"])
+        .expect(0, "add");
+    let dest = env.root().join("out.txt");
+    env.bound_pv(&tpm, "get", &["a.txt", dest.to_str().unwrap()])
+        .expect(0, "get");
+    assert_eq!(std::fs::read(&dest).unwrap(), b"bound data");
+    let status = env.run(
+        &[
+            arg("status"),
+            arg(&env.vault()),
+            arg("--tpm"),
+            arg(&tpm.arg()),
+        ],
+        b"",
+        None,
+    );
+    status.expect(0, "status");
+    for line in [
+        "Mode:                bound",
+        "reachable",
+        "TPM identity:        measurable",
+    ] {
+        assert!(status.stdout.contains(line), "{line}: {}", status.stdout);
+    }
+    // F2: a wrong passphrase.
+    let mut args = vec![
+        arg("list"),
+        arg(&env.vault()),
+        arg("--tpm"),
+        arg(&tpm.arg()),
+    ];
+    let wrong = env.run(&args, b"wrong passphrase entirely\n", None);
+    wrong.expect(1, "wrong passphrase");
+    // Exactly the generic message: nothing from the TPM stack (5.6).
+    assert_eq!(wrong.stderr.trim(), "Unlock failed.", "{}", wrong.stderr);
+    // F1: the vault copied to another TPM.
+    let Some(other) = Emulator::start() else {
+        return;
+    };
+    args[3] = arg(&other.arg());
+    let copy = env.run(&args, PW, None);
+    copy.expect(1, "copy on another TPM");
+    assert!(copy.says("Unlock failed."));
+    // D9: owner authorization set on the TPM.
+    other.tool(&["tpm2_changeauth", "-c", "owner", "owner-cli-auth"]);
+    let env2 = Env::new();
+    let refused = env2.run(&env2.bound_args(&other, &[]), &[PW, PW, PW].concat(), None);
+    refused.expect(4, "owner authorization not declared");
+    assert!(refused.says("--tpm-owner-auth"), "{}", refused.stderr);
+    assert!(!env2.vault().exists(), "nothing created");
+    let ok = env2.run(
+        &env2.bound_args(&other, &["--tpm-owner-auth"]),
+        &[PW, PW, b"owner-cli-auth\n", PW].concat(),
+        None,
+    );
+    ok.expect(0, "owner authorization on the documented line");
+    assert!(!ok.stderr.contains("owner-cli-auth") && !ok.stdout.contains("owner-cli-auth"));
+    println!("    bound: init, add, get, status, F1, F2 and --tpm-owner-auth through the CLI");
+}
+
+/// F59 and F60 through the real CLI: a crash at every bound `init` step,
+/// then `pvault init <vault> --tpm`: before the header the setup and its
+/// index are removed; after it the setup is finished and the index kept.
+/// The digital card file is never deleted after the crash (L2).
+#[cfg(target_os = "linux")]
+fn bound_crash_at_each_step() {
+    let Some(_probe) = Emulator::start() else {
+        skip_all("swtpm is not installed");
+        return;
+    };
+    drop(_probe);
+    let committed = ["init.committed"];
+    for fp in [
+        "init.prepared",
+        "init.index-defined",
+        "init.index-written",
+        "init.keytable-written",
+        "init.cards-written",
+        "init.rehearsed",
+        "init.committing",
+        "init.committed",
+    ] {
+        let tpm = Emulator::start().unwrap();
+        let env = Env::new();
+        let out = env.run(&env.bound_args(&tpm, &[]), &[PW, PW, PW].concat(), Some(fp));
+        assert!(out.crashed(), "{fp}: {:?} {}", out.code, out.stderr);
+        let resume = env.run(
+            &[
+                arg("init"),
+                arg(&env.vault()),
+                arg("--tpm"),
+                arg(&tpm.arg()),
+            ],
+            PW,
+            None,
+        );
+        resume.expect(0, fp);
+        if committed.contains(&fp) {
+            assert!(
+                resume.says("The interrupted setup was finished"),
+                "{fp}: {}",
+                resume.stderr
+            );
+            assert_eq!(tpm.nv_handles().len(), 1, "{fp}: the live index is kept");
+            env.bound_pv(&tpm, "list", &[]).expect(0, fp);
+        } else {
+            assert!(
+                resume.says("The interrupted setup was removed"),
+                "{fp}: {}",
+                resume.stderr
+            );
+            assert!(
+                tpm.nv_handles().is_empty(),
+                "{fp}: index removed under 9.2b"
+            );
+        }
+    }
+    println!("    bound: crash at 8 init steps, resume removes or finishes");
 }

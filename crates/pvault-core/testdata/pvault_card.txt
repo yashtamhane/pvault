@@ -6,9 +6,9 @@
 # QR byte mode, error correction M, smallest fitting version and automatic
 # mask selection, computed independently with Python qrcode (MIT). qr_bits
 # packs the row-major module matrix MSB-first, with zero tail padding.
-# Card-file format 1 (SI-52): pvault_card_a.svg, rendered by this script
-# from the documented layout and the qrcode matrix; file_len and
-# file_sha256 describe its exact bytes.
+# Card-file format 1 (SI-52): pvault_card_a.svg and pvault_card_bound.svg,
+# rendered by this script from the documented layout and the qrcode
+# matrix; file_len and file_sha256 describe their exact bytes.
 
 name = portable-card-a
 vault_id = 101112131415161718191a1b1c1d1e1f
@@ -24,3 +24,18 @@ file = pvault_card_a.svg
 file_created = 2026-01-02
 file_len = 19569
 file_sha256 = 91568fc3dbb784a33be04c8ff82ab3777bdbaee5ac8c2146f6d6ec64d54db15f
+
+name = bound-card
+vault_id = 101112131415161718191a1b1c1d1e1f
+mode = 0
+set_id = 2021222324252627
+share_x = 3
+share = 404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f
+payload = 5056433101101112131415161718191a1b1c1d1e1f00202122232425262703404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f34cc3568f7531cf2
+base32 = A1B46C81208H44RM2MB1E60S38DHR78Y3W0208924CJ2A9H70D042GJ38H2MCHT89554PK2D9S7N0MAJADA5ANJQB1CNMPTWBNF5YR31C9HP8SB6CXM6JTKBDHPPWVVGE5S76X3NESVQGYBTFDY7TZKZG20R50W4GP38F249HA5RS3CEHY8934MKJJASD5WRK6D9Q74XKTFK9K1ND3VN677J
+qr_width = 49
+qr_bits = fec3948d5cbfc1038c7d1fd06e9e04d7126bb75c009a9825dbab363fa942ec164eb18e1107faaaaaaaaafe017a346641008bc8ebf2bf7ce41bcb3b2d4f7cff75ae296292bb54a2808b5bebaa8418dab8268fc902d96da8fdceb67a19b10c4f589d4a93404de78b2c8824d8e9b6b2e2d1988603137a983c63898a55723d1ab7b18d865d6b5c3350feb02fb8f3f991ae946641161a971ab6faa9045cd713a54767f308fe293f0b88fa6aa0b474ac31ba5c98bce0a236ca5bac4942387679e898b9b6776c29ca7f0ef87425b4426a06e674cde957716970791f43f781a0f376a944f1c5eee1024d90ff511a79d4bef028e21b94268395e2a99bf09cf8007e451f69477fbb9fa82d2a104b88c620714baa02fe3aeffdd13fd44699e6e87cc4f61c9704df09dade2afebcfbe7e8dd80
+file = pvault_card_bound.svg
+file_created = 2026-01-02
+file_len = 19807
+file_sha256 = f48b73ecf0ab23c5774d426c80e947c44f5e7ff5ecc018443bbe1d7ec0d556bd

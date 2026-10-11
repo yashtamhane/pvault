@@ -10,8 +10,12 @@ publish.workspace = true
 license.workspace = true
 
 [features]
+default = ["tpm"]
 # Test-only crash injection (spec 11, SI-48). Refused in release builds (F85).
 fault-injection = []
+# Bound mode's TPM access (spec 9.1; D1, D10). The dependency exists only on
+# Linux; elsewhere the feature has no effect and bound mode is refused.
+tpm = ["dep:tss-esapi"]
 
 [dependencies]
 secrecy.workspace = true
@@ -37,6 +41,9 @@ directories.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tss-esapi = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true

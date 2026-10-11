@@ -48,8 +48,32 @@ jobs:
           toolchain: stable
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Bound mode (Milestone 5; D1, D11): tpm2-tss builds the default `tpm`
+      # feature on Linux; swtpm and tpm2-tools run the emulator tests, which
+      # must not skip (PVAULT_TEST_REQUIRE_SWTPM). Never a real TPM.
+      - name: TPM libraries and swtpm (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libtss2-dev pkg-config swtpm swtpm-tools tpm2-tools
+          swtpm --version
+          echo "PVAULT_TEST_REQUIRE_SWTPM=1" >> "$GITHUB_ENV"
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+      # The tests that start processes run in a test process of their own
+      # (docs/M5_READINESS.md, V2). Show the list that ran and passed there;
+      # on Linux it must include the TPM emulator tests.
+      - name: Isolated process tests ran
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p pvault-core --lib --locked -- --exact \
+            test_process::tests_that_start_processes_run_in_their_own_process --nocapture 2>&1 | tee isolated.log
+          grep -E "^[0-9]+ isolated tests passed in their own process:" isolated.log
+          if [ "$RUNNER_OS" = Linux ]; then
+            grep -q "^  tpm::tests::emulator::parameter_encryption_on_the_wire$" isolated.log
+            grep -q "^  vault::tests::bound::bound_init_unlock_and_everyday_commands$" isolated.log
+          fi
       # Runs every Criterion benchmark once, as a smoke test.
       - run: cargo test --workspace --benches --locked
       # Native Windows locality probe (spec 8.5): prints the raw Q1-Q4
@@ -191,6 +215,16 @@ jobs:
         with:
           toolchain: "1.89"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # Bound mode (Milestone 5; D1, D11): tpm2-tss builds the default `tpm`
+      # feature on Linux; swtpm and tpm2-tools run the emulator tests, which
+      # must not skip (PVAULT_TEST_REQUIRE_SWTPM). Never a real TPM.
+      - name: TPM libraries and swtpm (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libtss2-dev pkg-config swtpm swtpm-tools tpm2-tools
+          swtpm --version
+          echo "PVAULT_TEST_REQUIRE_SWTPM=1" >> "$GITHUB_ENV"
       - run: cargo build --workspace --all-targets --locked
       - run: cargo test --workspace --locked
 
@@ -207,6 +241,10 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: TPM libraries (bound mode's `tpm` feature, D1)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libtss2-dev pkg-config
       - name: Release build with fault-injection is refused
         run: |
           if cargo build --release --locked -p pvault-core --features fault-injection; then

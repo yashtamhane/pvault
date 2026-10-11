@@ -221,6 +221,7 @@ mod tests {
     }
 
     fn holder(path: &Path, mode: &str) -> Child {
+        crate::test_process::assert_isolated();
         let child = Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -249,6 +250,7 @@ mod tests {
     /// F56a: a second mutating process is refused; a crashed holder's lock
     /// is released by the OS.
     #[test]
+    #[ignore = "starts processes: runs in its own test process (test_process)"]
     fn concurrent_processes_and_crash_release() {
         let tmp = tempdir();
         let dir = Dir::open(&tmp).unwrap();

@@ -14,7 +14,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "=0.4.13"
-pvault-core = { path = "../crates/pvault-core" }
+# Parsers only: no TPM support (the `tpm` feature needs tpm2-tss on Linux).
+pvault-core = { path = "../crates/pvault-core", default-features = false }
 
 [[bin]]
 name = "header_parse"

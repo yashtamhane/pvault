@@ -1,4 +1,4 @@
-# pvault formats (Milestones 1 to 4)
+# pvault formats (Milestones 1 to 5)
 
 Byte-level formats, written as the milestones that define them are built.
 Milestone 1 covers the key derivations of spec Section 5.1 and the chunked
@@ -319,6 +319,44 @@ the Python `qrcode` matrix; pvault code is not used. The Rust test renders the
 same payload and date and compares every byte, and reads the file back to the
 same payload.
 
+`testdata/pvault_card_bound.svg` (Milestone 5, D8) is the same for the
+`bound-card` record: mode 0, `share_x` = 3, role `Bound card`, 19,807 bytes.
+
+## Bound mode's TPM index (spec 9.1; Milestone 5, D2 to D4)
+
+All integers are big-endian.
+
+```text
+authPolicy = SHA-256(0^32 || u32(0x171) || A || B)
+  A = SHA-256(0^32 || u32(0x16B))                       PolicyAuthValue
+  B = SHA-256("pvault/v1/policy-nonce" || tpm_policy_nonce[32])
+public     = u32(nvIndex) || u16(0x000B) || u32(attributes) || u16(32)
+             || authPolicy || u16(97)                    46 bytes
+attributes = 0x00040004 before the first write, 0x20040004 after it
+Name       = u16(0x000B) || SHA-256(public)              34 bytes
+index data = u8(2) || S2_wrapped[96]                     97 bytes
+```
+
+Vector: for `nvIndex` = 0x01801234 and a policy nonce of 32 bytes 0x11, the
+Names reported by `swtpm` 0.7.3 (the emulator computed them; E1 probe,
+`docs/M5_READINESS.md` 12.2) are
+
+```text
+pre-write  000b015dd1a49cce12139979dcd5439c8daff83dd026251632760ad8c09691ad9232
+post-write 000bb8be497b1a6a38c90d717f908481207577494c61a8f76ecc8ce29121d5f4b246
+```
+
+and pvault's computation must equal them (`names_equal_the_emulator_observation`).
+
+**H-2 EK template** (spec 8.1), marshalled `TPMT_PUBLIC`, 58 bytes: type ECC
+`0023`, nameAlg `000B`, attributes `000300F2`, `0020` and Policy-B-SHA256
+`ca3d0a99a2b93906f7a3342414efcfb3a385d44cd1fd459089d19b5071c0b7a0`, symmetric
+AES `0006` 128 bits `0080` CFB `0043`, scheme null `0010`, curve NIST P-256
+`0003`, KDF null `0010`, `unique` x and y empty (`0000 0000`). pvault builds
+it itself; a test pins these bytes against the backend's template.
+`ek_digest` is SHA-256 of the marshalled `TPMT_PUBLIC` the TPM returns (with
+the populated 32-byte x and y: 122 bytes).
+
 ## Custom-passphrase estimator protocol (SI-51)
 
 The parent re-executes the pvault binary with the single argument
@@ -537,6 +575,7 @@ Vectors: `testdata/pvault_tokens.txt` (one per scope).
 | `xchacha20_draft.txt` | draft-irtf-cfrg-xchacha-03 Appendix A.3.2.1 (XChaCha20, counter 0) | 1 |
 | `pvault_card.txt` | Independent Python payload/Base32 plus `qrcode` 8.2 byte-mode/M module matrix | 1 |
 | `pvault_card_a.svg` | Card-file format 1 of the `pvault_card.txt` payload, rendered by the same script from the documented layout | 1 file |
+| `pvault_card_bound.svg` | The same for the bound card (Milestone 5, D8) | 1 file |
 | `unicode/NormalizationTest-17.0.0.txt` | Unicode 17.0.0 UCD, unchanged (SHA-256 `5019ffd5…87db`) | 19,000+ lines |
 
 The Wycheproof vectors are at commit `3fa63dd0344abb611f1fb1d77e119938603ea230`.

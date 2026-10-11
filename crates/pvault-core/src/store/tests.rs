@@ -239,6 +239,7 @@ fn crash_child() {
 /// Runs `scenario` in a child that aborts at `failpoint`. Returns whether
 /// it crashed (a failpoint on a path not taken lets the child finish).
 fn run_child(path: &Path, scenario: &str, failpoint: &str) -> bool {
+    crate::test_process::assert_isolated();
     let status = Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -369,6 +370,7 @@ enum Expect {
 /// Every crash point of the tracking path (8.2 crash table), from each
 /// phase a remote rollback can start in.
 #[test]
+#[ignore = "starts processes: runs in its own test process (test_process)"]
 fn tracking_crash_restart_matrix() {
     use Expect::*;
     let points: &[(&str, Expect)] = &[
@@ -428,6 +430,7 @@ fn tracking_crash_restart_matrix() {
 /// nonces) has another digest, so the rebuilt core no longer matches
 /// `tracking_core_digest`. The restart blocks and deletes nothing.
 #[test]
+#[ignore = "starts processes: runs in its own test process (test_process)"]
 fn reencrypted_tracking_keytable_is_indeterminate() {
     let k = keys();
     let tmp = tempdir();
@@ -469,6 +472,7 @@ fn reencrypted_tracking_keytable_is_indeterminate() {
 /// A tracking key table replaced by another file (another identity) while
 /// `tracking_created` is canonical blocks; nothing is overwritten.
 #[test]
+#[ignore = "starts processes: runs in its own test process (test_process)"]
 fn replaced_tracking_keytable_blocks() {
     let k = keys();
     let tmp = tempdir();
@@ -490,6 +494,7 @@ fn replaced_tracking_keytable_blocks() {
 /// The new side (8.2): after the header replacement, old material sees an
 /// unauthenticated header and deletes nothing; new material finishes.
 #[test]
+#[ignore = "starts processes: runs in its own test process (test_process)"]
 fn new_side_restart_after_commit() {
     let k = keys();
     for point in ["header.replaced", "journal.unlinked-never-hit"] {
@@ -516,6 +521,7 @@ fn new_side_restart_after_commit() {
 /// A crash before the replacement leaves the old side: new material finds
 /// no new header and deletes nothing; old material gets the rollback choice.
 #[test]
+#[ignore = "starts processes: runs in its own test process (test_process)"]
 fn crash_before_replacement_stays_old() {
     let k = keys();
     let tmp = tempdir();
@@ -945,6 +951,7 @@ fn failed_replacement_classification() {
 /// temp missing: the restart is indeterminate, keeps the journal, and
 /// performs no cleanup (decided 2026-10-05).
 #[test]
+#[ignore = "starts processes: runs in its own test process (test_process)"]
 fn missing_tracking_header_temp_blocks_without_cleanup() {
     let k = keys();
     let tmp = tempdir();

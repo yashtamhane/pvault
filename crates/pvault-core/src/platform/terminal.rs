@@ -521,7 +521,9 @@ mod imp {
 mod tests {
     use std::fs::File;
     use std::io::{Read, Write};
-    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::process::Command;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -540,27 +542,42 @@ mod tests {
         slave: File,
     }
 
+    /// A pseudo-terminal whose descriptors are close-on-exec from the start
+    /// (`File` opens always set `O_CLOEXEC`; `openpty` cannot), so a process
+    /// another test starts meanwhile does not inherit this terminal.
     fn pty() -> Pty {
-        let (mut master, mut slave) = (-1, -1);
-        // SAFETY: both out-pointers are valid; the optional arguments are
-        // null.
-        let rc = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-            )
+        // `ptsname` returns a static buffer; only this function calls it.
+        static NAME: Mutex<()> = Mutex::new(());
+        let open = |path: &std::ffi::OsStr| {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_NOCTTY)
+                .open(path)
+                .unwrap()
         };
-        assert_eq!(rc, 0, "openpty failed");
-        // SAFETY: `openpty` returned two new descriptors, owned by nothing else.
-        unsafe {
-            Pty {
-                master: File::from_raw_fd(master),
-                slave: File::from_raw_fd(slave),
-            }
+        let master = open("/dev/ptmx".as_ref());
+        let fd = master.as_raw_fd();
+        // SAFETY: `fd` is an open pseudo-terminal master.
+        assert_eq!(unsafe { libc::grantpt(fd) }, 0, "grantpt failed");
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::unlockpt(fd) }, 0, "unlockpt failed");
+        let name = {
+            let _name = NAME.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: `fd` is an unlocked master; the static result is
+            // copied while `NAME` is held.
+            let p = unsafe { libc::ptsname(fd) };
+            assert!(!p.is_null(), "ptsname failed");
+            // SAFETY: `ptsname` returned a NUL-terminated string.
+            unsafe { std::ffi::CStr::from_ptr(p) }.to_owned()
+        };
+        let slave = open(std::ffi::OsStr::from_bytes(name.to_bytes()));
+        for f in [&master, &slave] {
+            // SAFETY: reading the descriptor flags of an open descriptor.
+            let flags = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFD) };
+            assert!(flags & libc::FD_CLOEXEC != 0, "not close-on-exec");
         }
+        Pty { master, slave }
     }
 
     fn echo_on(file: &File) -> bool {
@@ -627,6 +644,21 @@ mod tests {
         out
     }
 
+    /// Reads the master side into `shown` until `done(shown)`, for up to
+    /// 10 s.
+    fn read_until(master: &File, shown: &mut Vec<u8>, done: impl Fn(&[u8]) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done(shown) {
+            assert!(
+                Instant::now() < deadline,
+                "terminal output so far: {:?}",
+                String::from_utf8_lossy(shown)
+            );
+            shown.extend_from_slice(&drain_master(master));
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[test]
     fn echo_is_off_during_input_and_restored_after() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -634,12 +666,21 @@ mod tests {
         assert!(echo_on(&slave));
         let watcher = slave.try_clone().unwrap();
         let reader = std::thread::spawn(move || read_secret_from(&slave, "Passphrase: "));
-        wait_for_echo(&watcher, false);
+        // Type only once the prompt is visible, as a person would. Echo goes
+        // off before the prompt is written, so input typed earlier could have
+        // its newline echoed (`ECHONL`) ahead of the prompt.
+        let mut shown = Vec::new();
+        read_until(&master, &mut shown, |s| s.starts_with(b"Passphrase: "));
+        assert!(!echo_on(&watcher), "echo is off while the input is typed");
         (&master).write_all(b"hunter2 with spaces  \n").unwrap();
         let line = reader.join().unwrap().unwrap();
         assert_eq!(line.as_bytes(), b"hunter2 with spaces  ");
         assert!(echo_on(&watcher), "restored after a normal read");
-        let shown = drain_master(&master);
+        // The newline's echo follows any echo of the line itself, so once it
+        // has arrived, an echoed secret would be in `shown`.
+        read_until(&master, &mut shown, |s| {
+            s[b"Passphrase: ".len()..].contains(&b'\n')
+        });
         assert!(shown.starts_with(b"Passphrase: "));
         assert!(
             !shown.windows(7).any(|w| w == b"hunter2"),
@@ -777,6 +818,7 @@ mod tests {
     }
 
     fn signal_restores(signal: libc::c_int) {
+        crate::test_process::assert_isolated();
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let Pty { master, slave } = pty();
         let mut child = Command::new(std::env::current_exe().unwrap())
@@ -807,21 +849,25 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "starts processes: runs in its own test process (test_process)"]
     fn restored_after_sigint() {
         signal_restores(libc::SIGINT);
     }
 
     #[test]
+    #[ignore = "starts processes: runs in its own test process (test_process)"]
     fn restored_after_sigterm() {
         signal_restores(libc::SIGTERM);
     }
 
     #[test]
+    #[ignore = "starts processes: runs in its own test process (test_process)"]
     fn restored_after_sighup() {
         signal_restores(libc::SIGHUP);
     }
 
     #[test]
+    #[ignore = "starts processes: runs in its own test process (test_process)"]
     fn restored_after_sigquit() {
         signal_restores(libc::SIGQUIT);
     }

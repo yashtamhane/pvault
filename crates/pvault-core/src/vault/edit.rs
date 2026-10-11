@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 use crate::crypto::cascade::{self, StreamHeader, StreamKeys, StreamKind};
 use crate::crypto::random;
 use crate::errors::Error;
-use crate::header::Header;
+use crate::header::{Header, SlotFields};
 use crate::journal::{UpdatePhase, UpdateRecord};
 use crate::keytable::{self, EntryKind, KeyTable, NewEntry};
 use crate::paths::{self, InputPathError};
@@ -236,19 +236,22 @@ fn new_file_id(table: &KeyTable) -> Result<[u8; 16], Error> {
 }
 
 /// A source prepared for U7.
-struct Source {
+pub(crate) struct Source {
     file: File,
     meta: SourceMeta,
     oid: [u8; 16],
     keys: (SecretBytes<32>, SecretBytes<32>),
 }
 
-/// U3 to U11 for both commands.
-fn transact(
+/// U3 to U11 for `add`, `rm` and the duress commands. `new_table: None`
+/// keeps the current entries (rewritten as the new generation, spec 6.10);
+/// `new_slots` replaces the slots (duress set and disable).
+pub(crate) fn transact(
     s: &mut Session,
-    new_table: KeyTable,
+    new_table: Option<KeyTable>,
     mut source: Option<Source>,
     settings: Option<&Settings>,
+    new_slots: Option<SlotFields>,
 ) -> Result<Vec<String>, Error> {
     let core = s.header.core().clone();
     let old_gen = core.generation;
@@ -313,7 +316,7 @@ fn transact(
     let result = (|| -> Result<([u8; 64], Vec<u8>), Error> {
         // U6.
         let digest = keytable::write_file(
-            &new_table,
+            new_table.as_ref().unwrap_or(&s.table),
             &core.vault_id,
             new_gen,
             &s.bundle.keytable_keys()?,
@@ -360,7 +363,8 @@ fn transact(
         new_core.generation = new_gen;
         new_core.keytable_gen = new_gen;
         new_core.keytable_digest = digest;
-        let bytes = Header::build(&new_core, s.header.slots(), &s.bundle.k_mac)?;
+        let slots = new_slots.as_ref().unwrap_or(s.header.slots());
+        let bytes = Header::build(&new_core, slots, &s.bundle.k_mac)?;
         Ok((new_core.digest()?, bytes))
     })();
     let (new_core_digest, bytes) = match result {
@@ -384,9 +388,17 @@ fn transact(
     // Tests stop here to leave the after-commit state in-process.
     fail_io!("update.before-cleanup").map_err(Error::Io)?;
     // U10 and U11.
-    let kept = update::finish(&s.dir, &rec, &s.bundle, &new_table, None)?;
+    let kept = update::finish(
+        &s.dir,
+        &rec,
+        &s.bundle,
+        new_table.as_ref().unwrap_or(&s.table),
+        None,
+    )?;
     s.header = store::read_header(&s.dir)?.ok_or(Error::HeaderInvalid)?;
-    s.table = new_table;
+    if let Some(t) = new_table {
+        s.table = t;
+    }
     if let Some(settings) = settings {
         let _ = settings.rollback_observe(&core.vault_id, new_gen);
     }
@@ -449,7 +461,7 @@ pub fn add(
     let size = meta.size;
     let kept = transact(
         s,
-        new_table,
+        Some(new_table),
         Some(Source {
             file,
             meta,
@@ -457,6 +469,7 @@ pub fn add(
             keys,
         }),
         settings,
+        None,
     )?;
     Ok(AddOutcome {
         stored: input.stored,
@@ -496,7 +509,7 @@ pub fn rm(
         .collect();
     let removed = s.table.len() - keep.len();
     let new_table = KeyTable::from_entries(keep)?;
-    let kept = transact(s, new_table, None, settings)?;
+    let kept = transact(s, Some(new_table), None, settings, None)?;
     Ok((removed, kept))
 }
 

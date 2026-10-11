@@ -33,6 +33,32 @@ pub enum CoreDumpProtection {
     BestEffort,
 }
 
+/// Turns off the TPM software stack's own logging for this process (bound
+/// mode; Milestone 5). At debug level `tpm2-tss` logs command parameters
+/// before encryption and session keys (`TSS2_LOG`), and its error and
+/// warning lines on standard error would add detail to `Unlock failed.`
+/// (spec 5.6). Sets `TSS2_LOG=all+NONE` and removes `TSS2_LOGFILE`,
+/// whatever the environment asked for; there is no switch to turn logging
+/// back on.
+///
+/// The `pvault` CLI calls this first thing in `main`. A program that uses
+/// this library directly gets no such protection unless it calls this
+/// itself before its first TPM operation; the library does not call it.
+///
+/// # Safety
+///
+/// Changes the process environment: call it while no other thread exists
+/// (no other thread may read or write the environment at the same time).
+#[allow(unsafe_code)]
+pub unsafe fn quiet_tpm_stack() {
+    // SAFETY: the caller guarantees that no other thread exists.
+    #[cfg(all(target_os = "linux", feature = "tpm"))]
+    unsafe {
+        std::env::set_var("TSS2_LOG", "all+NONE");
+        std::env::remove_var("TSS2_LOGFILE");
+    }
+}
+
 /// Stops this process from writing its memory to disk if it crashes
 /// (spec Section 10.3). Call once at startup, before handling any secret.
 pub fn disable_core_dumps() -> Result<CoreDumpProtection, Error> {

@@ -28,6 +28,10 @@ exceptions = [
     # Milestone 4 (A7): Option helpers used by directories (MPL-2.0; no
     # Exhibit B notice, so the GPL secondary-license clause applies).
     { allow = ["MPL-2.0"], crate = "option-ext" },
+    # Milestone 5 (D1, approved 2026-10-06): build dependency of tss-esapi-sys
+    # (Linux only), not compiled into pvault. The LLVM exception only adds
+    # permissions to Apache-2.0.
+    { allow = ["Apache-2.0 WITH LLVM-exception"], crate = "target-lexicon" },
 ]
 confidence-threshold = 0.93
 # By default the license check skips crates that are reachable only through

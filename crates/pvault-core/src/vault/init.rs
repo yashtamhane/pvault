@@ -1,5 +1,13 @@
-//! Portable `init` and its resume (spec 8.3, 7.4a, 7.4b, 6.4; `docs/CLI.md`
-//! 6.1; `docs/M4_READINESS.md` section 11; approved for Milestone 4).
+//! `init` and its resume (spec 8.3, 7.4a, 7.4b, 6.4; `docs/CLI.md` 6.1;
+//! `docs/M4_READINESS.md` section 11; portable approved for Milestone 4,
+//! bound for Milestone 5).
+//!
+//! Bound (D1 to D12): the TPM is checked first (C2, C3, the H-2 identity,
+//! N2); the bundle is split 2-of-3; the `prepared` journal names the chosen
+//! handle, both Names, the policy nonce and the scope-2 identity token
+//! before the index is defined; S2 is written and both Names confirmed; S1
+//! goes into the slots and S3 onto the single bound card. A failure before
+//! `committing` removes the index under 9.2b and rolls the setup back.
 //!
 //! Order: bootstrap and preflight (8.3 steps 1 to 6), settings and card
 //! destination checks, passphrase, Argon2id, `prepared`, key table
@@ -21,8 +29,10 @@ use crate::crypto::kdf::{self, Argon2Params, PassphraseKey};
 use crate::crypto::{random, wrap};
 use crate::errors::Error;
 use crate::estimator::{self, Band};
-use crate::header::{CoreFields, Header, Mode, PassphraseKind, PortableSlots, SlotFields};
-use crate::journal::{self, InitPhase, InitRecord, Record};
+use crate::header::{
+    BoundSlots, CoreFields, Header, Mode, PassphraseKind, PortableSlots, SlotFields,
+};
+use crate::journal::{self, Idx, InitPhase, InitRecord, Record};
 use crate::keytable::{self, KeyTable};
 use crate::lock::VaultLock;
 use crate::passphrase::{self, CustomPassphrase, WordCount};
@@ -37,6 +47,10 @@ use crate::store::{
     self, HEADER, HEADER_TMP, JOURNAL, JOURNAL_TMP, Owned, keytable_name, keytable_tmp_name,
 };
 
+use crate::tpm::{Tpm, TpmOptions, TpmState};
+use crate::tpmid::{self, IndexContext, Scope};
+
+use super::bound::{self, BoundKeys};
 use super::{Bundle, Pending, Prompter, date, now, pending};
 
 const LOCK_FILES: [&str; 2] = ["vault.gate", "vault.lock"];
@@ -80,12 +94,21 @@ pub struct InitOptions<'a> {
     pub card_b_png: Option<PathBuf>,
     /// The custom-passphrase estimator.
     pub estimate: Estimate<'a>,
+    /// Portable or bound (`--mode`; required by the CLI, D9).
+    pub mode: Mode,
+    /// Bound, digital: the single card's folder (`--card-dir`, D8).
+    pub card_dir: Option<PathBuf>,
+    /// Bound, paper: verify the bound card from this PNG (`--card-png`).
+    pub card_png: Option<PathBuf>,
+    /// `--tpm`, `--tpm-owner-auth` (bound, and the resume of a bound setup).
+    pub tpm: TpmOptions,
 }
 
 impl std::fmt::Debug for InitOptions<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InitOptions")
             .field("vault", &self.vault)
+            .field("mode", &self.mode)
             .field("delivery", &self.delivery)
             .field("cards_dir", &self.cards_dir)
             .field("card_a_dir", &self.card_a_dir)
@@ -103,9 +126,10 @@ pub enum InitOutcome {
     Created {
         /// Its ID.
         vault_id: [u8; 16],
-        /// Digital delivery: the saved Card A and Card B files, for the
-        /// optional check after the commit ([`card_check_after_commit`]).
-        card_files: Option<[PathBuf; 2]>,
+        /// Digital delivery: the saved card files (Card A and Card B, or the
+        /// bound card), for the optional check after the commit
+        /// ([`card_check_after_commit`]).
+        card_files: Option<Vec<PathBuf>>,
     },
     /// An interrupted setup whose header was committed was finished.
     Finished {
@@ -199,6 +223,8 @@ fn write_init(
 struct Chosen {
     kind: PassphraseKind,
     handled: SecretBuf,
+    /// Custom and refused by generated-word handling (N3; D7).
+    words_refused: bool,
 }
 
 fn choose_passphrase(
@@ -228,6 +254,7 @@ fn choose_passphrase(
             Ok(Chosen {
                 kind: PassphraseKind::Words,
                 handled,
+                words_refused: false,
             })
         }
         PassphraseChoice::Custom => {
@@ -247,6 +274,7 @@ fn choose_passphrase(
             }
             let raw = accepted.ok_or(Error::PassphraseMismatch)?;
             let custom = passphrase::handle_custom(raw.as_bytes()).map_err(Error::Passphrase)?;
+            let words_refused = passphrase::handle_words(raw.as_bytes()).is_err();
             drop(raw);
             for w in custom.warnings() {
                 ui.notice(&w.to_string());
@@ -278,6 +306,7 @@ fn choose_passphrase(
             Ok(Chosen {
                 kind: PassphraseKind::Custom,
                 handled,
+                words_refused,
             })
         }
     }
@@ -402,12 +431,13 @@ pub(crate) fn read_bounded(file: &File) -> Result<Zeroizing<Vec<u8>>, Error> {
 
 impl<'a> CardFiles<'a> {
     /// W1 to W4 (paper) and D1 to D4 (digital). `targets` are the folder of
-    /// each card; for paper both are the same folder.
+    /// each card; for paper every card goes to the same folder. Portable:
+    /// Card A and Card B; bound: the one bound card.
     #[allow(clippy::too_many_arguments)]
     fn write(
         settings: &'a Settings,
-        targets: [(Dir, PathBuf); 2],
-        cards: [(&Card, CardRole, &str); 2],
+        targets: Vec<(Dir, PathBuf)>,
+        cards: &[(&Card, CardRole, &str)],
         vault_id: &[u8; 16],
         set_id: &[u8; 8],
         delivery: Delivery,
@@ -425,7 +455,7 @@ impl<'a> CardFiles<'a> {
             // W2 / D2.
             let mut entries = Vec::new();
             let created_at = now();
-            for ((dir, dir_path), (_, role, suffix)) in targets.into_iter().zip(&cards) {
+            for ((dir, dir_path), (_, role, suffix)) in targets.into_iter().zip(cards) {
                 let name = format!(
                     "pvault-{}-{}-{suffix}.svg",
                     hex(&vault_id[..4]),
@@ -514,14 +544,10 @@ impl<'a> CardFiles<'a> {
     /// that was written. Returns the payloads read from the files.
     fn read_back(
         &self,
-        expected: [&Card; 2],
-    ) -> Result<[SecretBytes<{ card::PAYLOAD_LEN }>; 2], Error> {
-        let mut out = Vec::with_capacity(2);
-        for (f, (card, label)) in self
-            .files
-            .iter()
-            .zip(expected.into_iter().zip(["Card A", "Card B"]))
-        {
+        expected: &[(&Card, &'static str)],
+    ) -> Result<Vec<SecretBytes<{ card::PAYLOAD_LEN }>>, Error> {
+        let mut out = Vec::with_capacity(expected.len());
+        for (f, &(card, label)) in self.files.iter().zip(expected) {
             let reopened = f
                 .dir
                 .open_regular(&f.name, false)
@@ -538,9 +564,10 @@ impl<'a> CardFiles<'a> {
             }
             out.push(SecretBytes::take_from(&mut read.payload().to_vec())?);
         }
-        let b = out.pop().ok_or(Error::RehearsalFailed)?;
-        let a = out.pop().ok_or(Error::RehearsalFailed)?;
-        Ok([a, b])
+        if out.len() != expected.len() {
+            return Err(Error::RehearsalFailed);
+        }
+        Ok(out)
     }
 
     /// W7 and W8, or the in-process rollback before `committing` (both
@@ -602,6 +629,44 @@ pub(crate) mod hooks {
             hook(paths);
         }
     }
+
+    type DefineHook = Box<dyn FnOnce(u32)>;
+
+    thread_local! {
+        static BEFORE_DEFINE: RefCell<Option<DefineHook>> = RefCell::new(None);
+    }
+
+    /// Runs `hook` once with the chosen handle, after the `prepared` journal
+    /// and before `NV_DefineSpace` (F87: another program takes the handle).
+    #[cfg_attr(not(all(target_os = "linux", feature = "tpm")), allow(dead_code))]
+    pub(crate) fn set_before_define(hook: impl FnOnce(u32) + 'static) {
+        BEFORE_DEFINE.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn before_define(handle: u32) {
+        if let Some(hook) = BEFORE_DEFINE.with(|h| h.borrow_mut().take()) {
+            hook(handle);
+        }
+    }
+
+    type Hook0 = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static AFTER_COMMIT: RefCell<Option<Hook0>> = RefCell::new(None);
+    }
+
+    /// Runs `hook` once right after the first header commit, before the
+    /// journal is removed (F59: a panic there leaves the post-commit state).
+    #[cfg_attr(not(all(target_os = "linux", feature = "tpm")), allow(dead_code))]
+    pub(crate) fn set_after_commit(hook: impl FnOnce() + 'static) {
+        AFTER_COMMIT.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn after_commit() {
+        if let Some(hook) = AFTER_COMMIT.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
 }
 
 /// The recovery rehearsal (SI-52 6.4): from the delivered payloads only,
@@ -644,14 +709,11 @@ pub(crate) fn rehearse(
     Ok(())
 }
 
-/// The digital folders, checked before any secret (SI-52 D0).
-struct DigitalTargets {
-    a: (Dir, PathBuf),
-    b: (Dir, PathBuf),
-}
-
 /// The digital-card risk text (SI-52 5, 10), printed in every case.
 pub const DIGITAL_RISKS: &str = "Digital recovery cards: Card A and Card B together open this vault without the passphrase. Keep them on different drives in different places, never in one cloud account or one backup set, and never both on the computer that holds the vault. Losing a card's drive loses that card; with the passphrase forgotten and one card lost, the vault cannot be recovered. Deleting a card file does not erase it from flash storage, snapshots, backups, cloud history or thumbnail caches. pvault never deletes these files after the vault is created.";
+
+/// The bound digital card's risk text (D8), printed in every case.
+pub const DIGITAL_RISKS_BOUND: &str = "Digital recovery card: this card file together with your passphrase opens this vault without the TPM. Keep it on a drive in a different place, never in a cloud account or a backup set shared with the vault, and never on the computer that holds the vault. Losing the card's drive loses the card; with the passphrase forgotten, the card alone recovers nothing. Deleting a card file does not erase it from flash storage, snapshots, backups, cloud history or thumbnail caches. pvault never deletes this file after the vault is created.";
 
 #[cfg(test)]
 thread_local! {
@@ -711,21 +773,38 @@ fn open_card_folder(p: &Path) -> Result<(Dir, PathBuf), Error> {
 }
 
 /// SI-52 D0 for digital mode: folders, acknowledgments and warnings, all
-/// before any secret is read or anything is created.
+/// before any secret is read or anything is created. Portable: Card A's and
+/// Card B's folders; bound: the single card's folder (D8; no same-volume
+/// acknowledgment, since there is one card).
 fn digital_preflight(
     opts: &InitOptions<'_>,
     ui: &mut dyn Prompter,
-) -> Result<DigitalTargets, Error> {
-    let a = open_card_folder(opts.card_a_dir.as_deref().ok_or(Error::Unsupported(
-        "digital cards need --card-a-dir and --card-b-dir",
-    ))?)?;
-    let b = open_card_folder(opts.card_b_dir.as_deref().ok_or(Error::Unsupported(
-        "digital cards need --card-a-dir and --card-b-dir",
-    ))?)?;
-    if a.0.contains(&b.0).map_err(Error::Io)? && b.0.contains(&a.0).map_err(Error::Io)? {
-        return Err(Error::SameCardFolder);
-    }
-    ui.notice(DIGITAL_RISKS);
+) -> Result<Vec<(Dir, PathBuf)>, Error> {
+    let bound = opts.mode == Mode::Bound;
+    let (folders, labels): (Vec<(Dir, PathBuf)>, &[&str]) = if bound {
+        let c = open_card_folder(
+            opts.card_dir
+                .as_deref()
+                .ok_or(Error::Unsupported("a digital bound card needs --card-dir"))?,
+        )?;
+        (vec![c], &["The bound card"])
+    } else {
+        let a = open_card_folder(opts.card_a_dir.as_deref().ok_or(Error::Unsupported(
+            "digital cards need --card-a-dir and --card-b-dir",
+        ))?)?;
+        let b = open_card_folder(opts.card_b_dir.as_deref().ok_or(Error::Unsupported(
+            "digital cards need --card-a-dir and --card-b-dir",
+        ))?)?;
+        if a.0.contains(&b.0).map_err(Error::Io)? && b.0.contains(&a.0).map_err(Error::Io)? {
+            return Err(Error::SameCardFolder);
+        }
+        (vec![a, b], &["Card A", "Card B"])
+    };
+    ui.notice(if bound {
+        DIGITAL_RISKS_BOUND
+    } else {
+        DIGITAL_RISKS
+    });
     if !opts.accept_digital_cards {
         let phrase = "STORE CARDS DIGITALLY";
         if !ui.has_terminal() || !ui.confirm(&format!("Type {phrase} to continue: "), phrase)? {
@@ -734,14 +813,15 @@ fn digital_preflight(
             ));
         }
     }
-    let (va, vb) = (
-        a.0.volume().map_err(Error::Io)?,
-        b.0.volume().map_err(Error::Io)?,
-    );
-    if va == vb {
+    let volumes = folders
+        .iter()
+        .map(|f| f.0.volume())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(Error::Io)?;
+    if !bound && volumes[0] == volumes[1] {
         ui.notice(&format!(
             "Card A and Card B are on the same volume ({}). Anyone who gets that drive, its backups or its synced copies gets both cards, which open the vault without the passphrase. Different volumes are not proof of different devices either: keep the cards on separate drives in separate places.",
-            va.fs_type
+            volumes[0].fs_type
         ));
         if !opts.accept_same_volume {
             let phrase = "SAME DRIVE";
@@ -761,7 +841,7 @@ fn digital_preflight(
     if let Some(parent) = vault_abs.parent()
         && let Ok(pv) = Dir::open(parent).and_then(|d| d.volume())
     {
-        for (label, v) in [("Card A", &va), ("Card B", &vb)] {
+        for (label, v) in labels.iter().zip(&volumes) {
             if *v == pv {
                 ui.notice(&format!(
                     "Warning: {label} is on the same drive as the vault."
@@ -769,7 +849,7 @@ fn digital_preflight(
             }
         }
     }
-    for (label, p) in [("Card A", &a.1), ("Card B", &b.1)] {
+    for (label, (_, p)) in labels.iter().zip(&folders) {
         if let Some(root) = sync_root(p) {
             ui.notice(&format!(
                 "Warning: {label}'s folder is inside {}, which is usually synced to a cloud account: the card would be copied to the provider, to other devices and to version history. pvault cannot detect every synced or backed-up folder, so no warning does not mean not synced.",
@@ -777,7 +857,7 @@ fn digital_preflight(
             ));
         }
     }
-    Ok(DigitalTargets { a, b })
+    Ok(folders)
 }
 
 /// Removes the authenticated init artifacts (rollback) and the journal.
@@ -804,6 +884,170 @@ fn report_kept(kept: &[String], ui: Option<&mut dyn Prompter>) {
     }
 }
 
+/// A bound setup in progress: the TPM, its identity and the index this
+/// setup defined (journal form, with the pre-write Name).
+struct BoundSetup {
+    tpm: Box<dyn Tpm>,
+    state: TpmState,
+    ek: SecretBytes<32>,
+    owner: Option<SecretBuf>,
+    keys: BoundKeys,
+    index: IndexContext,
+    s1: shamir::Share,
+    s3: shamir::Share,
+    s2_nonce: [u8; 24],
+}
+
+/// Bound: chooses a handle, journals it (with the scope-2 token) before
+/// `NV_DefineSpace`, defines the index, confirms the pre-write public area,
+/// writes S2 and confirms the post-write one (8.3, 9.1; SI-35). A raced
+/// handle (`TPM_RC_NV_DEFINED`, F87) rolls back and starts over with a new
+/// journal; an unknown outcome (F88) keeps the journal.
+#[allow(clippy::too_many_arguments)]
+fn bound_index(
+    t: &Dir,
+    rec: &mut InitRecord,
+    init_key: &SecretBytes<32>,
+    master: &SecretBytes<32>,
+    bundle: &Bundle,
+    mut tpm: Box<dyn Tpm>,
+    state: TpmState,
+    ek: [u8; 32],
+    owner: Option<SecretBuf>,
+) -> Result<BoundSetup, Error> {
+    let keys = BoundKeys::derive(master)?;
+    let ek = SecretBytes::take_from(&mut ek.to_vec())?;
+    let [s1, s2, s3] = shamir::split_2_of_3(&bundle.to_bytes())?;
+    let (s2_nonce, data) = bound::index_data(&s2, &keys.s2)?;
+    drop(s2);
+    for attempt in 0..3 {
+        let handle = crate::tpm::free_handle(tpm.as_mut())?;
+        let nonce = random::array::<32>()?;
+        let (pre, post) = crate::tpm::expected_names(handle, &nonce);
+        let index = IndexContext {
+            tpm_index: handle,
+            name_prewrite: Some(pre),
+            name_postwrite: post,
+            policy_nonce: nonce,
+        };
+        let token = tpmid::seal(Scope::Init, init_key, &rec.vault_id, &index, &ek)?;
+        rec.idx = Some(Idx { index, token });
+        // Write-ahead (8.1): durable before the index can exist.
+        write_init(t, rec, init_key)?;
+        failpoint!("init.prepared");
+        #[cfg(test)]
+        hooks::before_define(handle);
+        match tpm.define(handle, &nonce, &keys.auth, owner.as_ref()) {
+            Ok(()) => {}
+            Err(Error::TpmHandleTaken) if attempt < 2 => {
+                // Nothing was created (F87): the normal rollback, then a new
+                // journal; the index fields are never rewritten in place.
+                store::remove_journal(t)?;
+                rec.idx = None;
+                continue;
+            }
+            // The index may exist: keep the journal for the resume (F88).
+            Err(Error::TpmDefineUnknown) => return Err(Error::TpmDefineUnknown),
+            Err(e) => {
+                store::remove_journal(t)?;
+                return Err(e);
+            }
+        }
+        // Tests: a definition whose outcome is unknown (F88): the index
+        // exists, but the process cannot tell.
+        fail_io!("init.define-unknown").map_err(|_| Error::TpmDefineUnknown)?;
+        failpoint!("init.index-defined");
+        let mut setup = BoundSetup {
+            tpm,
+            state,
+            ek,
+            owner,
+            keys,
+            index,
+            s1,
+            s3,
+            s2_nonce,
+        };
+        let written = (|| -> Result<(), Error> {
+            let found = setup.tpm.read_public(handle)?;
+            if !found.is_some_and(|p| p.matches(handle, &nonce, false) && p.name == pre) {
+                return Err(Error::Tpm(
+                    "the new index does not have the expected public area".into(),
+                ));
+            }
+            setup.tpm.write(handle, &setup.keys.auth, &data)?;
+            failpoint!("init.index-written");
+            let found = setup.tpm.read_public(handle)?;
+            if !found.is_some_and(|p| p.matches(handle, &nonce, true) && p.name == post) {
+                return Err(Error::Tpm(
+                    "the written index does not have the expected Name".into(),
+                ));
+            }
+            Ok(())
+        })();
+        if let Err(e) = written {
+            let _ = rollback_all(t, rec, Some(&mut setup));
+            return Err(e);
+        }
+        return Ok(setup);
+    }
+    Err(Error::TpmNoFreeHandle)
+}
+
+/// The rollback of an uncommitted setup: bound first removes the index it
+/// defined under 9.2b (same TPM, exact public area, journaled Name); if that
+/// fails the journal is kept so that `pvault init` can resolve it later.
+fn rollback_all(t: &Dir, rec: &InitRecord, setup: Option<&mut BoundSetup>) -> Result<(), Error> {
+    if let Some(s) = setup {
+        bound::remove_owned(s.tpm.as_mut(), &s.index, &s.ek, s.owner.as_ref())?;
+    }
+    rollback_setup(t, rec)
+}
+
+/// The optional duress step of an interactive `init` (6.10, D5 to D7):
+/// returns the header bytes with the tag, or `None` when skipped.
+fn init_duress(
+    chosen: &Chosen,
+    core: &CoreFields,
+    slots: &SlotFields,
+    k_mac: &SecretBytes<32>,
+    bound_setup: Option<&BoundSetup>,
+    ui: &mut dyn Prompter,
+) -> Result<Option<Vec<u8>>, Error> {
+    let ek = match bound_setup {
+        Some(b) => {
+            let why = b.state.duress_unavailable(true);
+            if !why.is_empty() {
+                ui.notice(&Error::DuressUnavailable(why.join(", ")).to_string());
+                return Ok(None);
+            }
+            let mut ek = [0u8; 32];
+            ek.copy_from_slice(b.ek.expose_secret());
+            Some(ek)
+        }
+        None => None,
+    };
+    let phrase = "SET DURESS";
+    if !ui.confirm(
+        &format!("Type {phrase} to create a duress passphrase now, or press Enter to skip: "),
+        phrase,
+    )? {
+        return Ok(None);
+    }
+    if chosen.words_refused {
+        ui.notice(super::duress::N3_NOTICE);
+    }
+    let mut is_main = |raw: &[u8]| -> Result<bool, Error> {
+        Ok(super::handle(chosen.kind, raw)
+            .is_ok_and(|h| bool::from(h.expose_secret().ct_eq(chosen.handled.expose_secret()))))
+    };
+    let words = super::duress::new_duress_words(ui, &mut is_main)?;
+    let slots = super::duress::slots_with_tag(core, slots, &words, ek.as_ref())?;
+    drop(words);
+    ui.notice("Duress passphrase set. It is inactive in this version: entering it fails like a wrong passphrase and changes nothing.");
+    Ok(Some(Header::build(core, &slots, k_mac)?))
+}
+
 /// `pvault init`: a new vault, or the resume of an interrupted setup.
 pub fn init(
     opts: &InitOptions<'_>,
@@ -811,12 +1055,13 @@ pub fn init(
     ui: &mut dyn Prompter,
 ) -> Result<InitOutcome, Error> {
     let digital = opts.delivery == Delivery::Digital;
+    let bound_mode = opts.mode == Mode::Bound;
     // A PNG photo of a printed card can exist only after the cards are
     // written and printed: its verification waits for the printing
     // acknowledgment on the terminal device (decided 2026-10-06, O1), also
     // under `--secrets-stdin`. Without a terminal it is refused here, before
     // any bootstrap creation.
-    let photos = opts.card_a_png.is_some() || opts.card_b_png.is_some();
+    let photos = opts.card_a_png.is_some() || opts.card_b_png.is_some() || opts.card_png.is_some();
     if photos && digital {
         return Err(Error::Unsupported(
             "PNG verification belongs to paper cards",
@@ -826,6 +1071,22 @@ pub fn init(
         return Err(Error::NeedsTerminal(
             "Verifying a card from a PNG photo needs a terminal for the printing acknowledgment, also with --secrets-stdin. Nothing was written.",
         ));
+    }
+    // Bound (D10, N2, 9.3): the TPM is checked before anything is created
+    // and before any secret is read.
+    let mut tpm_pre = None;
+    if bound_mode {
+        let mut tpm = bound::connect(&opts.tpm)?;
+        let state = tpm.state()?;
+        if !state.storage_enabled() {
+            return Err(Error::TpmHierarchyDisabled);
+        }
+        if state.in_lockout() {
+            return Err(Error::TpmLockout);
+        }
+        let ek = tpm.ek_digest()?;
+        bound::owner_auth_possible(&opts.tpm, &state, ui)?;
+        tpm_pre = Some((tpm, state, ek));
     }
     // O3 (decided 2026-10-06): card files hold shares and must stay
     // owner-only; an unverifiable card folder is refused before anything is
@@ -842,15 +1103,16 @@ pub fn init(
     }
     let (t, _lock, state) = bootstrap(&opts.vault)?;
     if state == Target::Occupied {
-        return resume(&t, settings, ui);
+        return resume(&t, settings, ui, opts);
     }
+    let card_count = if bound_mode { 1 } else { 2 };
     // Settings and card destination, before any vault artifact.
     settings.check_registration()?;
-    settings.check_card_room(2)?;
+    settings.check_card_room(card_count)?;
     let vault_abs = std::path::absolute(&opts.vault).map_err(Error::Io)?;
     let vault_path = native_path(&vault_abs).ok_or(Error::PathTooLongToTrack)?;
-    let folders: [(Dir, PathBuf); 2] = match targets {
-        Some(DigitalTargets { a, b }) => [a, b],
+    let folders: Vec<(Dir, PathBuf)> = match targets {
+        Some(v) => v,
         None => {
             let cards_path = std::path::absolute(&opts.cards_dir).map_err(Error::Io)?;
             if is_link(&cards_path) {
@@ -858,9 +1120,10 @@ pub fn init(
                     "the card folder is a symbolic link or reparse point",
                 ));
             }
-            let first = Dir::open(&cards_path).map_err(Error::Io)?;
-            let second = Dir::open(&cards_path).map_err(Error::Io)?;
-            [(first, cards_path.clone()), (second, cards_path)]
+            (0..card_count)
+                .map(|_| Dir::open(&cards_path).map(|d| (d, cards_path.clone())))
+                .collect::<Result<_, _>>()
+                .map_err(Error::Io)?
         }
     };
     for (dir, _) in &folders {
@@ -881,6 +1144,11 @@ pub fn init(
         .take(64)
         .collect::<String>();
     let chosen = choose_passphrase(opts.passphrase, opts.estimate, &context, ui)?;
+    // Bound: the owner authorization, after the passphrase (D9).
+    let owner = match &tpm_pre {
+        Some((_, state, _)) => bound::owner_auth(&opts.tpm, state, ui)?,
+        None => None,
+    };
     ui.notice("Deriving keys…");
     let vault_id = random::array::<16>()?;
     let setup_id = random::array::<16>()?;
@@ -888,11 +1156,12 @@ pub fn init(
     let set_id = random::array::<8>()?;
     let master = kdf::master_pw(&chosen.handled, &salt, opts.argon2)?;
     let init_key = kdf::init_journal_key(&master)?;
+    let bundle = Bundle::generate()?;
     let mut rec = InitRecord {
         phase: InitPhase::Prepared,
         vault_id,
         setup_id,
-        mode: Mode::Portable,
+        mode: opts.mode,
         salt,
         argon2: opts.argon2,
         passphrase_kind: chosen.kind,
@@ -903,11 +1172,18 @@ pub fn init(
         header_id: None,
         mac: [0; 64],
     };
-    write_init(&t, &rec, &init_key)?;
-    failpoint!("init.prepared");
+    let mut setup = match tpm_pre.take() {
+        Some((tpm, state, ek)) => Some(bound_index(
+            &t, &mut rec, &init_key, &master, &bundle, tpm, state, ek, owner,
+        )?),
+        None => {
+            write_init(&t, &rec, &init_key)?;
+            failpoint!("init.prepared");
+            None
+        }
+    };
 
-    let bundle = Bundle::generate()?;
-    let staged = (|| -> Result<Vec<u8>, Error> {
+    let staged = (|| -> Result<(Vec<u8>, CoreFields, SlotFields), Error> {
         // Key table 1 (empty).
         let kt = Owned::create(&t, &keytable_tmp_name(1), "a key-table temp")?;
         rec.phase = InitPhase::KeytableCreated;
@@ -925,7 +1201,7 @@ pub fn init(
         // The exact future core and header.
         let core = CoreFields {
             vault_id,
-            mode: Mode::Portable,
+            mode: opts.mode,
             argon2: opts.argon2,
             salt,
             generation: 1,
@@ -937,43 +1213,76 @@ pub fn init(
             passphrase_kind: chosen.kind,
             tpm_cleanup: Vec::new(),
         };
-        let k_slot = kdf::passphrase_subkey(&master, PassphraseKey::PortableSlot)?;
-        let (slot_nonce, slot_ct) = wrap::wrap::<96>(&k_slot, &bundle.to_bytes())?;
-        let slots = SlotFields::Portable(PortableSlots {
-            slot_nonce,
-            slot_ct,
-            duress_tag: None,
-        });
+        let slots = match &setup {
+            None => {
+                let k_slot = kdf::passphrase_subkey(&master, PassphraseKey::PortableSlot)?;
+                let (slot_nonce, slot_ct) = wrap::wrap::<96>(&k_slot, &bundle.to_bytes())?;
+                SlotFields::Portable(PortableSlots {
+                    slot_nonce,
+                    slot_ct,
+                    duress_tag: None,
+                })
+            }
+            Some(b) => {
+                let (s1_nonce, s1_ct) = wrap::wrap::<96>(&b.keys.s1, b.s1.y())?;
+                // The slots keep the post-write Name only (4.1).
+                let index = IndexContext {
+                    name_prewrite: None,
+                    ..b.index
+                };
+                SlotFields::Bound(BoundSlots {
+                    s1_nonce,
+                    s1_ct,
+                    s2_nonce: b.s2_nonce,
+                    index,
+                    tpm_id: tpmid::seal(Scope::Slots, &bundle.k_mac, &vault_id, &index, &b.ek)?,
+                    duress_tag: None,
+                })
+            }
+        };
         let bytes = Header::build(&core, &slots, &bundle.k_mac)?;
         rec.phase = InitPhase::KeytableWritten;
         rec.keytable_digest = Some(digest);
         rec.new_core_digest = Some(core.digest()?);
         write_init(&t, &rec, &init_key)?;
         failpoint!("init.keytable-written");
-        Ok(bytes)
+        Ok((bytes, core, slots))
     })();
-    let header_bytes = match staged {
-        Ok(b) => b,
+    let (mut header_bytes, final_core, final_slots) = match staged {
+        Ok(v) => v,
         Err(e) => {
-            let _ = rollback_setup(&t, &rec);
+            rollback_or_report(&t, &rec, setup.as_mut(), ui);
             return Err(e);
         }
     };
     drop(master);
 
-    // Cards: a 2-of-2 split of the bundle (7.4).
-    let shares = shamir::split_2_of_2(&bundle.to_bytes())?;
-    let card_a = Card::new(&vault_id, CardMode::Portable, &set_id, &shares[0])?;
-    let card_b = Card::new(&vault_id, CardMode::Portable, &set_id, &shares[1])?;
-    drop(shares);
-    card::check_pair(&card_a, &card_b).map_err(Error::Card)?;
+    // Cards: portable, a 2-of-2 split of the bundle (Card A, Card B); bound,
+    // S3 of the 2-of-3 split on the single bound card (7.4, 7.4d).
+    let cards: Vec<(Card, CardRole, &str, &'static str)> = match &setup {
+        None => {
+            let shares = shamir::split_2_of_2(&bundle.to_bytes())?;
+            let a = Card::new(&vault_id, CardMode::Portable, &set_id, &shares[0])?;
+            let b = Card::new(&vault_id, CardMode::Portable, &set_id, &shares[1])?;
+            card::check_pair(&a, &b).map_err(Error::Card)?;
+            vec![
+                (a, CardRole::CardA, "card-a", "Card A"),
+                (b, CardRole::CardB, "card-b", "Card B"),
+            ]
+        }
+        Some(s) => vec![(
+            Card::new(&vault_id, CardMode::Bound, &set_id, &s.s3)?,
+            CardRole::Bound,
+            "bound",
+            "Bound card",
+        )],
+    };
+    let entries: Vec<(&Card, CardRole, &str)> =
+        cards.iter().map(|(c, r, sfx, _)| (c, *r, *sfx)).collect();
     let files = match CardFiles::write(
         settings,
         folders,
-        [
-            (&card_a, CardRole::CardA, "card-a"),
-            (&card_b, CardRole::CardB, "card-b"),
-        ],
+        &entries,
         &vault_id,
         &set_id,
         opts.delivery,
@@ -981,48 +1290,99 @@ pub fn init(
     ) {
         Ok(f) => f,
         Err(e) => {
-            let _ = rollback_setup(&t, &rec);
+            rollback_or_report(&t, &rec, setup.as_mut(), ui);
             return Err(e);
         }
     };
+    drop(entries);
     let shown = files.shown();
-    if digital {
-        ui.notice(&format!(
-            "Card files saved: {} (Card A), {} (Card B). Checking them now.",
-            shown[0], shown[1]
-        ));
-    } else {
-        ui.notice(&format!(
+    let labelled = shown
+        .iter()
+        .zip(&cards)
+        .map(|(p, c)| format!("{p} ({})", c.3))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match (digital, bound_mode) {
+        (true, false) => ui.notice(&format!(
+            "Card files saved: {labelled}. Checking them now."
+        )),
+        (true, true) => ui.notice(&format!("Card file saved: {labelled}. Checking it now.")),
+        (false, false) => ui.notice(&format!(
             "Card files written: {}. Print both, then keep the printed cards in two different places.",
             shown.join(", ")
-        ));
+        )),
+        (false, true) => ui.notice(&format!(
+            "Card file written: {}. Print it, then keep the printed card away from this computer.",
+            shown.join(", ")
+        )),
     }
 
-    // W5 / D5, then the header temp and `committing`.
+    // W5 / D5, the rehearsal, the type-back, the optional duress step, then
+    // the header temp and `committing`.
     let mut committing_attempted = false;
     let verified = (|| -> Result<Owned, Error> {
         let delivered = if digital {
             // Digital: no printing acknowledgment; the saved files are read
             // back through the format 1 reader (SI-52 6.4).
-            files.read_back([&card_a, &card_b])?
+            let expected: Vec<(&Card, &'static str)> =
+                cards.iter().map(|(c, _, _, l)| (c, *l)).collect();
+            files.read_back(&expected)?
         } else {
             // With a terminal this always waits (also under
             // `--secrets-stdin`); PNG photos are opened only after it.
-            ui.acknowledge(if photos {
-                "Print both cards and save the PNG photos at the paths you gave, then press Enter. "
-            } else {
-                "Press Enter after printing. "
+            ui.acknowledge(match (photos, bound_mode) {
+                (true, false) => {
+                    "Print both cards and save the PNG photos at the paths you gave, then press Enter. "
+                }
+                (true, true) => {
+                    "Print the card and save the PNG photo at the path you gave, then press Enter. "
+                }
+                (false, _) => "Press Enter after printing. ",
             })?;
-            [
-                verify_card(&card_a, "Card A", opts.card_a_png.as_deref(), ui)?,
-                verify_card(&card_b, "Card B", opts.card_b_png.as_deref(), ui)?,
-            ]
+            let pngs = if bound_mode {
+                vec![opts.card_png.as_deref()]
+            } else {
+                vec![opts.card_a_png.as_deref(), opts.card_b_png.as_deref()]
+            };
+            let mut out = Vec::with_capacity(cards.len());
+            for ((card, _, _, label), png) in cards.iter().zip(pngs) {
+                out.push(verify_card(card, label, png, ui)?);
+            }
+            out
         };
-        // The recovery rehearsal from the delivered cards (SI-52 6.4).
-        rehearse(&t, &delivered, &header_bytes)?;
-        drop(delivered);
+        // The recovery rehearsal from the delivered cards (SI-52 6.4; bound:
+        // S1 + S3, spec 6.1).
+        let rehearse_now = |bytes: &[u8]| -> Result<(), Error> {
+            match &setup {
+                None => {
+                    let pair: &[SecretBytes<{ card::PAYLOAD_LEN }>; 2] = delivered
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| Error::RehearsalFailed)?;
+                    rehearse(&t, pair, bytes)
+                }
+                Some(b) => bound::rehearse(&t, &b.keys.s1, &delivered[0], bytes),
+            }
+        };
+        rehearse_now(&header_bytes)?;
         failpoint!("init.rehearsed");
         type_back(&chosen, ui)?;
+        // The optional duress step, interactive only (6.10). The header that
+        // will be committed is rehearsed again.
+        if ui.interactive()
+            && let Some(bytes) = init_duress(
+                &chosen,
+                &final_core,
+                &final_slots,
+                &bundle.k_mac,
+                setup.as_ref(),
+                ui,
+            )?
+        {
+            rehearse_now(&bytes)?;
+            header_bytes = bytes;
+        }
+        drop(delivered);
         let hdr = Owned::create(&t, HEADER_TMP, HEADER_TMP)?;
         rec.phase = InitPhase::Committing;
         rec.header_id = Some(hdr.id());
@@ -1037,7 +1397,7 @@ pub fn init(
             if digital && committing_attempted {
                 // SI-52 8.1: once `committing` may exist, keep the files.
                 files.retain();
-                let _ = rollback_setup(&t, &rec);
+                rollback_or_report(&t, &rec, setup.as_mut(), ui);
                 ui.notice(&format!(
                     "The setup was rolled back. The card files {} were kept; they are probably invalid. pvault does not delete them now; check them with pvault discard-card.",
                     shown.join(", ")
@@ -1045,7 +1405,7 @@ pub fn init(
                 return Err(e);
             }
             report_kept(&files.delete(), Some(ui));
-            let _ = rollback_setup(&t, &rec);
+            rollback_or_report(&t, &rec, setup.as_mut(), ui);
             if !matches!(e, Error::NeedsTerminal(_)) {
                 ui.notice(if digital {
                     "The setup was rolled back; the card files were deleted. If you copied them anywhere, delete those copies: they are invalid."
@@ -1056,8 +1416,7 @@ pub fn init(
             return Err(e);
         }
     };
-    drop(card_a);
-    drop(card_b);
+    drop(cards);
 
     // W6: the first header, by no-replace rename.
     let committed = (|| -> Result<(), Error> {
@@ -1082,19 +1441,22 @@ pub fn init(
     })();
     drop(hdr);
     match committed {
-        Ok(()) => {}
+        Ok(()) => {
+            #[cfg(test)]
+            hooks::after_commit();
+        }
         Err(Error::Io(e)) => {
             if digital {
                 // After `committing`: retained (SI-52 8.1).
                 files.retain();
-                let _ = rollback_setup(&t, &rec);
+                rollback_or_report(&t, &rec, setup.as_mut(), ui);
                 ui.notice(&format!(
                     "The setup was rolled back. The card files {} were kept; they are probably invalid. pvault does not delete them now; check them with pvault discard-card.",
                     shown.join(", ")
                 ));
             } else {
                 report_kept(&files.delete(), Some(ui));
-                let _ = rollback_setup(&t, &rec);
+                rollback_or_report(&t, &rec, setup.as_mut(), ui);
                 ui.notice("The setup was rolled back; the printed cards are invalid.");
             }
             return Err(Error::Io(e));
@@ -1111,14 +1473,26 @@ pub fn init(
             return Err(e);
         }
     }
-    let card_files = digital.then(|| [files.files[0].path.clone(), files.files[1].path.clone()]);
+    let card_files = digital.then(|| {
+        files
+            .files
+            .iter()
+            .map(|f| f.path.clone())
+            .collect::<Vec<_>>()
+    });
     if digital {
         // D7: the files are the owner's; only the entries go.
         files.release();
-        ui.notice(&format!(
-            "Your recovery card files: {} (Card A) and {} (Card B). Keep them on different drives in different places; pvault will not delete them.",
-            shown[0], shown[1]
-        ));
+        if bound_mode {
+            ui.notice(&format!(
+                "Your recovery card file: {labelled}. Keep it on a drive in a different place; pvault will not delete it."
+            ));
+        } else {
+            ui.notice(&format!(
+                "Your recovery card files: {} (Card A) and {} (Card B). Keep them on different drives in different places; pvault will not delete them.",
+                shown[0], shown[1]
+            ));
+        }
     } else {
         // W7, W8.
         report_kept(&files.delete(), Some(ui));
@@ -1129,6 +1503,20 @@ pub fn init(
         vault_id,
         card_files,
     })
+}
+
+/// [`rollback_all`], telling the owner when a bound index could not be
+/// removed now (the journal is then kept for `pvault init`).
+fn rollback_or_report(
+    t: &Dir,
+    rec: &InitRecord,
+    setup: Option<&mut BoundSetup>,
+    ui: &mut dyn Prompter,
+) {
+    let bound = setup.is_some();
+    if rollback_all(t, rec, setup).is_err() && bound {
+        ui.notice("The TPM index of this setup could not be removed now. The setup journal was kept; run pvault init on the folder again to finish removing it.");
+    }
 }
 
 /// What the optional card check after the commit did (SI-52 R5).
@@ -1155,26 +1543,36 @@ pub enum CardCheck {
 /// is deleted.
 pub fn card_check_after_commit(
     vault: &Path,
-    files: &[PathBuf; 2],
+    files: &[PathBuf],
     ui: &mut dyn Prompter,
 ) -> Result<CardCheck, Error> {
     if !ui.interactive() {
         return Ok(CardCheck::Skipped);
     }
-    ui.notice(
-        "The vault has already been created. Optional check: pvault has closed the card files, so you can now eject the drives that hold them, insert them again, and let pvault check that both cards read back and recover the vault. A failed check changes nothing: the vault stays, and no card file is deleted.",
-    );
+    let bound = files.len() == 1;
+    ui.notice(if bound {
+        "The vault has already been created. Optional check: pvault has closed the card file, so you can now eject the drive that holds it, insert it again, and let pvault check that the card reads back and, with your passphrase, recovers the vault. A failed check changes nothing: the vault stays, and the card file is not deleted."
+    } else {
+        "The vault has already been created. Optional check: pvault has closed the card files, so you can now eject the drives that hold them, insert them again, and let pvault check that both cards read back and recover the vault. A failed check changes nothing: the vault stays, and no card file is deleted."
+    });
     let phrase = "CHECK";
     if !ui.confirm(
-        &format!("Type {phrase} after re-inserting the drives to check the card files, or press Enter to skip: "),
+        &format!(
+            "Type {phrase} after re-inserting the {} to check the card {}, or press Enter to skip: ",
+            if bound { "drive" } else { "drives" },
+            if bound { "file" } else { "files" }
+        ),
         phrase,
     )? {
         ui.notice("Card check skipped.");
         return Ok(CardCheck::Skipped);
     }
-    check_saved_cards(vault, files).map_err(|e| {
+    check_saved_cards(vault, files, ui).map_err(|e| {
         // The vault exists: never repeat a setup-time "rolled back" text.
         let mut reason = match e {
+            Error::RehearsalFailed if bound => {
+                "the file and the passphrase do not recover this vault.".to_owned()
+            }
             Error::RehearsalFailed => "the two files do not recover this vault.".to_owned(),
             other => other.to_string(),
         };
@@ -1183,16 +1581,23 @@ pub fn card_check_after_commit(
         }
         Error::CardCheckFailed(reason)
     })?;
-    ui.notice(&format!(
-        "Card check passed: {} (Card A) and {} (Card B) read back and recover this vault.",
-        crate::render::path(&files[0]),
-        crate::render::path(&files[1])
-    ));
+    if bound {
+        ui.notice(&format!(
+            "Card check passed: {} (Bound card) reads back and, with your passphrase, recovers this vault.",
+            crate::render::path(&files[0])
+        ));
+    } else {
+        ui.notice(&format!(
+            "Card check passed: {} (Card A) and {} (Card B) read back and recover this vault.",
+            crate::render::path(&files[0]),
+            crate::render::path(&files[1])
+        ));
+    }
     Ok(CardCheck::Passed)
 }
 
-fn check_saved_cards(vault: &Path, files: &[PathBuf; 2]) -> Result<(), Error> {
-    let mut delivered = Vec::with_capacity(2);
+fn check_saved_cards(vault: &Path, files: &[PathBuf], ui: &mut dyn Prompter) -> Result<(), Error> {
+    let mut delivered = Vec::with_capacity(files.len());
     for path in files {
         let abs = std::path::absolute(path).map_err(Error::Io)?;
         let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) else {
@@ -1212,8 +1617,6 @@ fn check_saved_cards(vault: &Path, files: &[PathBuf; 2]) -> Result<(), Error> {
         let read = card::parse_card_file(&bytes).map_err(Error::CardFile)?;
         delivered.push(SecretBytes::take_from(&mut read.payload().to_vec())?);
     }
-    let delivered: [SecretBytes<{ card::PAYLOAD_LEN }>; 2] =
-        delivered.try_into().map_err(|_| Error::RehearsalFailed)?;
     let t = Dir::open(vault).map_err(Error::Io)?;
     let _shared = crate::lock::status_shared(&t)?.ok_or(Error::VaultInUse)?;
     let header = crate::store::read_capped(
@@ -1223,7 +1626,27 @@ fn check_saved_cards(vault: &Path, files: &[PathBuf; 2]) -> Result<(), Error> {
         || Error::HeaderInvalid,
     )?
     .ok_or(Error::HeaderInvalid)?;
-    rehearse(&t, &delivered, &header)
+    let parsed = Header::parse(&header)?;
+    match parsed.slots() {
+        SlotFields::Portable(_) => {
+            let pair: [SecretBytes<{ card::PAYLOAD_LEN }>; 2] =
+                delivered.try_into().map_err(|_| Error::RehearsalFailed)?;
+            rehearse(&t, &pair, &header)
+        }
+        SlotFields::Bound(_) => {
+            // A bound card recovers only with the passphrase (spec 6.1).
+            let core = parsed.core();
+            let raw = ui.secret("Enter the passphrase to check the card: ")?;
+            let handled = super::handle(core.passphrase_kind, raw.as_bytes())?;
+            drop(raw);
+            let master = kdf::master_pw(&handled, &core.salt, core.argon2)?;
+            drop(handled);
+            let keys = BoundKeys::derive(&master)?;
+            drop(master);
+            let card = delivered.first().ok_or(Error::RehearsalFailed)?;
+            bound::rehearse(&t, &keys.s1, card, &header)
+        }
+    }
 }
 
 /// Card entries left by an interrupted setup of `vault_id` (11.3; SI-52 8.2).
@@ -1298,8 +1721,13 @@ fn offer_stale_cards(
     Ok(())
 }
 
-/// The 8.3 restart table for portable setups.
-fn resume(t: &Dir, settings: &Settings, ui: &mut dyn Prompter) -> Result<InitOutcome, Error> {
+/// The 8.3 restart table (portable and bound setups).
+fn resume(
+    t: &Dir,
+    settings: &Settings,
+    ui: &mut dyn Prompter,
+    opts: &InitOptions<'_>,
+) -> Result<InitOutcome, Error> {
     match pending(t)? {
         Pending::Init => {}
         Pending::Other(op) => return Err(Error::PendingJournal(op)),
@@ -1314,14 +1742,14 @@ fn resume(t: &Dir, settings: &Settings, ui: &mut dyn Prompter) -> Result<InitOut
     let Ok(Record::Init(unverified)) = Record::parse(&bytes) else {
         return Err(Error::PendingJournal("operation"));
     };
-    if unverified.mode != Mode::Portable {
+    if unverified.mode == Mode::Bound && !crate::tpm::supported() {
         return Err(Error::BoundVault);
     }
     unverified.argon2.check_hard_caps()?;
     resources::check_argon2(&unverified.argon2, &SystemMemory)?;
     match header {
-        Some(h) => finish_committed(t, &h, settings, ui),
-        None => remove_uncommitted(t, &unverified, settings, ui),
+        Some(h) => finish_committed(t, &h, settings, ui, &opts.tpm),
+        None => remove_uncommitted(t, &unverified, settings, ui, &opts.tpm),
     }
 }
 
@@ -1340,10 +1768,13 @@ fn finish_committed(
     h: &Header,
     settings: &Settings,
     ui: &mut dyn Prompter,
+    tpm_opts: &TpmOptions,
 ) -> Result<InitOutcome, Error> {
-    if h.core().mode != Mode::Portable {
-        return Err(Error::BoundVault);
-    }
+    // Bound: Path A reads S2 from the TPM (5.5; no duress check).
+    let mut tpm = match h.core().mode {
+        Mode::Portable => None,
+        Mode::Bound => Some(bound::connect(tpm_opts)?),
+    };
     let raw = ui.secret(
         "This vault's setup was interrupted after it was saved. Enter the passphrase to finish: ",
     )?;
@@ -1351,7 +1782,11 @@ fn finish_committed(
     drop(raw);
     let master = kdf::master_pw(&handled, &h.core().salt, h.core().argon2)?;
     drop(handled);
-    let _bundle = super::open_bundle(h, &master)?;
+    let _bundle = match tpm.as_deref_mut() {
+        Some(t) => bound::open_bundle(h, &master, t)?,
+        None => super::open_bundle(h, &master)?,
+    };
+    drop(tpm);
     let init_key = kdf::init_journal_key(&master)?;
     drop(master);
     let rec = authenticated(t, &init_key)?;
@@ -1383,6 +1818,7 @@ fn remove_uncommitted(
     unverified: &InitRecord,
     settings: &Settings,
     ui: &mut dyn Prompter,
+    tpm_opts: &TpmOptions,
 ) -> Result<InitOutcome, Error> {
     let raw =
         ui.secret("This folder holds an interrupted setup. Enter the passphrase used for it: ")?;
@@ -1393,6 +1829,47 @@ fn remove_uncommitted(
     let init_key = kdf::init_journal_key(&master)?;
     drop(master);
     let rec = authenticated(t, &init_key)?;
+    // Bound (8.3 restart table): resolve the journaled index first, on the
+    // TPM that created it, under 9.2b. Elsewhere the journal and every
+    // artifact are kept.
+    if let Some(idx) = &rec.idx {
+        let expected = tpmid::open(
+            Scope::Init,
+            &init_key,
+            &rec.vault_id,
+            &idx.index,
+            &idx.token,
+        )?;
+        let mut tpm = bound::connect(tpm_opts)?;
+        let state = tpm.state()?;
+        let live = tpm
+            .ek_digest()
+            .map_err(|_| Error::TpmIndexElsewhere(idx.index.tpm_index))?;
+        if !bool::from(live.ct_eq(expected.expose_secret())) {
+            return Err(Error::TpmIndexElsewhere(idx.index.tpm_index));
+        }
+        let present = tpm.read_public(idx.index.tpm_index)?.is_some();
+        // A declared owner authorization is always read, so that the
+        // `--secrets-stdin` line order does not depend on TPM state.
+        let owner = if present || tpm_opts.owner_auth_declared {
+            bound::owner_auth(tpm_opts, &state, ui)?
+        } else {
+            None
+        };
+        match bound::remove_owned(tpm.as_mut(), &idx.index, &expected, owner.as_ref())? {
+            bound::Resolution::Removed => {
+                ui.notice(&format!(
+                    "Removed this setup's TPM index (handle 0x{:08x}).",
+                    idx.index.tpm_index
+                ));
+            }
+            bound::Resolution::Absent => {}
+            bound::Resolution::Foreign => ui.notice(&format!(
+                "TPM handle 0x{:08x} now holds an index that is not this setup's; it was left alone.",
+                idx.index.tpm_index
+            )),
+        }
+    }
     // Authenticated artifacts.
     if let Some(id) = &rec.keytable_id {
         for name in [keytable_tmp_name(1), keytable_name(1)] {

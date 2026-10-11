@@ -173,3 +173,29 @@ release artifacts is planned for Milestone 13.
   or substantial portions. The software is provided "AS IS", without
   warranty or liability. Each crate includes the exact notice in its license
   file.
+
+## TPM support on Linux (Milestone 5; bound mode)
+
+Compiled into the Linux binary only, with pvault-core's default `tpm`
+feature (D1). Other platforms do not build them.
+
+- `tss-esapi` 7.7.0 and `tss-esapi-sys` 0.6.0: Parsec Project Contributors.
+  **License:** Apache-2.0 (no `NOTICE` file in either package). Each package
+  includes the license text as `LICENSE`; it is also at
+  <https://www.apache.org/licenses/LICENSE-2.0>.
+  **Source:** <https://crates.io/crates/tss-esapi/7.7.0> and
+  <https://crates.io/crates/tss-esapi-sys/0.6.0>.
+- `hostname-validator` 1.1.1: Copyright (c) 2018 System76. `mbox` 0.7.1:
+  Copyright (c) 2016 Kenny Chan. **License:** MIT (the permission and
+  warranty terms of the MIT-only section above). Each package includes the
+  exact notice in its license file. **Source:**
+  <https://crates.io/crates/hostname-validator/1.1.1> and
+  <https://crates.io/crates/mbox/0.7.1>.
+- Their other new dependencies (`bitfield`, `enumflags2`, `num-derive`, `oid`,
+  `picky-asn1`, `picky-asn1-der`, `picky-asn1-x509`) are dual-licensed MIT OR
+  Apache-2.0. `target-lexicon` (Apache-2.0 WITH LLVM-exception) and
+  `pkg-config` are build-time dependencies of `tss-esapi-sys` and are not
+  compiled into pvault (crate-specific `deny.toml` exception for
+  `target-lexicon`).
+- The system TPM software stack `tpm2-tss` (BSD-2-Clause) is linked
+  dynamically from the operating system and is not distributed with pvault.

@@ -920,11 +920,11 @@ def format_records():
 CARD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
 
-def card_record():
+def card_record(name="portable-card-a", mode=1, share_x=1):
     vault_id = bytes(range(0x10, 0x20))
     set_id = bytes(range(0x20, 0x28))
     share = bytes(range(0x40, 0xA0))
-    head = b"PVC1" + bytes([1]) + vault_id + bytes([1]) + set_id + bytes([1]) + share
+    head = b"PVC1" + bytes([1]) + vault_id + bytes([mode]) + set_id + bytes([share_x]) + share
     payload = head + hashlib.sha512(b"pvault/v1/card" + head).digest()[:8]
     assert len(payload) == 135
 
@@ -953,11 +953,11 @@ def card_record():
         if dark:
             packed[i // 8] |= 1 << (7 - i % 8)
     return [
-        ("name", "portable-card-a"),
+        ("name", name),
         ("vault_id", vault_id.hex()),
-        ("mode", "1"),
+        ("mode", str(mode)),
         ("set_id", set_id.hex()),
-        ("share_x", "1"),
+        ("share_x", str(share_x)),
         ("share", share.hex()),
         ("payload", payload.hex()),
         ("base32", symbols),
@@ -994,7 +994,7 @@ def card_file_svg(record):
             y, x = divmod(i, width)
             out.append(f"M{(x + quiet) * module} {(y + quiet) * module}h{module}v{module}h-{module}z")
     out.append('"/>\n')
-    role = "Card A" if fields["share_x"] == "1" else "Card B"
+    role = {"1": "Card A", "2": "Card B", "3": "Bound card"}[fields["share_x"]]
     symbols = fields["base32"]
     lines = [(22, f"pvault recovery card: {role}"),
              (14, f"Vault ID: {fields['vault_id']}"),
@@ -1012,16 +1012,25 @@ def card_file_svg(record):
     return "".join(out).encode("ascii")
 
 
+CARD_FILE_BOUND = "pvault_card_bound.svg"
+
+
 def write_card_vectors(out):
-    record = card_record()
-    svg = card_file_svg(record)
-    (out / CARD_FILE_NAME).write_bytes(svg)
-    record += [
-        ("file", CARD_FILE_NAME),
-        ("file_created", CARD_FILE_DATE),
-        ("file_len", str(len(svg))),
-        ("file_sha256", hashlib.sha256(svg).hexdigest()),
-    ]
+    records = []
+    for record, file_name in [
+        (card_record(), CARD_FILE_NAME),
+        # Milestone 5 (D8): the bound card, mode 0, share_x = 3.
+        (card_record("bound-card", 0, 3), CARD_FILE_BOUND),
+    ]:
+        svg = card_file_svg(record)
+        (out / file_name).write_bytes(svg)
+        record += [
+            ("file", file_name),
+            ("file_created", CARD_FILE_DATE),
+            ("file_len", str(len(svg))),
+            ("file_sha256", hashlib.sha256(svg).hexdigest()),
+        ]
+        records.append(record)
     write_records(
         out / "pvault_card.txt",
         [
@@ -1030,11 +1039,11 @@ def write_card_vectors(out):
             "QR byte mode, error correction M, smallest fitting version and automatic",
             "mask selection, computed independently with Python qrcode (MIT). qr_bits",
             "packs the row-major module matrix MSB-first, with zero tail padding.",
-            f"Card-file format 1 (SI-52): {CARD_FILE_NAME}, rendered by this script",
-            "from the documented layout and the qrcode matrix; file_len and",
-            "file_sha256 describe its exact bytes.",
+            f"Card-file format 1 (SI-52): {CARD_FILE_NAME} and {CARD_FILE_BOUND},",
+            "rendered by this script from the documented layout and the qrcode",
+            "matrix; file_len and file_sha256 describe their exact bytes.",
         ],
-        [record],
+        records,
         packages=["qrcode"],
     )
 

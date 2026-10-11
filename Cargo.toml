@@ -46,6 +46,9 @@ rqrr = { version = "=0.11.0", default-features = false }
 png = "=0.18.1"
 # Per-user settings folder (7.9, 9.7; approved for Milestone 4, A7).
 directories = "=6.0.0"
+# TPM access for bound mode (spec 7.6, 9.1; SI-18; approved for Milestone 5,
+# D1): Linux only, behind pvault-core's `tpm` feature. Needs tpm2-tss >= 2.4.6.
+tss-esapi = { version = "=7.7.0", default-features = false }
 tempfile = "3.27.0"
 assert_cmd = "2"
 criterion = "0.8.2"

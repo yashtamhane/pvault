@@ -24,6 +24,9 @@ pub mod resources;
 pub mod secrets;
 pub mod shamir;
 pub mod store;
+#[cfg(test)]
+mod test_process;
+pub mod tpm;
 pub mod tpmid;
 mod ucd17;
 pub mod vault;

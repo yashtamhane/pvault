@@ -84,7 +84,7 @@
 
 You are building a security-critical tool. Correctness matters more than speed.
 
-1. **Work one milestone at a time** (Section 13). Do not start the next milestone until the current one's acceptance criteria pass. At the end of each milestone, stop and give the human a short summary: what was built, test results, open decisions.
+1. **Work one milestone at a time** (Section 13). Do not start the next milestone until the current one's acceptance criteria pass. At the end of each milestone, stop and give the human a short summary: what was built, test results, open decisions. **Recorded exception E2 (author, 2026-10-06):** Milestone 5 may be implemented while Milestone 4 remains unaccepted; both Milestone 4 manual gates stay outstanding and unchanged, and neither milestone is accepted by the exception (`docs/SPEC_ISSUES.md`, E2).
 2. **Stop at the review gate (Milestone 8).** The gate covers exactly these features: owner Revoke, the duress *trigger action* (what happens when a duress passphrase matches), Erase, the flush step and K2 (everything under `destructive/`). Duress *setup* (generating the duress passphrase, computing and storing the tag) and duress handling during recovery are not destructive and are built before the gate. Do not write that code until the human confirms the review. Routine operations built earlier (`rm`, atomic header replacement, keytable file rotation, recovery cleanup, `fsck`) are allowed before the gate, but any TPM index deletion they perform must go through the ownership verification in 9.2b and pass its tests.
 3. **Never invent cryptography.** Use only the primitives and crates in Section 7. The only hand-written crypto-adjacent code allowed is the Shamir module (7.4), and only if no listed crate fits.
 4. **Do not add dependencies outside Section 7.6** without asking the human first.
@@ -192,7 +192,7 @@ The "50+ years" and "quantum-resistant" statements are **design targets under A1
 | **K2** | Whole-device destruction, per drive type. |
 | **Duress passphrase** | A second generated passphrase that looks like a failed unlock and silently fires Revoke only. |
 | **Journal** | `vault.journal`: authenticated record of an in-progress multi-step operation. |
-| **Generation** | Authenticated transaction counter in the core. Incremented by exactly 1 by every commit that rewrites the core, which is every write made with the bundle. One approved exception (Milestone 3): the remote-rollback tracking commit uses `old_gen + 2` (8.1). Revoke and duress writes do not change it (9.7). `u64`. Overflow handling is **PENDING (SI-35)**; the proposal is that a commit that would overflow is refused. |
+| **Generation** | Authenticated transaction counter in the core. Incremented by exactly 1 by every commit that rewrites the core, which is every write made with the bundle. One approved exception (Milestone 3): the remote-rollback tracking commit uses `old_gen + 2` (8.1). Revoke and duress writes do not change it (9.7). `u64`. Overflow handling is **approved for Milestone 5 (2026-10-06, D3)**: a commit that would overflow is refused ("generation limit reached"). |
 | **Vault path** | The unique, normalized relative path of a key-table entry (7.8). |
 
 ---
@@ -263,7 +263,7 @@ SlotFields, portable {
 
 - The x-coordinate stored with S2 in the TPM index (9.1) must also be 2. Any other value is a parse failure.
 - An optional field is absent when unused, never `null`. The presence of `duress_tag` is visible to anyone who can read the header (9.6).
-- The exact TPM public area, including the 34-byte Name, is **PENDING (SI-22)**.
+- The exact TPM public area, including the 34-byte Name, is **approved for Milestone 5 (2026-10-06, D2)** and specified in 9.1.
 - A proposed `TpmCleanupEntry` has `tpm_index` u32,
   `name_prewrite` optional bytes(34), `name_postwrite` bytes(34),
   `policy_nonce` bytes(32), `tpm_id_template` u8 = 1, `tpm_id_nonce`
@@ -340,13 +340,14 @@ journal_key   = HKDF-SHA-512(K_mac,     info="pvault/v1/journal")       (after u
 1. Parse header; validate Argon2 caps (4.3).
 2. Derive keys (5.1).
 3. Duress check (9.6). On match: duress Revoke if bound duress is available (9.3), then return
-   generic failure.
+   generic failure. (The Revoke action is a Milestone 9 feature behind the Milestone 8
+   gate; until then a match returns the generic failure and changes nothing: D6.)
 4. S1 = slots.s1_ct XOR XChaCha20(k_s1wrap, slots.s1_nonce)
 5. Provisional read (9.2a): NV_ReadPublic(slots.tpm_nv_index); only if its Name equals
    slots.tpm_nv_name, S2_wrapped = NV_Read(slots.tpm_nv_index, auth=tpm_auth).
    Name mismatch -> generic failure WITHOUT attempting NV_Read (protects the DA counter).
-   The session used for NV_Read is PENDING (SI-22). It must never silently fall back to a
-   weaker session.
+   NV_Read uses a salted HMAC session with response encryption (9.1, approved for
+   Milestone 5, D2). It must never silently fall back to a weaker session.
 6. S2 = S2_wrapped XOR XChaCha20(k_s2wrap, slots.s2_nonce)
 7. bundle = Shamir_combine(S1, S2)          (locked memory)
 8. Verify core_mac, then slots_mac. Either fails -> generic failure.
@@ -404,7 +405,7 @@ For a custom main passphrase with a duress tag, both derivations run in a fixed 
 - **Effect:** the unlock runs one Argon2id instead of two, and finishes about one run sooner (about 2 s at the defaults on the measured Apple M4).
 - **What an observer learns:** someone who can time unlock attempts learns that the typed text is in a refused class. When the typed text is the correct passphrase, that is a property of the secret passphrase. It reveals nothing about the bundle, the TPM share or the duress passphrase.
 - **Already public:** whether a duress tag exists (9.6), and whether an unlock succeeded.
-- **Avoidance:** an owner avoids the difference by choosing a custom passphrase that generated-word handling accepts. Whether pvault should warn about this at creation is not decided (**PENDING**).
+- **Avoidance:** an owner avoids the difference by choosing a custom passphrase that generated-word handling accepts. **Decided 2026-10-06 (D7): a conditional notice.** When a duress passphrase is set (`duress set`, or the duress step of `init`) and the main passphrase is custom **and** generated-word handling refuses it, pvault prints the timing notice (`docs/CLI.md` 7) and continues. No notice otherwise; nothing about the passphrase is printed.
 - Verification-only paths never run the duress derivation (5.5), so they are unaffected.
 
 ### 5.7 Command authentication table and ordering
@@ -516,11 +517,12 @@ Open keytable.<core.keytable_gen>.pv, verify its digest against the core, decryp
 a. Generate new_bundle (three fresh independent keys).
 b. Portable: generate a NEW passphrase (shown once) and new salt.
    Bound: keep the owner's passphrase; generate a new salt.
-   Argon2 parameters for the new salt: PENDING (SI-35).
+   Argon2 parameters for the new salt: the current defaults, which must pass 4.3 on this
+   machine (SI-35 item 2; Milestone 6).
 c. Bound: new Shamir 2-of-3 split -> S1', S2', S3'. Portable: new 2-of-2 split -> A', B'.
 d. Bound: first measure the TPM identity (9.3, decision N2); if it cannot be measured,
    refuse before step e and offer `recover --to-portable`. Then choose a free handle
-   (allocation and collision rules PENDING, SI-35) and a fresh
+   (allocation and collision rules approved for Milestone 5, D3; 9.1) and a fresh
    policy nonce. Precompute BOTH expected Names
    from the index's public area (9.1), which is deterministic:
    new_name_prewrite  (TPMA_NV_WRITTEN clear) and new_name_postwrite (TPMA_NV_WRITTEN set).
@@ -652,7 +654,9 @@ When the new slots are bound and bound duress is unavailable (9.3), options 1 an
 
 Object keys are not rotated (6.11).
 
-### 6.10 Duress setup: drafted in v7, confirm before Milestone 5
+### 6.10 Duress setup (approved for Milestone 5, 2026-10-06, D5)
+
+The draft below is approved for both modes, with these decisions: duress setup needs the terminal device (the generated duress passphrase is shown only there, like a generated main passphrase); `duress set` refuses while a tag is configured (disable first); bound mode needs C1 to C4 (9.3); the N3 notice is conditional (5.6, D7); and until the Milestone 9 trigger exists a configured duress passphrase is **inactive**: a match is the generic failure and changes nothing, and `status` and the documentation say so (D6).
 
 - **`duress set`:**
   1. Ordinary unlock, with the duress check, under the exclusive lock.
@@ -772,6 +776,7 @@ The full design, with its decisions R1 to R7, Q1 to Q4, L1 and L2, is `docs/RECO
 - **Deletion (L2):** inside the running `init`, before the `committing` journal record is written, a failure deletes both digital files through the handles that created them. From the `committing` attempt on, the files and their entries are kept. After a commit the entries are released and the files kept. After a restart no command deletes a digital card file: `init` resume releases entries whose card set is the vault's current set and names the others as probably invalid; `clean-partials` lists digital entries and `FORGET <n> CARD RECORDS` removes only the entries. The only other deletion is `pvault discard-card <file> [--vault <dir>]`: it reads the named file through the reader, shows its public fields, labels any comparison with the vault's public header as not verified, always requires `DISCARD RECOVERY CARD <first 8 hex of the card set>` on the terminal device (exit 4 without one), and deletes only the file it opened, through that handle.
 - **Records (R7):** `cards.cbor` version 2 adds `delivery` and `vault_path`. Version 1 is read (as paper entries) and migrated by the first update; a newer version is refused unchanged. The init journal is unchanged: Q2 (adding `card_set_id`) is superseded (decided 2026-10-06), because nothing is deleted after a restart and each card entry already records its `vault_id` and `set_id` (`docs/RECOVERY_DELIVERY_PROPOSAL.md` 9).
 - **Optional card check after the commit (R5, decided 2026-10-06):** after "Vault created", with every handle and lock of `init` released, an interactive digital `init` offers a check: the owner may eject and re-insert the drives and type `CHECK`; each file is opened afresh, read through the strict reader, and the pair goes through the recovery rehearsal against the stored header and key table. The message says that the vault has already been created. A failure is reported (exit 1) and rolls nothing back, deletes no card and unregisters nothing. A non-interactive `init` omits it.
+- **Bound vaults (approved for Milestone 5, 2026-10-06, D8):** one card (`share_x = 3`, role "Bound card"). Paper: `--cards paper --cards-dir <dir>`, one file `pvault-<vault8>-<set8>-bound.svg`, verified by photo or typed text. Digital: `--cards digital --card-dir <dir>` (one folder; the `digital-cards` acknowledgment; no same-volume acknowledgment; the vault-volume and sync warnings apply). The rehearsal follows 6.1: S1 from the passphrase and the candidate slots, S3 from the delivered card, combined to the bundle that must verify the candidate header and `keytable.1.pv`; S2 is not used. The optional check after the commit (R5) also asks for the passphrase, because a bound card alone recovers nothing. `cards.cbor` uses the reserved role `"bound"`; no schema change.
 - **Not implemented in Milestone 4:** the optional real-drive measurement (R6). Card-file options of `verify-card`, `recover` and `convert` arrive with those commands in Milestone 6.
 
 ### 7.4c PNG input limits (card QR codes)
@@ -799,7 +804,7 @@ The full design, with its decisions R1 to R7, Q1 to Q4, L1 and L2, is `docs/RECO
 | Secrets | `zeroize`, `secrecy` |
 | Memory locking | `memsec` or `region` |
 | RNG | `getrandom` (`fill`, `SysRng`); `rand_core` only as the trait an API requires |
-| TPM (bound, Linux) | `tss-esapi` (version pin and features **PENDING SI-18**) |
+| TPM (bound, Linux) | `tss-esapi = "=7.7.0"` (`tss-esapi-sys` 0.6.0), Linux-only optional dependency behind the default Cargo feature `tpm`; system `tpm2-tss` ≥ 2.4.6; one crate-specific `deny.toml` license exception for its build dependency `target-lexicon` (Apache-2.0 WITH LLVM-exception) (approved 2026-10-06, D1) |
 | Unicode | `unicode-normalization` |
 | Serialization | In-house fixed-schema codec for the 4.4 profile (approved for Milestone 3; SI-07 option 2). `serde` and `ciborium` are not used by product code (`ciborium` remains only a benchmark dependency through `criterion`) |
 | CLI | `clap`. Terminal secret input uses bounded platform FFI (7.6a), **not** `rpassword` (approved; SI-51) |
@@ -1100,7 +1105,7 @@ vault remains readable and operations that cannot add a record may proceed.
 
 **Transition records.** Any record written just before a commit point that changes the bundle (recovery, `convert`) carries **two** MACs, `mac_old` and `mac_new`, over identical content, so it can be verified whichever bundle the owner unlocks with after a crash. The authenticated expected-core digest, not the generation by itself, decides which side of the commit the vault is on.
 
-**Write-ahead rule.** Any TPM index an operation will create is recorded in an authenticated journal record (handle, policy nonce, and both precomputed expected Names, pre-write and post-write) *before* it is defined. A later record for the same operation (e.g. "committing") replaces the earlier one and must carry the same index fields. A record naming an index that may exist is **never** replaced by a record naming a different index until that index is resolved. Resolved means confirmed absent, confirmed not ours, or deleted under 9.2b. The resolution procedure is **PENDING (SI-35)**.
+**Write-ahead rule.** Any TPM index an operation will create is recorded in an authenticated journal record (handle, policy nonce, and both precomputed expected Names, pre-write and post-write) *before* it is defined. A later record for the same operation (e.g. "committing") replaces the earlier one and must carry the same index fields. A record naming an index that may exist is **never** replaced by a record naming a different index until that index is resolved. Resolved means confirmed absent, confirmed not ours, or deleted under 9.2b. The resolution procedure is **approved for Milestone 5 (2026-10-06, D3)**: 9.1 (handles) and the 8.3 restart table; `NV_ReadPublic` absent means resolved, a foreign Name means resolved and not ours, and a journaled Name is deleted only under 9.2b.
 
 **Core-binding crash order (approved for Milestone 3).** `prepared` with the immutable `old_core_digest` and `old_keytable_digest` is durable before any target side effect. The target key-table identity (`target_created`) is durable before any key-table byte. After every target dependency is durable, `committing` with the exact `new_core_digest`, the header-temp identity and both MACs is durable before any header byte and before header replacement. For remote pre-commit rollback, `tracking_created` (with the tracking key-table temp identity) is durable before any tracking key-table byte. The tracking key table is then made final and durable, the complete tracking core is built, and `rollback_tracking` (with `tracking_core_digest` and the tracking header-temp identity) is durable before any tracking header byte. A directory-flush failure after header replacement keeps the journal and every old/new dependency as 8.5 requires.
 
@@ -1519,7 +1524,14 @@ filename, glob or generation number alone.
   it therefore requires a future reviewed format revision and is not a
   runtime-only addition to v1.
 - Develop against `swtpm`. A real TPM is used only behind `--tpm device`, and during development only with the owner's explicit authorization.
-- **PENDING (SI-18 / SI-22):** the exact public area (nameAlg, the full `TPMA_NV` value pre- and post-write, `dataSize`), the policy-digest construction, the pinned TPM dependencies and the session design. The proposal is salted HMAC sessions with parameter encryption that fail closed rather than weaken. The design and its trust assumptions are in `docs/SPEC_ISSUES.md`.
+- **Approved for Milestone 5 (2026-10-06; SI-18, SI-22, D1 to D3):**
+  - **Public area:** `nameAlg` SHA-256 (`0x000B`); attributes `0x00040004` before the first write and `0x20040004` after it (ordinary index, AUTHWRITE, AUTHREAD, WRITTEN after the write; every other bit clear, so DA protection is on); `dataSize` 97; `authPolicy` = `SHA-256(0^32 || u32_be(0x171) || A || B)` with `A = SHA-256(0^32 || u32_be(0x16B))` and `B = SHA-256("pvault/v1/policy-nonce" || tpm_policy_nonce)`.
+  - **Name:** `u16_be(0x000B) || SHA-256(u32_be(nvIndex) || u16_be(0x000B) || u32_be(attributes) || u16_be(32) || authPolicy || u16_be(97))`, 34 bytes; computed by pvault and compared with the TPM's. 9.2a and 9.2b compare the complete public area with this template.
+  - **Index data:** `u8(x = 2) || S2_wrapped[96]`.
+  - **Handles (SI-35 items 3 and 4):** a uniformly random handle in the owner range, probed with `NV_ReadPublic` (absent, `TPM_RC_HANDLE`, means free), at most 32 attempts, then "No free TPM NV handle was found." The journal record naming the handle is durable before `NV_DefineSpace`. `TPM_RC_NV_DEFINED` (a race): nothing was created; the normal rollback runs and a new journal is written; the journal's index fields are never rewritten. A definite TPM error: rollback. An unknown outcome (transport error, timeout, crash): stop and keep the journal; the index is resolved by Name later (8.3 restart table; `fsck` in Milestone 6).
+  - **Sessions (fail closed):** a transient ECC P-256 restricted decryption primary in the NULL hierarchy is the salting key; it is created with an **empty password session** (the NULL hierarchy's authorization is always empty; the session carries no secret). Salted HMAC sessions: `tpmKey` = that key, no bind, AES-128-CFB, SHA-256. pvault fixes the **per-command session attributes itself** and never relies on the TPM stack to reject a wrong combination: `NV_DefineSpace` (owner) decrypt; `NV_Write` decrypt; `NV_Read` encrypt; `NV_UndefineSpace` (owner) neither; `GetCapability` and `NV_ReadPublic` no session; `CreatePrimary` for the salting key and the H-2 EK an empty password session. One session per command, flushed by pvault exactly once. Any failure to create the key, start the session or set the attributes aborts the command; there is no fallback to a password session or to clear parameters.
+  - **What parameter encryption hides, and what stays public:** encrypted are the `auth` parameter of `NV_DefineSpace` (`tpm_auth`), the data of `NV_Write` (`x || S2_wrapped`) and the data returned by `NV_Read`. The owner authorization and `tpm_auth` are never sent: they key the session HMACs. Public on the transport: command and response codes, handles, sizes, offsets, session nonces and HMACs, the salting key's public area and encrypted salt, every `NV_ReadPublic` and `GetCapability` response (public area, Name, attributes, policy digest, TPM properties), and the EK public area. The handle, Name and policy nonce are also public in the header. Parameter encryption is verified with controlled emulator transport tests (F103). It defeats a passive observer of the TPM transport; it does **not** establish resistance to every active transport attacker: the salting key comes from an unauthenticated `CreatePrimary` response, and defeating an interposer needs EK-certificate verification, out of scope for v1.
+  - **Probe evidence (E1, emulator only):** `docs/M5_READINESS.md` 12.2.
 
 ### 9.2 Reads vs deletions
 
@@ -1547,7 +1559,7 @@ Defining and deleting owner-range indices is authorized by the **owner hierarchy
   - the storage hierarchy is enabled (`TPMA_STARTUP_CLEAR.shEnable` set);
   - the TPM is not in lockout (`TPMA_PERMANENT.inLockout` clear). While in lockout, commands authorized by anything other than platform or lockout authorization fail.
 
-  The exact capability checks and their timing are prepared for review before Milestone 5 (**PENDING SI-42**). If the SI-36 proposal is adopted, a fourth condition applies: the TPM identity must be computable without a prompt (endorsement hierarchy enabled, endorsement authorization empty, and the fixed H-2 ECC P-256 EK creatable). Because the proposed bound slots and `IDX` records **require** the identity token, the same condition also gates *creating* any bound index.
+  **Capability checks (approved for Milestone 5, 2026-10-06, D4):** read with `GetCapability(TPM_PROPERTIES)`: C1 `TPM_PT_PERMANENT` bit 0 (`ownerAuthSet`) clear; C2 `TPM_PT_STARTUP_CLEAR` bit 1 (`shEnable`) set; C3 `TPM_PT_PERMANENT` bit 9 (`inLockout`) clear; C4 `TPM_PT_STARTUP_CLEAR` bit 2 (`ehEnable`) set, `TPM_PT_PERMANENT` bit 1 (`endorsementAuthSet`) clear, and the H-2 EK creatable. Evaluated at `duress set` (refused unless all hold), in `status`, and on a duress match. **Unavailable duress is reported in `status` only, never during an unlock** (a warning there would reveal duress to a coercer). pvault builds the H-2 template itself from 8.1 and never uses a library EK helper (`tss-esapi` 7.7.0's builds the L-2 template). If the SI-36 proposal is adopted, a fourth condition applies: the TPM identity must be computable without a prompt (endorsement hierarchy enabled, endorsement authorization empty, and the fixed H-2 ECC P-256 EK creatable). Because the proposed bound slots and `IDX` records **require** the identity token, the same condition also gates *creating* any bound index.
 - **Decided N2 (2026-10-05):** bound `init`, bound recovery and `convert` to bound measure the identity before any journal is written, any index is defined or any file is created. If the measurement fails, the operation is refused and portable mode is offered explicitly:
   - `init`: "This computer's TPM identity cannot be established, so a bound vault cannot be created here. You can create a portable vault instead."
   - bound recovery: the same reason, offering `recover --to-portable`.
@@ -1676,6 +1688,10 @@ Mounted vault sessions on the device must be closed before step 1; K2 refuses to
    - Non-interactive input requires an explicit flag, `--secrets-stdin`. Secrets are then read from standard input, one per line, in prompt order.
    - Without the flag, a secret prompt on a non-terminal standard input is refused.
 7. No plaintext anywhere except the requested destination (7.9).
+8. **TPM C library (bound mode; recorded limitation, decided 2026-10-11 for Milestone 5).**
+   - `tpm2-tss` keeps authorization values, session keys, `S2_wrapped` and decrypted response bytes in its own heap and stack buffers and frees them without wiping (`docs/M5_READINESS.md` 15). This residue is accepted and documented for Milestone 5 (FAILURE_MODES: memory attacks). It does **not** mean that secret memory is wiped completely, and it does **not** authorize releasing bound mode, which still needs real-hardware validation.
+   - The library's logging (which at debug level writes session keys and parameters before encryption) is forced off by the `pvault` CLI before its first TPM operation: `TSS2_LOG=all+NONE`, `TSS2_LOGFILE` removed, whatever the environment asked for. There is no switch to turn it back on.
+   - The guarantee covers the `pvault` CLI. A program that uses `pvault-core` directly gets it only by calling `platform::quiet_tpm_stack` itself, while it has one thread, before its first TPM operation; the library does not call it.
 
 ---
 
@@ -1777,7 +1793,7 @@ Mounted vault sessions on the device must be closed before step 1; K2 refuses to
 | F83 | Old index re-created with an identical definition on a different TPM (second swtpm instance) | Never deleted (9.2b same-TPM rule); reported. Depends on the SI-36 mechanism |
 | F84 | Erase confirmation with a wrong basename or ID prefix; unrelated files in the vault directory | Refused; Erase removes only authenticated vault files and never the directory |
 | F85 | Release build with the `fault-injection` feature requested; inspect release artifacts | Build refused; no failpoint names present |
-| F91 (proposed, N2) | Bound `init`, bound recovery and `convert` to bound on a swtpm whose endorsement hierarchy is disabled, whose endorsement authorization is set, or that cannot create the H-2 EK | Refused before any journal, index or file; portable mode or `recover --to-portable` offered; vault directory and TPM unchanged |
+| F91 (adopted for Milestone 5, N2) | Bound `init`, bound recovery and `convert` to bound on a swtpm whose endorsement hierarchy is disabled, whose endorsement authorization is set, or that cannot create the H-2 EK | Refused before any journal, index or file; portable mode or `recover --to-portable` offered; vault directory and TPM unchanged |
 | F92 (proposed, N5) | `add` that would make the key table exceed 65,536 entries: a single file at the limit; a nested path whose new parent directories cross it; exactly 65,536 reached | Over-limit attempts are refused before any write; the vault directory is byte-for-byte unchanged, the generation is unchanged, and no temp or journal exists. Reaching exactly 65,536 succeeds. A decoded table with 65,537 entries is `KeyTableCorrupt` |
 | F93 | Card-file reader, format 1, per file: both roles accepted and the byte-exact `docs/FORMAT.md` vector; one changed byte anywhere (text, QR path, labels, date), a second card appended, a missing line, CRLF, a BOM, a `DOCTYPE` or entity, a file over 64 KiB, a link, a directory | Accepted files give their payload; everything else is refused with "This is not an unmodified pvault card file (format 1)." (or the size or file-type refusal) and nothing is used |
 | F94 | Pair validation: one card twice, two Card A, two Card B, roles swapped, different `vault_id`, different `set_id` | Each refused with its message before any Shamir operation |
@@ -1789,6 +1805,9 @@ Mounted vault sessions on the device must be closed before step 1; K2 refuses to
 | F100 | Acknowledgments by option (with and without a terminal) and by typed phrase; missing without a terminal; environment variables; card-file options on `list` | Accepted; exit 4 with nothing read or created; no variable accepted; exit 2 |
 | F101 | Destinations and records: same folder; FAT/exFAT/fuseblk and an ownership-ignored APFS image for a digital folder; an ownership-enforced second volume; a listed sync root; `cards.cbor` v1, v2 and a newer version | Exit 2; exit 6 before anything is created; accepted without the same-volume acknowledgment; non-exhaustive sync warning; v1 read and migrated to v2 by the first update, a newer version refused unchanged |
 | F102 | Card check after the commit (R5): no interactive terminal; Enter; `CHECK` after the card folder was removed and recreated; `CHECK` after a file was changed, swapped or removed | Not offered; skipped; passes (no `init` handle was open); fails with exit 1 and "The vault was created", vault unchanged, no file deleted |
+| F87 (adopted for Milestone 5, D3) | A handle defined by someone else between the `NV_ReadPublic` probe and `NV_DefineSpace` | `TPM_RC_NV_DEFINED`; nothing deleted; the setup rolls back and restarts with a new journal and handle; the foreign index is untouched |
+| F88 (adopted, D3; `init` part in Milestone 5, `fsck` part in Milestone 6) | An unknown `NV_DefineSpace` outcome (transport failure or crash after the command) | The journal is kept; `init` resume resolves the index by Name under 9.2b: a journaled Name on the same TPM is removed, an absent or foreign index is left and reported |
+| F103 (adopted for Milestone 5, 2026-10-06) | Parameter encryption, observed on a controlled emulator transport: the bytes of `NV_DefineSpace`, `NV_Write` and `NV_Read` recorded between pvault and `swtpm` | `tpm_auth`, `x || S2_wrapped` and the owner authorization never appear in the recorded bytes; negative cases with encryption deliberately disabled in a test build show them, proving the capture works; a session that cannot be salted or encrypted aborts the command. This does not establish resistance to every active transport attacker |
 
 **Destructive features (built after the review gate)**
 
@@ -1861,7 +1880,7 @@ Each milestone ends with `cargo fmt --check`, `cargo clippy -- -D warnings`, `ca
 | 2 | Shamir (0x11B field, published test vectors; implementation per SI-08), passphrases (7.3: generation, H_w and word-list check, H_c, collision rule), bounded secret input (7.6a), the custom-passphrase estimator child process (SI-51), wraps. No header or journal schema changes | F5, F6, F62; wordlist = 7,776; normalization tests (F75 normalization part); SI-51 section 9 tests that need no vault |
 | 3 | Formats: deterministic CBOR (4.4), header (core/slots, two MACs, caps and limits), chunked stream (version in AAD), key-table file with vault paths (7.8), journal schemas (8.1), locking (8.4 per SI-14), file-system support check (8.5), test-only failpoints | F7, F9 to F14, F56a, F58, F71, F73 (decode part), F74 (detection part), F76, F85 |
 | 4 | Cards (7.4a to 7.4c: payload, Base32, SVG QR, PNG input, card files, published vectors). Portable mode: init (with full card verification), add, list, get, rm with crash-safe ordering and secure `.pvpartial`; `docs/CLI.md` approved first | F15, F16, F20, F26 (init/add/rm), F33 (`get` part), F4 (portable), F50, F51, F61 (portable cards), F64, F65 (portable cards), F67, F70 (card records once SI-10 is approved), F72 (`get` part), F73, F74, F75, F78, F79. The `fsck` parts of F33 and F72 belong to Milestone 6 |
-| 5 | Bound mode via swtpm: policy-nonce index, precomputed and post-write Name, read rules (9.2a), ownership verification (9.2b), sessions (SI-22), duress setup (6.10) and availability (9.3) | F1 to F3, F17, F19, F30, F52, F59, F60, F61 and F65 (bound cards), F81 |
+| 5 | Bound mode via swtpm: policy-nonce index, precomputed and post-write Name, read rules (9.2a), ownership verification (9.2b), sessions (SI-22), duress setup (6.10) and availability (9.3) | F1 to F3, F17, F19, F30, F52, F59, F60, F61 and F65 (bound cards), F81; **amended 2026-10-06:** F87, F88 (`init` part), F91 and F103 (parameter encryption on a controlled emulator transport, with negative cases); before acceptance, a report on how the TPM C library (`tpm2-tss`) handles session secrets, for a separate decision. Release of bound mode additionally needs an owner-authorized real-hardware validation (none authorized yet) |
 | 6 | Recovery (both modes, and directly to portable), bundle rotation, write-ahead journal, dual-MAC transition records, full-share card verification, duress choices, `fsck`, `convert` | F8, F18, F21 to F29b, F31, F32, F26 (convert), F44 to F47, F53 to F55, F57, F63 (verify-card and recovery parts), F66, F68, F69, F80, F82, F83 |
 | 7 | Hardening: fuzz all targets 10+ min, memory locking with strict mode, timing measurements, draft docs, `cargo audit` | All tests that do not need mounting or gated features are green in CI (F1 to F33, F44 to F47, F50 to F55, F56a, F57 to F62, F63 except K2, F64 to F83, F85). F48 and F49 are gated (Milestones 9 and 10); F84 is gated (Milestone 9); F56b needs mounting (Milestone 11) |
 | **8** | **REVIEW GATE** for the `destructive/` features only. Agent stops. Human (and/or a second AI) reviews Sections 4, 6, 8, 9 and the code from Milestones 3 to 7. Agent writes `docs/REVIEW_8.md` listing every existing code path that deletes or overwrites anything (with the check that protects it) and the planned design of each gated feature, then waits for explicit approval | Human approval recorded |
@@ -1877,6 +1896,8 @@ Each milestone ends with `cargo fmt --check`, `cargo clippy -- -D warnings`, `ca
 | 18 | Release checklist: all tests green on 3 OSes, docs complete, `ASSUMPTIONS.md` matches Section 2, external review invited, signed release published | Human sign-off |
 
 **Status (2026-10-05):** Milestone 0 accepted. Milestone 0.5 closed. **Milestone 1 accepted** (commit `bd04bb4`; CI run 37254330640, every job green, including the native Rust 1.89 jobs on Linux, Windows and macOS, and `cargo-deny`). **Milestone 2 accepted** (commit `a099bb6`; CI run 37261091478, every job green). Its recorded limitations are in `docs/SPEC_ISSUES.md` 10.4 to 10.8: the estimator's accepted platform limits (Windows Job Object limits deferred), Windows console input that only compiles (interactive validation outstanding), and the normalization-version policy that blocks the Milestone 3 schema review. **Milestone 3 accepted (2026-10-05)** (commit `afa6a3f`; CI run 37391563815, all twelve jobs green, including the native Windows locality probe, the Rust 1.89 jobs, fuzz smoke, release checks and Unicode regeneration). Findings and acceptance record: `docs/SPEC_ISSUES.md` 10.11 and 10.12. Still open: the unverified W1/WO power-loss assumptions; ReFS, mounted VHD and real remote SMB coverage; Q1 did not discriminate local from remote in the observed tests.
+
+**Status (2026-10-06):** Milestone 4 implemented (commits through `b6baa13`; native CI run 37541676635 green) and **not accepted**: the Windows console checklist and the printed-card photo check are outstanding. **Exception E2** (author, 2026-10-06; `docs/SPEC_ISSUES.md`): Milestone 5 is being implemented while Milestone 4 remains unaccepted. D1 to D12 of `docs/M5_READINESS.md` are approved with the author's choices (section 13 of that file, as amended in `docs/SPEC_ISSUES.md`).
 
 ---
 

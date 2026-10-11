@@ -54,33 +54,34 @@ fn payload_round_trip_and_fields() {
 #[test]
 fn independent_payload_base32_and_qr_vector() {
     let all = records(include_str!("../../testdata/pvault_card.txt"));
-    assert_eq!(all.len(), 1);
-    let vector = &all[0];
+    // Portable Card A and (Milestone 5, D8) the bound card.
+    assert_eq!(all.len(), 2);
+    for vector in &all {
+        let payload = hex_field(vector, "payload");
+        let card = Card::parse(SecretBytes::take_from(&mut payload.clone()).unwrap()).unwrap();
+        assert_eq!(card.vault_id().as_slice(), hex_field(vector, "vault_id"));
+        assert_eq!(card.mode().byte().to_string(), field(vector, "mode"));
+        assert_eq!(card.set_id().as_slice(), hex_field(vector, "set_id"));
+        assert_eq!(card.x().to_string(), field(vector, "share_x"));
+        assert_eq!(
+            card.share().unwrap().y().expose_secret().as_slice(),
+            hex_field(vector, "share")
+        );
+        assert_eq!(
+            card.base32().expose_secret(),
+            field(vector, "base32").as_bytes()
+        );
 
-    let payload = hex_field(vector, "payload");
-    let card = Card::parse(SecretBytes::take_from(&mut payload.clone()).unwrap()).unwrap();
-    assert_eq!(card.vault_id().as_slice(), hex_field(vector, "vault_id"));
-    assert_eq!(card.mode().byte().to_string(), field(vector, "mode"));
-    assert_eq!(card.set_id().as_slice(), hex_field(vector, "set_id"));
-    assert_eq!(card.x().to_string(), field(vector, "share_x"));
-    assert_eq!(
-        card.share().unwrap().y().expose_secret().as_slice(),
-        hex_field(vector, "share")
-    );
-    assert_eq!(
-        card.base32().expose_secret(),
-        field(vector, "base32").as_bytes()
-    );
-
-    let (width, dark) = qr_matrix(card.payload()).unwrap();
-    assert_eq!(width.to_string(), field(vector, "qr_width"));
-    let mut packed = vec![0u8; dark.len().div_ceil(8)];
-    for (i, &module) in dark.iter().enumerate() {
-        if module {
-            packed[i / 8] |= 1 << (7 - i % 8);
+        let (width, dark) = qr_matrix(card.payload()).unwrap();
+        assert_eq!(width.to_string(), field(vector, "qr_width"));
+        let mut packed = vec![0u8; dark.len().div_ceil(8)];
+        for (i, &module) in dark.iter().enumerate() {
+            if module {
+                packed[i / 8] |= 1 << (7 - i % 8);
+            }
         }
+        assert_eq!(packed, hex_field(vector, "qr_bits"));
     }
-    assert_eq!(packed, hex_field(vector, "qr_bits"));
 }
 
 /// F93: card-file format 1 against the independent Python rendering, byte
@@ -88,19 +89,31 @@ fn independent_payload_base32_and_qr_vector() {
 #[test]
 fn independent_card_file_vector() {
     use sha2::{Digest, Sha256};
-    let vector = &records(include_str!("../../testdata/pvault_card.txt"))[0];
-    let file: &[u8] = include_bytes!("../../testdata/pvault_card_a.svg");
-    assert_eq!(field(vector, "file"), "pvault_card_a.svg");
-    assert_eq!(file.len().to_string(), field(vector, "file_len"));
-    assert_eq!(
-        Sha256::digest(file).as_slice(),
-        hex_field(vector, "file_sha256")
-    );
-    let payload = hex_field(vector, "payload");
-    let card = Card::parse(SecretBytes::take_from(&mut payload.clone()).unwrap()).unwrap();
-    let rendered = render_svg(&card, field(vector, "file_created")).unwrap();
-    assert_eq!(rendered.as_bytes(), file);
-    assert_eq!(parse_card_file(file).unwrap().payload().as_slice(), payload);
+    let all = records(include_str!("../../testdata/pvault_card.txt"));
+    let files: [(&str, &[u8]); 2] = [
+        (
+            "pvault_card_a.svg",
+            include_bytes!("../../testdata/pvault_card_a.svg"),
+        ),
+        (
+            "pvault_card_bound.svg",
+            include_bytes!("../../testdata/pvault_card_bound.svg"),
+        ),
+    ];
+    assert_eq!(all.len(), files.len());
+    for (vector, (name, file)) in all.iter().zip(files) {
+        assert_eq!(field(vector, "file"), name);
+        assert_eq!(file.len().to_string(), field(vector, "file_len"));
+        assert_eq!(
+            Sha256::digest(file).as_slice(),
+            hex_field(vector, "file_sha256")
+        );
+        let payload = hex_field(vector, "payload");
+        let card = Card::parse(SecretBytes::take_from(&mut payload.clone()).unwrap()).unwrap();
+        let rendered = render_svg(&card, field(vector, "file_created")).unwrap();
+        assert_eq!(rendered.as_bytes(), file);
+        assert_eq!(parse_card_file(file).unwrap().payload().as_slice(), payload);
+    }
 }
 
 /// F61: invalid payloads are refused; substitutions decode.

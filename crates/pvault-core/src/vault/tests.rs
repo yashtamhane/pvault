@@ -23,6 +23,9 @@ use crate::records::Settings;
 use crate::secrets::SecretBytes;
 use crate::store;
 
+#[cfg(all(target_os = "linux", feature = "tpm"))]
+mod bound;
+
 const PW: &[u8] = b"correct horse battery staple violin quantum harbor 9172";
 const FAST: Argon2Params = Argon2Params {
     m_kib: 262_144,
@@ -60,6 +63,8 @@ pub(crate) struct Script {
     /// An interactive run (terminal, no `--secrets-stdin`); only the
     /// optional card check after the commit asks for it.
     interactive: bool,
+    /// The last duress passphrase shown.
+    duress_words: Option<Vec<u8>>,
 }
 
 impl Script {
@@ -76,6 +81,7 @@ impl Script {
             entered_cards: Vec::new(),
             on_confirm: None,
             interactive: false,
+            duress_words: None,
         }
     }
 
@@ -118,7 +124,9 @@ impl Prompter for Script {
     fn card_text(&mut self, label: &str) -> Result<SecretBytes<PAYLOAD_LEN>, Error> {
         let dir = self.cards_dir.as_ref().ok_or(Error::InputEnded)?;
         // `wrong_card`: answer with the other card (valid, same set).
-        let suffix = if (label == "Card A") != self.wrong_card {
+        let suffix = if label == "Bound card" {
+            "bound.svg"
+        } else if (label == "Card A") != self.wrong_card {
             "card-a.svg"
         } else {
             "card-b.svg"
@@ -168,6 +176,13 @@ impl Prompter for Script {
     fn show_secret(&mut self, text: &str) -> Result<(), Error> {
         if !self.tty {
             return Err(Error::NeedsTerminal("no terminal in tests"));
+        }
+        // A duress passphrase is remembered and typed back next.
+        if let Some(rest) = text.split("Your duress passphrase:\n\n    ").nth(1) {
+            let w = rest.split('\n').next().unwrap().as_bytes().to_vec();
+            self.secrets.push_front(w.clone());
+            self.duress_words = Some(w);
+            return Ok(());
         }
         let words = text
             .split("Your passphrase:\n\n    ")
@@ -230,6 +245,10 @@ impl Fixture {
             card_a_png: None,
             card_b_png: None,
             estimate: &strong,
+            mode: crate::header::Mode::Portable,
+            card_dir: None,
+            card_png: None,
+            tpm: crate::tpm::TpmOptions::default(),
         }
     }
 
@@ -808,6 +827,7 @@ fn source_writers_are_blocked_on_windows() {
 }
 
 #[test]
+#[ignore = "starts processes: runs in its own test process (test_process)"]
 fn source_kinds_are_refused() {
     let f = Fixture::new().init();
     assert!(matches!(
@@ -821,6 +841,7 @@ fn source_kinds_are_refused() {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(matches!(f.add(&link, "l", false), Err(Error::SourceLink)));
         let fifo = f.root.join("fifo");
+        crate::test_process::assert_isolated();
         let st = std::process::Command::new("mkfifo")
             .arg(&fifo)
             .status()
@@ -972,11 +993,19 @@ fn bound_header_is_refused_before_the_passphrase() {
     let bytes = Header::build(&core, &sample_bound_slots(false), &key).unwrap();
     fs::write(f.vault.join("vault.hdr"), bytes).unwrap();
     let mut ui = Script::new(); // no secret available: none may be read
+    // Without TPM support: bound mode is refused (D10). With it: a TPM that
+    // cannot be reached is reported, also before any secret.
+    let nowhere = crate::tpm::TpmOptions {
+        target: crate::tpm::TpmTarget::Swtpm { port: 9 },
+        owner_auth_declared: false,
+    };
     for access in [Access::Read, Access::Write] {
-        assert!(matches!(
-            unlock(&f.vault, &mut ui, Some(&f.settings), access),
-            Err(Error::BoundVault)
-        ));
+        let r = super::unlock_with(&f.vault, &mut ui, Some(&f.settings), access, &nowhere);
+        if crate::tpm::supported() {
+            assert!(matches!(r, Err(Error::TpmUnavailable(_))), "{r:?}");
+        } else {
+            assert!(matches!(r, Err(Error::BoundVault)), "{r:?}");
+        }
     }
     let mut opts = f.opts();
     opts.cards_dir = f.cards.clone();
@@ -1050,7 +1079,13 @@ fn unsupported_file_system_refuses_mutations_only() {
     drop(s);
     assert_eq!(f.snapshot(), before, "nothing written");
     assert!(f.listing().ends_with("\ta\n"), "list works");
-    let (report, _) = super::status::status(&f.vault, Some(&f.settings), None).unwrap();
+    let (report, _) = super::status::status(
+        &f.vault,
+        Some(&f.settings),
+        None,
+        &crate::tpm::TpmOptions::default(),
+    )
+    .unwrap();
     assert!(report.contains("Generation:"));
     // A new vault is refused before its folder exists (the mock makes the
     // card folder FAT too, so the O3 card-folder refusal may come first).
@@ -1807,7 +1842,7 @@ fn card_check_after_commit() {
     // is reported; the vault and the files stay.
     let header = fs::read(f.vault.join("vault.hdr")).unwrap();
     let originals: Vec<Vec<u8>> = files.iter().map(|p| fs::read(p).unwrap()).collect();
-    let restore = |files: &[PathBuf; 2]| {
+    let restore = |files: &[PathBuf]| {
         for (p, b) in files.iter().zip(&originals) {
             fs::write(p, b).unwrap();
         }
@@ -1815,7 +1850,7 @@ fn card_check_after_commit() {
     let kt_path = f.vault.join("keytable.1.pv");
     let keytable = fs::read(&kt_path).unwrap();
     let restore_keytable = || fs::write(&kt_path, &keytable).unwrap();
-    type Damage = Box<dyn Fn(&[PathBuf; 2])>;
+    type Damage = Box<dyn Fn(&[PathBuf])>;
     let damages: [Damage; 4] = [
         Box::new(|f| {
             let mut b = fs::read(&f[0]).unwrap();
@@ -1871,4 +1906,102 @@ fn card_check_after_commit() {
         )
         .is_ok()
     );
+}
+
+/// D5 to D7 (portable): `duress set` needs a terminal and refuses while a tag
+/// is configured; a configured duress passphrase is inactive (a match is
+/// `Unlock failed.` and changes nothing); `disable` needs DISABLE DURESS;
+/// the N3 notice appears only for a custom passphrase that generated-word
+/// handling refuses.
+#[test]
+fn portable_duress_set_and_disable() {
+    let f = Fixture::new().init();
+    // No terminal.
+    let mut s = f.unlock(Access::Write, &mut Script::new()).unwrap();
+    assert!(matches!(
+        super::duress::set(&mut s, Some(&f.settings), &mut Script::new()),
+        Err(Error::NeedsTerminal(_))
+    ));
+    let mut ui = Script::new();
+    ui.tty = true;
+    super::duress::set(&mut s, Some(&f.settings), &mut ui).unwrap();
+    assert!(
+        !ui.said("generated-word handling refuses"),
+        "no N3 notice here"
+    );
+    let words = ui.duress_words.clone().unwrap();
+    assert_ne!(words, PW.to_vec());
+    drop(s);
+    let before = f.snapshot();
+    let mut ui = Script::new();
+    ui.secrets.push_back(words.clone());
+    assert!(matches!(
+        unlock(&f.vault, &mut ui, Some(&f.settings), Access::Write),
+        Err(Error::HeaderInvalid)
+    ));
+    assert_eq!(f.snapshot(), before, "inactive: nothing changed");
+    let (report, _) = super::status::status(
+        &f.vault,
+        Some(&f.settings),
+        None,
+        &crate::tpm::TpmOptions::default(),
+    )
+    .unwrap();
+    assert!(
+        report.contains(
+            "Duress:              configured (inactive: no duress action in this version)"
+        ),
+        "{report}"
+    );
+    // Already configured.
+    let mut s = f.unlock(Access::Write, &mut Script::new()).unwrap();
+    let mut ui = Script::new();
+    ui.tty = true;
+    assert!(matches!(
+        super::duress::set(&mut s, Some(&f.settings), &mut ui),
+        Err(Error::DuressConfigured)
+    ));
+    // Disable: declined, then confirmed.
+    let mut ui = Script::new().confirm(&[false]);
+    ui.tty = true;
+    assert!(matches!(
+        super::duress::disable(&mut s, Some(&f.settings), &mut ui),
+        Err(Error::NotConfirmed(_))
+    ));
+    let mut ui = Script::new().confirm(&[true]);
+    ui.tty = true;
+    super::duress::disable(&mut s, Some(&f.settings), &mut ui).unwrap();
+    drop(s);
+    let mut ui = Script::new();
+    ui.secrets.push_back(words);
+    assert!(unlock(&f.vault, &mut ui, Some(&f.settings), Access::Read).is_err());
+    assert!(f.unlock(Access::Read, &mut Script::new()).is_ok());
+}
+
+/// D7: the N3 notice for a custom passphrase that generated-word handling
+/// refuses (over 1,024 bytes after NFKC), at `duress set` and at the duress
+/// step of an interactive `init`.
+#[test]
+fn n3_notice_is_conditional() {
+    let long: Vec<u8> = "\u{FDFA}".repeat(40).into_bytes();
+    assert!(passphrase::handle_custom(&long).is_ok());
+    assert!(passphrase::handle_words(&long).is_err());
+    let f = Fixture::new();
+    let mut ui = Script::new().confirm(&[true]);
+    (ui.tty, ui.interactive) = (true, true);
+    ui.secrets
+        .extend([long.clone(), long.clone(), long.clone()]);
+    ui.cards_dir = Some(f.cards.clone());
+    super::init::init(&f.opts(), &f.settings, &mut ui).unwrap();
+    assert!(
+        ui.said("generated-word handling refuses"),
+        "init duress step"
+    );
+    assert!(ui.duress_words.is_some());
+    // The duress step is not offered without an interactive terminal.
+    let g = Fixture::new();
+    let mut ui = Script::pw(3);
+    ui.cards_dir = Some(g.cards.clone());
+    super::init::init(&g.opts(), &g.settings, &mut ui).unwrap();
+    assert!(!ui.said("SET DURESS"));
 }
