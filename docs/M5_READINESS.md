@@ -769,16 +769,90 @@ must still decide; "approve" means the recommendation can be taken as is.
 Starting Milestone 5 itself still needs Milestone 4 acceptance (both manual
 gates) or a new, explicit exception (section 1).
 
-## 14. Implementation under E2 (2026-10-06 to 2026-10-11; commit `dab6264`)
+## 14. Implementation under E2 (2026-10-06 to 2026-10-11; commits `dab6264` and `c4a4480`)
 
 Milestone 5 is implemented under exception E2 (`docs/SPEC_ISSUES.md`),
 against the approved D1 to D12 and the acceptance-plan amendment. **Neither
 Milestone 4 nor Milestone 5 is accepted**; both Milestone 4 manual gates
 remain outstanding; no real TPM was accessed (development on `swtpm` only).
 
-**Commit and native CI:** committed as `dab6264` (2026-10-11). Native CI
-run 38154441494 did not start: GitHub refused every job for an account
-billing problem, so no native CI result exists for Milestone 5 yet.
+**Commit and native CI:** committed as `dab6264` (2026-10-11). Its first
+native CI run (38154441494) did not start: GitHub refused every job for an
+account billing problem. After the repository was made public, the re-run
+(38155611115, attempt 2, commit `0af6cf1`) passed 11 of 12 jobs; the fuzz
+smoke job failed at its seed step ("Failed to find tss2-sys library"),
+because the seed test builds `pvault-core` with its default features, which
+include `tpm` on Linux, and that job did not install `tpm2-tss`. Commit
+`c4a4480` installs `libtss2-dev` in that job, as the release-check job
+already did; no test, assertion or timing limit changed.
+
+**Native CI evidence (run 38157453235, commit `c4a44806f7b0`, 2026-10-11:
+all 12 jobs succeeded).**
+<https://github.com/yashtamhane/pvault/actions/runs/38157453235>. Read from
+the job logs, not only the job status. Counts come from each job's main
+`cargo test --workspace --locked` step; stable and Rust 1.89 gave identical
+counts on each operating system.
+
+| Platform | Shared-process libtest: passed / failed / ignored | Isolated tests passed in their own process | Substantive libtest tests | Scenario suites: passed / skipped |
+| --- | --- | --- | --- | --- |
+| Linux (ubuntu-latest, x86_64) | 235 / 0 / 39 | 33 | 266 | 17 / 2 |
+| macOS (macos-latest) | 235 / 0 / 19 | 13 | 246 | 14 / 2 |
+| Windows (windows-latest) | 226 / 0 / 15 | 9 | 233 | 12 / 2 |
+
+- **No double counting:** the shared-process "passed" count includes the
+  runner (`test_process::tests_that_start_processes_run_in_their_own_process`),
+  and the isolated count includes the completeness check
+  (`test_process::the_isolated_set_is_complete`). Neither is a substantive
+  test, so substantive = shared passed − 1 + isolated − 1. The isolated tests
+  appear in the shared "ignored" count, not in its "passed" count. Scenario
+  suites are a separate test binary and are not in the libtest counts.
+- **Isolated tests:** the "Isolated process tests ran" step printed the list
+  on every operating system (Linux 33: the 20 TPM emulator tests, 4
+  signal-restoration, 6 store crash, the lock-holder test, the `mkfifo`
+  test and the completeness check; macOS 13, without the emulator tests;
+  Windows 9, without the emulator and Unix signal tests), and on Linux the
+  required emulator names were present. Both Linux test jobs installed
+  `swtpm` 0.7.3 and `tpm2-tss` 4.0.1 with `PVAULT_TEST_REQUIRE_SWTPM=1`, so
+  the emulator tests could not skip; no "swtpm is not installed" line
+  appears.
+- **The other ignored tests** (6 per platform) are not skipped coverage:
+  helper processes started by their tests (`lock_holder_child`,
+  `crash_child`, `stdin_helper`, and on Unix `signal_helper_reads_from_pty`),
+  on Windows the drive-mapping probe instead (run by the Windows locality
+  step: 2 passed), the fuzz seeds (run by the fuzz smoke job) and the manual
+  QR measurement.
+- **Scenario skips:** the two suites skipped in the main step,
+  `fat_exfat_images` and `ownership_ignored_mounts_are_refused`, run in the
+  dedicated image step (below).
+- **Native-name coverage** (Linux and Windows): 1 unit test and 1 scenario
+  suite each, no skips. **Benches** (`--benches`, a rerun): Linux 196,
+  macOS 196, Windows 190 passed.
+- **Other jobs:** rustfmt; cargo-deny 0.20.2 (advisories, bans, licenses,
+  sources pass for the product and the fuzz workspace; the binary's SHA-256
+  checked; two `duplicate` warnings, as at `b6baa13`); Unicode table
+  regeneration (no diff); `swtpm` smoke test (0.7.3); release build checks
+  (F85: the `fault-injection` release build refused by its
+  `compile_error!`, the release build succeeds, no failpoint name in the
+  artifacts); fuzz smoke (seed test, then 60 s per target for all five
+  targets, no crash).
+
+**Dedicated image results (run 38157453235, `PVAULT_TEST_REQUIRE_IMAGES`).**
+
+| Platform | Images | Result |
+| --- | --- | --- |
+| Linux | Loopback `vfat`, `exfat` (kernel) and exFAT through FUSE (`fuseblk`) | `fat_exfat_images` passed: export and paper and digital card folders refused (exit 6) on each; the `fuseblk` vault refused (no stable file identity). `ownership_ignored_mounts_are_refused` skipped (macOS only) |
+| macOS | `hdiutil` FAT32, exFAT; APFS with ownership ignored and enforced | Both suites passed; `fat_exfat_images` with its `fuseblk` part skipped (Linux only) |
+| Windows | `diskpart` VHDX, FAT32 and exFAT | `fat_exfat_images` passed (vault refused, no stable file identity; export and card folders refused, exit 6), its `fuseblk` part skipped (Linux only); the ownership suite skipped (macOS only) |
+
+**Not covered by this run:** real TPM hardware (bound mode is tested only on
+`swtpm`; real-hardware validation stays required before any bound-mode
+release); bound mode outside Linux (refused there by design); the Milestone
+4 manual gates; native Linux on ARM (the arm64 runs were local, in a
+container). The recorded limitations stay open: E1 (its test passed
+natively here, which does not show that it cannot recur under load), V3's
+unknown original cause, the runner's single process-start window (V2), the
+accepted `tpm2-tss` memory limitation (15), and the open licensing questions
+in `THIRD_PARTY_NOTICES.md`.
 
 **Code (by area):**
 
@@ -858,9 +932,7 @@ working tree, fresh build directories and new log names. Environments:
 - **Linux x86_64 (emulated):** an amd64 container under emulation on the
   same Mac; `swtpm` runs with its seccomp filter off (a wrapper in that
   container only, because the emulator rejects the filter). This is **not**
-  native CI: the GitHub CI workflow (with the `swtpm` steps) has produced no
-  result for Milestone 5; run 38154441494 for `dab6264` was not started
-  (account billing).
+  native CI; the native results are above (run 38157453235).
 
 Distinct tests, one complete run each:
 
