@@ -56,6 +56,13 @@ pub fn has_terminal() -> bool {
     imp::has_terminal()
 }
 
+/// Clears the terminal screen and, where the terminal supports it, its
+/// scrollback, after a shown secret (best effort; 7.4b remnants). Never
+/// writes control sequences to a console that would print them literally.
+pub fn clear_screen() {
+    imp::clear_screen();
+}
+
 #[cfg(unix)]
 #[allow(unsafe_code)]
 mod imp {
@@ -217,6 +224,12 @@ mod imp {
         tty.flush().map_err(InputError::Io)
     }
 
+    /// Erase display, erase scrollback, cursor home (ECMA-48 ED 2, ED 3
+    /// and CUP), interpreted by Unix terminals.
+    pub(super) fn clear_screen() {
+        let _ = show("\x1b[2J\x1b[3J\x1b[H");
+    }
+
     pub(super) fn read_hidden<T>(
         prompt: &str,
         read: impl FnOnce(&mut dyn ByteSource) -> Result<T, InputError>,
@@ -289,8 +302,10 @@ mod imp {
         CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::Console::{
-        ENABLE_ECHO_INPUT, FlushConsoleInputBuffer, GetConsoleMode, ReadConsoleW,
-        SetConsoleCtrlHandler, SetConsoleMode,
+        CONSOLE_SCREEN_BUFFER_INFO, COORD, ENABLE_ECHO_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        FillConsoleOutputAttribute, FillConsoleOutputCharacterW, FlushConsoleInputBuffer,
+        GetConsoleMode, GetConsoleScreenBufferInfo, ReadConsoleW, SetConsoleCtrlHandler,
+        SetConsoleCursorPosition, SetConsoleMode,
     };
     use windows_sys::core::BOOL;
     use zeroize::Zeroizing;
@@ -455,6 +470,58 @@ mod imp {
             .map_err(InputError::Io)
     }
 
+    /// The classic console (`conhost`) prints control sequences literally
+    /// unless virtual-terminal processing is on for its output handle. So:
+    /// turn it on for the sequences and restore the previous mode; where it
+    /// cannot be turned on, overwrite the whole screen buffer (which holds
+    /// the console's scrollback) through the console API instead.
+    pub(super) fn clear_screen() {
+        let Ok(conout) = open("CONOUT$") else {
+            return;
+        };
+        let mut out = File::from(conout);
+        let handle = out.as_raw_handle() as HANDLE;
+        let mut mode = 0u32;
+        // SAFETY: `handle` is an open console output handle and `mode` is
+        // writable.
+        if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+            return;
+        }
+        // SAFETY: as above; only an output mode flag changes.
+        if unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) } != 0 {
+            let _ = out.write_all(b"\x1b[2J\x1b[3J\x1b[H");
+            let _ = out.flush();
+            // SAFETY: restores the mode read above on the same handle.
+            unsafe { SetConsoleMode(handle, mode) };
+        } else {
+            fill_blank(handle);
+        }
+    }
+
+    /// Blanks every cell of the console screen buffer and homes the cursor.
+    fn fill_blank(handle: HANDLE) {
+        let mut info = core::mem::MaybeUninit::<CONSOLE_SCREEN_BUFFER_INFO>::uninit();
+        // SAFETY: `handle` is an open console output handle; `info` is
+        // writable and initialized on success.
+        if unsafe { GetConsoleScreenBufferInfo(handle, info.as_mut_ptr()) } == 0 {
+            return;
+        }
+        // SAFETY: the call above succeeded.
+        let info = unsafe { info.assume_init() };
+        let width = u32::try_from(info.dwSize.X).unwrap_or(0);
+        let height = u32::try_from(info.dwSize.Y).unwrap_or(0);
+        let cells = width.saturating_mul(height);
+        let origin = COORD { X: 0, Y: 0 };
+        let mut written = 0u32;
+        // SAFETY: `handle` is an open console output handle; the counts stay
+        // within the buffer the console reported; `written` is writable.
+        unsafe {
+            FillConsoleOutputCharacterW(handle, u16::from(b' '), cells, origin, &mut written);
+            FillConsoleOutputAttribute(handle, info.wAttributes, cells, origin, &mut written);
+            SetConsoleCursorPosition(handle, origin);
+        }
+    }
+
     /// Echo off and pending input discarded (EchoOff), then the prompt, then
     /// the read. The console buffer belongs to this prompt and is wiped when
     /// it is dropped.
@@ -510,6 +577,8 @@ mod imp {
     pub(super) fn show(_text: &str) -> Result<(), InputError> {
         Err(InputError::NoTerminal)
     }
+
+    pub(super) fn clear_screen() {}
 
     pub(super) fn has_terminal() -> bool {
         false

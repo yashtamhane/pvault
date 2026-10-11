@@ -91,6 +91,10 @@ pub enum InputError {
     /// `--secrets-stdin` was given, but stdin is a terminal, where echo
     /// cannot be controlled.
     StdinIsTerminal,
+    /// A secret would be read without `--secrets-stdin` while standard input
+    /// is not a terminal (redirected from a file or a pipe). Refused: spec
+    /// 10 item 6, `docs/CLI.md` 2.
+    StdinNotTerminal,
     /// The console delivered invalid UTF-16 (a lone surrogate).
     InvalidUtf16,
     /// Reading failed.
@@ -107,6 +111,9 @@ impl fmt::Display for InputError {
             ),
             Self::StdinIsTerminal => f.write_str(
                 "--secrets-stdin reads from a pipe or file. Standard input is a terminal, so type the secret at the prompt instead.",
+            ),
+            Self::StdinNotTerminal => f.write_str(
+                "Standard input is redirected. pvault reads secrets from it only with --secrets-stdin; otherwise run it with standard input on the terminal.",
             ),
             Self::InvalidUtf16 => f.write_str("The console delivered invalid text."),
             Self::Io(e) => write!(f, "Reading input failed: {e}"),

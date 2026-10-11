@@ -111,7 +111,7 @@ from environment variables, and no option or variable for them exists (F79).
 | --- | --- | --- |
 | Terminal, hidden | Default | Echo off; restored on normal return, error, Ctrl-C, Ctrl-Break, SIGINT, SIGTERM, SIGHUP, SIGQUIT and window close. At most 1,024 raw bytes per line; a line ends at the first LF, and one CR before it is removed (SI-51 section 3) |
 | Standard input | Only with the global `--secrets-stdin` | Standard input must not be a terminal (refused if it is). Secrets are read **one complete line each** (terminator required), in the order listed for each command in section 6. A card's text is one line holding exactly 216 symbols (separators allowed), validated as a whole line; more or fewer symbols reject it. pvault reads exactly the lines it needs and nothing more |
-| Standard input without `--secrets-stdin` | Never | A secret prompt on a non-terminal standard input is refused |
+| Standard input without `--secrets-stdin` | Never | A secret prompt on a non-terminal standard input is refused, **also when a terminal device exists** (the terminal is used only when standard input is the terminal too). Commands that read secrets (`init`, `add`, `list`, `get`, `rm`, `duress`) refuse before anything is read or created: "Standard input is redirected. pvault reads secrets from it only with --secrets-stdin; otherwise run it with standard input on the terminal." (exit 6). Enforced from 2026-10-11 after Windows checklist step 9 found it missing (it was missing on every platform); message approved by the author (2026-10-11) |
 
 **Card text typed at the terminal.** A printed card shows its text on 7
 lines, so the hidden card prompt accepts one or more lines. Input is read and
@@ -173,7 +173,12 @@ treated as declined (8.3: "non-interactive operation … leaves … blocked").
 device. Without a terminal, generated mode is refused (use `--custom` with
 `--secrets-stdin`). After the owner presses Enter, pvault clears the screen
 on a best-effort basis; terminal scrollback, logs and recordings may still
-hold it (7.4b remnants). **Recovery-card text is never displayed** (decided
+hold it (7.4b remnants). On Windows the classic console (`conhost`) prints
+control sequences literally unless virtual-terminal processing is on, so
+pvault turns it on for the clearing sequences and restores the previous
+mode; where it cannot, it blanks the whole console screen buffer through the
+console API. Raw control sequences are never printed (fixed 2026-10-11 after
+the Windows checklist showed `←[2J←[3J←[H`). **Recovery-card text is never displayed** (decided
 2026-10-05); cards exist only as files. Card Base32 may be **typed** back,
 hidden, for verification.
 

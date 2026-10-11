@@ -3,7 +3,7 @@
 //! The binary is a one-line wrapper around [`main`], so the crash tests in
 //! `pvault-tests` can run the same CLI built with `fault-injection`.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -247,7 +247,9 @@ fn code(e: &Error) -> u8 {
         | Error::DuressUnavailable(_) => 6,
         Error::TpmOwnerAuthRequired | Error::DuressConfigured | Error::TpmIndexElsewhere(_) => 4,
         Error::TpmDefineUnknown => 5,
-        Error::Input(InputError::NoTerminal | InputError::StdinIsTerminal) => 6,
+        Error::Input(
+            InputError::NoTerminal | InputError::StdinIsTerminal | InputError::StdinNotTerminal,
+        ) => 6,
         Error::ForceRefused | Error::SameCardFolder => 2,
         Error::Cancelled => 7,
         _ => 1,
@@ -290,6 +292,10 @@ fn fail(e: &Error, typed: Option<&str>) -> ExitCode {
 struct Owner {
     stdin: Option<StdinSecrets>,
     tty: bool,
+    /// Whether standard input is a terminal. Without `--secrets-stdin`, a
+    /// secret prompt on a non-terminal standard input is refused (spec 10
+    /// item 6), even when a terminal device exists.
+    stdin_terminal: bool,
 }
 
 impl Owner {
@@ -314,6 +320,9 @@ impl Prompter for Owner {
         if !self.tty {
             return Err(Error::Input(InputError::NoTerminal));
         }
+        if !self.stdin_terminal {
+            return Err(Error::Input(InputError::StdinNotTerminal));
+        }
         terminal::read_secret(prompt).map_err(|e| match e {
             InputError::Cancelled => Error::Cancelled,
             e => Error::Input(e),
@@ -332,6 +341,9 @@ impl Prompter for Owner {
         }
         if !self.tty {
             return Err(Error::Input(InputError::NoTerminal));
+        }
+        if !self.stdin_terminal {
+            return Err(Error::Input(InputError::StdinNotTerminal));
         }
         let prompt = format!("{label}: type the card text (hidden; it may span lines): ");
         let result = terminal::read_hidden(&prompt, |src| {
@@ -389,7 +401,7 @@ impl Prompter for Owner {
         terminal::show(&format!("\n{text}\n")).map_err(Error::Input)?;
         terminal::read_visible("").map_err(Error::Input)?;
         // Best effort: clear the screen and scrollback (7.4b remnants).
-        let _ = terminal::show("\x1b[2J\x1b[3J\x1b[H");
+        terminal::clear_screen();
         Ok(())
     }
 
@@ -439,8 +451,29 @@ fn estimate(
     Ok((e.band(), feedback))
 }
 
+/// Whether the command reads a secret (a passphrase, card text or the TPM
+/// owner authorization) in some branch.
+fn reads_secrets(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Init { .. }
+            | Command::Duress { .. }
+            | Command::Add { .. }
+            | Command::List { .. }
+            | Command::Get { .. }
+            | Command::Rm { .. }
+    )
+}
+
 fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
     let tty = terminal::has_terminal() && !test_without_terminal();
+    let stdin_terminal = std::io::stdin().is_terminal();
+    // Spec 10 item 6 (`docs/CLI.md` 2): without --secrets-stdin, a secret is
+    // never read while standard input is redirected, even when a terminal
+    // device exists; refused before anything is read or created.
+    if !cli.secrets_stdin && tty && !stdin_terminal && reads_secrets(&cli.command) {
+        return fail(&Error::Input(InputError::StdinNotTerminal), None);
+    }
     let stdin = if cli.secrets_stdin {
         match StdinSecrets::open() {
             Ok(s) => Some(s),
@@ -449,7 +482,11 @@ fn run(cli: Cli, dumps: Option<CoreDumpProtection>) -> ExitCode {
     } else {
         None
     };
-    let mut ui = Owner { stdin, tty };
+    let mut ui = Owner {
+        stdin,
+        tty,
+        stdin_terminal,
+    };
     let tpm_opts = TpmOptions {
         target: cli.tpm.clone().unwrap_or(TpmTarget::Device),
         owner_auth_declared: cli.tpm_owner_auth,

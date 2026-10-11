@@ -855,6 +855,45 @@ Terminal), what you typed or pasted, what was shown, and the exit code.
 Every new-vault `init` in steps 1 to 15 needs `--mode portable --cards paper
 --cards-dir <scratch>\cards` (SI-52 R1; `--cards` has no default).
 
+**Partial attempt, 2026-10-11 (not passed).** Performed by the author at
+commit `2135a1f` on Windows 11 25H2, classic `conhost` only. Recorded results:
+
+| Step | Result |
+| --- | --- |
+| 2 (Ctrl-C at a hidden prompt) | As expected: `%ERRORLEVEL%` -1073741510; echo restored |
+| 9 (input redirected from a file, no `--secrets-stdin`) | **Failed.** `pvault list <vault>` with standard input from an empty file showed `Passphrase:` instead of exiting 6; cancelled with Ctrl-C |
+| 10 (`--secrets-stdin` from the console) | As expected: refused at once, exit 6 |
+| 15 (Ctrl-Z then Enter at a hidden prompt) | As expected: refused as input, exit 1; echo restored |
+| Digital `init` and a passphrase unlock (part of 16) | Exit 0 |
+| Clearing after the generated passphrase (steps 1 and 16) | **Failed.** The console printed `←[2J←[3J←[H` literally; the passphrase stayed on screen |
+
+Not yet run or not recorded: Windows Terminal, and every other step. **Both
+failures were defects on all platforms or on Windows, not test errors:**
+
+- **Step 9:** the CLI checked only whether a terminal device exists, so a
+  redirected standard input was ignored and the secret was read from the
+  console, contrary to spec 10 item 6 and `docs/CLI.md` 2. This was also true
+  on Unix; the scenario tests only simulated "no terminal" and never ran a
+  redirected standard input with a terminal present. **Fix (committed with
+  this record; message approved by the author):** commands that read secrets refuse before anything
+  is read or created (exit 6), and each secret prompt checks again; a new
+  scenario (`redirected_stdin_needs_secrets_stdin`) covers `list` and `init`
+  with a terminal present, and fails within 2 seconds without the fix
+  (negative control). Two pty scenarios that started the CLI with standard
+  input on `/dev/null` now give it the terminal, as an interactive owner has.
+- **Screen clearing:** the classic console prints control sequences literally
+  unless virtual-terminal processing is on. **Fix (committed with this
+  record):** on
+  Windows the clearing turns that mode on and restores it, or blanks the
+  screen buffer through the console API when it cannot; no automated
+  Windows console test exists (CI has no console), so this needs the manual
+  re-test.
+
+**Next:** once native CI passes on the fix commit, rerun the whole checklist
+on that commit (both terminals), because a gate result must come from one
+build. The gate stays **incomplete and not passed** until then; the
+printed-card photo check (14a) also stays outstanding.
+
 ### 14a. Printed-card photo check (manual acceptance gate for paper cards; prepared, not performed)
 
 This gate covers paper cards only: it shows that printed cards scan from

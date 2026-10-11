@@ -87,6 +87,11 @@ fn main() -> ExitCode {
             "native_termination_and_cancellation",
             native_termination_and_cancellation,
         ),
+        #[cfg(unix)]
+        (
+            "redirected_stdin_needs_secrets_stdin",
+            redirected_stdin_needs_secrets_stdin,
+        ),
         ("init_crash_at_each_step", init_crash_at_each_step),
         ("add_crash_at_each_step", add_crash_at_each_step),
         ("replace_crash_at_each_step", replace_crash_at_each_step),
@@ -1279,6 +1284,102 @@ fn image_cards(label: &str, base: &Path) {
 }
 
 /// O2 (2026-10-06), `docs/CLI.md` 3, on the real CLI with a terminal and no
+/// Spec 10 item 6 (`docs/CLI.md` 2; Windows checklist step 9): without
+/// `--secrets-stdin`, a command that reads secrets is refused (exit 6) when
+/// standard input is redirected, even with a terminal present: no prompt is
+/// shown, nothing is read and nothing is created. With standard input on the
+/// terminal the same command prompts as usual.
+#[cfg(unix)]
+fn redirected_stdin_needs_secrets_stdin() {
+    let env = Env::new();
+    env.init(None).expect(0, "init");
+    let fresh = env.root().join("fresh");
+    let cards = env.root().join("fresh-cards");
+    std::fs::create_dir(&cards).unwrap();
+    let redirected = |args: Vec<OsString>, what: &str| {
+        let tty = pty::open();
+        let input = env.root().join("empty-input");
+        std::fs::write(&input, b"").unwrap();
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(&args)
+            .env(CHILD_ENV, "1")
+            .env("PVAULT_CONFIG_DIR", env.root().join("settings"))
+            .env_remove("PVAULT_FAILPOINT")
+            .env_remove("PVAULT_TEST_NO_TERMINAL")
+            .stdin(Stdio::from(std::fs::File::open(&input).unwrap()))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        pty::make_controlling(&mut cmd, &tty.slave);
+        let mut child = cmd.spawn().unwrap();
+        let screen = pty::Screen::start(&tty.master);
+        // Bounded: a prompt on the terminal, or no exit within 60 s, means
+        // the command was not refused (it would wait for input forever).
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while child.try_wait().unwrap().is_none() {
+            if screen.text().contains("assphrase") || Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{what}: not refused; terminal: {}", screen.text());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let out = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(6), "{what}: {stderr}");
+        assert!(
+            stderr.contains("Standard input is redirected."),
+            "{what}: {stderr}"
+        );
+        // Give any terminal output time to arrive, then require none.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !screen.text().contains("assphrase"),
+            "{what}: a prompt was shown: {}",
+            screen.text()
+        );
+        drop(tty);
+    };
+    redirected(vec![arg("list"), arg(&env.vault())], "list");
+    redirected(
+        vec![
+            arg("init"),
+            arg(&fresh),
+            arg("--mode"),
+            arg("portable"),
+            arg("--cards"),
+            arg("paper"),
+            arg("--cards-dir"),
+            arg(&cards),
+        ],
+        "init",
+    );
+    assert!(!fresh.exists(), "init created nothing");
+    assert_eq!(
+        std::fs::read_dir(&cards).unwrap().count(),
+        0,
+        "no card file"
+    );
+    // `status` reads no secret, so a redirected standard input is fine.
+    let tty = pty::open();
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args([arg("status"), arg(&env.vault())])
+        .env(CHILD_ENV, "1")
+        .env("PVAULT_CONFIG_DIR", env.root().join("settings"))
+        .env_remove("PVAULT_FAILPOINT")
+        .env_remove("PVAULT_TEST_NO_TERMINAL")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    pty::make_controlling(&mut cmd, &tty.slave);
+    let out = cmd.output().unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "status: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// `--secrets-stdin` (Unix): end of input (Ctrl-D) at the hidden passphrase
 /// prompt is cancellation, exit 7; Ctrl-C is native termination by SIGINT
 /// (no pvault exit code). Echo is off at the prompt; its restoration is
@@ -1291,12 +1392,14 @@ fn native_termination_and_cancellation() {
     for (key, name) in [(4u8, "Ctrl-D"), (3u8, "Ctrl-C")] {
         let tty = pty::open();
         let mut cmd = Command::new(std::env::current_exe().unwrap());
+        // Interactive, as an owner at a terminal: standard input is the
+        // terminal itself (a redirected one is refused, spec 10 item 6).
         cmd.args([arg("list"), arg(&env.vault())])
             .env(CHILD_ENV, "1")
             .env("PVAULT_CONFIG_DIR", env.root().join("settings"))
             .env_remove("PVAULT_FAILPOINT")
             .env_remove("PVAULT_TEST_NO_TERMINAL")
-            .stdin(Stdio::null())
+            .stdin(Stdio::from(tty.slave.try_clone().unwrap()))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         pty::make_controlling(&mut cmd, &tty.slave);
@@ -1752,12 +1855,13 @@ fn digital_card_check_after_commit() {
         let args = env.digital_args(&ACK);
         let tty = pty::open();
         let mut cmd = Command::new(std::env::current_exe().unwrap());
+        // Interactive: standard input is the terminal (spec 10 item 6).
         cmd.args(&args)
             .env(CHILD_ENV, "1")
             .env("PVAULT_CONFIG_DIR", env.root().join("settings"))
             .env_remove("PVAULT_FAILPOINT")
             .env_remove("PVAULT_TEST_NO_TERMINAL")
-            .stdin(Stdio::null())
+            .stdin(Stdio::from(tty.slave.try_clone().unwrap()))
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         pty::make_controlling(&mut cmd, &tty.slave);
