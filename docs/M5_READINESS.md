@@ -16,8 +16,9 @@ manual same-volume digital-delivery check passed on macOS
 (`docs/M4_READINESS.md` 17). Both manual acceptance gates are **outstanding**:
 the Windows console checklist (`docs/M4_READINESS.md` 14, including digital
 steps 16 to 20b) and the printed-card photo check (14a, paper delivery only).
-The uncommitted Milestone 4 evidence and manual-test records in
-`docs/M4_READINESS.md` and `docs/SPEC_ISSUES.md` are untouched by this review.
+The Milestone 4 evidence and manual-test records in `docs/M4_READINESS.md`
+and `docs/SPEC_ISSUES.md` were not changed by this review (they were later
+committed together with Milestone 5, in `dab6264`).
 
 Sources: `CLAUDE.md`; `PVAULT_BUILD_SPEC.md` sections 0, 1, 5.2, 5.5 to 5.7,
 6.10, 7.4a to 7.4d, 7.6, 8.1 to 8.5, 9.1 to 9.3, 9.6, 11, 13, 15 and 16;
@@ -768,12 +769,16 @@ must still decide; "approve" means the recommendation can be taken as is.
 Starting Milestone 5 itself still needs Milestone 4 acceptance (both manual
 gates) or a new, explicit exception (section 1).
 
-## 14. Implementation under E2 (2026-10-06; uncommitted)
+## 14. Implementation under E2 (2026-10-06 to 2026-10-11; commit `dab6264`)
 
 Milestone 5 is implemented under exception E2 (`docs/SPEC_ISSUES.md`),
 against the approved D1 to D12 and the acceptance-plan amendment. **Neither
 Milestone 4 nor Milestone 5 is accepted**; both Milestone 4 manual gates
 remain outstanding; no real TPM was accessed (development on `swtpm` only).
+
+**Commit and native CI:** committed as `dab6264` (2026-10-11). Native CI
+run 38154441494 did not start: GitHub refused every job for an account
+billing problem, so no native CI result exists for Milestone 5 yet.
 
 **Code (by area):**
 
@@ -838,9 +843,12 @@ registered. Checked against the F-row texts:
     failure.
 
 **Validation results (2026-10-11, after the V1 to V3 corrections and the
-extended V2 isolation; uncommitted source).** Exit statuses are those of the
-commands themselves (every verification script exits non-zero when any step
-fails); summaries were checked against the logs, not filtered output alone.
+extended V2 isolation; the source committed as `dab6264`).** The runner's
+printed summary and the CI step that checks it were added just before the
+commit and were dry-run on Mac and Linux ARM only. Exit statuses are those
+of the commands themselves (every verification script exits non-zero when
+any step fails); summaries were checked against the logs, not filtered
+output alone.
 Container runs used a read-only source copy checked file by file against the
 working tree, fresh build directories and new log names. Environments:
 
@@ -850,8 +858,9 @@ working tree, fresh build directories and new log names. Environments:
 - **Linux x86_64 (emulated):** an amd64 container under emulation on the
   same Mac; `swtpm` runs with its seccomp filter off (a wrapper in that
   container only, because the emulator rejects the filter). This is **not**
-  native CI: the GitHub CI workflow (with the `swtpm` steps) has not run for
-  Milestone 5 because nothing is committed.
+  native CI: the GitHub CI workflow (with the `swtpm` steps) has produced no
+  result for Milestone 5; run 38154441494 for `dab6264` was not started
+  (account billing).
 
 Distinct tests, one complete run each:
 
