@@ -17,6 +17,18 @@ pvault [GLOBAL OPTIONS] <command> <vault-dir> [ARGUMENTS] [OPTIONS]
   error. Prompts and anything shown for the owner's eyes only (the generated
   passphrase) go to the **terminal device** (`/dev/tty`, Windows
   `CONIN$`/`CONOUT$`), never to standard output or standard error.
+- **Terminal availability.** Unix: `/dev/tty` opens. Windows
+  (WIN-CONSOLE-1, approved 2026-10-12): `CONIN$` and `CONOUT$` both open
+  **and** the console has a window (`GetConsoleWindow` returns a handle).
+  Open console handles alone do not show that a person can answer: a
+  console without a window (a program started with `CREATE_NO_WINDOW`,
+  measured 2026-10-12) counts as **no terminal**, and every "without a
+  terminal" rule below applies. The classic console and Windows Terminal
+  (whose pseudoconsole returns a window handle) keep working; window
+  visibility is not tested. **Unresolved:** a console that has a window on
+  a non-interactive window station (for example a program a scheduled task
+  starts directly) still counts as a terminal, and SSH sessions are not
+  verified.
 - Messages are fixed English text without color.
 - Sizes are bytes. Times are UTC, `YYYY-MM-DDTHH:MM:SSZ`.
 

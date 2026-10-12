@@ -102,6 +102,16 @@ fn main() -> ExitCode {
             "clearing_failures_are_reported",
             clearing_failures_are_reported,
         ),
+        #[cfg(windows)]
+        (
+            "detached_launch_is_refused_before_prompting",
+            detached_launch_is_refused_before_prompting,
+        ),
+        #[cfg(windows)]
+        (
+            "windowless_console_is_refused_before_prompting",
+            windowless_console_is_refused_before_prompting,
+        ),
         ("init_crash_at_each_step", init_crash_at_each_step),
         ("add_crash_at_each_step", add_crash_at_each_step),
         ("replace_crash_at_each_step", replace_crash_at_each_step),
@@ -1471,6 +1481,167 @@ impl Drop for GeneratedInit {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// Windows checklist steps 14 and 19 (`docs/M4_READINESS.md` 14; measured
+/// 2026-10-12): started with no console (`DETACHED_PROCESS`), a PNG `init`
+/// is refused with exit 6 and a digital `init` without `--accept-risk` with
+/// exit 4, before the vault or settings folder exists, and neither waits for
+/// an answer.
+#[cfg(windows)]
+fn detached_launch_is_refused_before_prompting() {
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    unattended_launch_is_refused(DETACHED_PROCESS, "DETACHED_PROCESS");
+}
+
+/// The same with `CREATE_NO_WINDOW`: in the measured run of 2026-10-12 the
+/// console handles opened in this launch (with no console window), so
+/// pvault prompted where nobody could answer and waited until its console
+/// host was ended. Regression test for WIN-CONSOLE-1 (spec 7.6a; approved
+/// 2026-10-12): a console without a window is no terminal.
+#[cfg(windows)]
+fn windowless_console_is_refused_before_prompting() {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    unattended_launch_is_refused(CREATE_NO_WINDOW, "CREATE_NO_WINDOW");
+}
+
+#[cfg(windows)]
+fn unattended_launch_is_refused(flags: u32, launch: &str) {
+    let env = Env::new();
+    let vault = env.vault();
+    let settings = env.root().join("settings");
+    let mut png = vec![
+        arg("--secrets-stdin"),
+        arg("init"),
+        arg(&vault),
+        arg("--mode"),
+        arg("portable"),
+        arg("--cards"),
+        arg("paper"),
+        arg("--cards-dir"),
+        arg(&env.cards()),
+        arg("--custom"),
+        arg("--card-a-png"),
+        arg(&env.cards().join("a.png")),
+    ];
+    png.extend(FAST.iter().map(arg));
+    let out = run_unattended(&env, flags, &png, &format!("{launch}: PNG init"));
+    out.expect(6, &format!("{launch}: PNG init (step 14)"));
+    assert!(
+        out.says(
+            "Verifying a card from a PNG photo needs a terminal for the printing \
+             acknowledgment, also with --secrets-stdin. Nothing was written."
+        ),
+        "{launch}: step 14 message\nstderr: {}",
+        out.stderr
+    );
+    assert!(!vault.exists(), "{launch}: no vault folder after step 14");
+    assert!(
+        !settings.exists(),
+        "{launch}: no settings folder after step 14"
+    );
+
+    let card_a = env.root().join("card-a");
+    let card_b = env.root().join("card-b");
+    std::fs::create_dir(&card_a).unwrap();
+    std::fs::create_dir(&card_b).unwrap();
+    let mut digital = vec![
+        arg("--secrets-stdin"),
+        arg("init"),
+        arg(&vault),
+        arg("--mode"),
+        arg("portable"),
+        arg("--cards"),
+        arg("digital"),
+        arg("--card-a-dir"),
+        arg(&card_a),
+        arg("--card-b-dir"),
+        arg(&card_b),
+        arg("--custom"),
+    ];
+    digital.extend(FAST.iter().map(arg));
+    let out = run_unattended(&env, flags, &digital, &format!("{launch}: digital init"));
+    out.expect(
+        4,
+        &format!("{launch}: digital init without --accept-risk (step 19)"),
+    );
+    assert!(
+        out.says(
+            "Digital recovery cards need your acknowledgment: give --accept-risk \
+             digital-cards, or type STORE CARDS DIGITALLY on a terminal. Nothing was written."
+        ),
+        "{launch}: step 19 message\nstderr: {}",
+        out.stderr
+    );
+    assert!(!vault.exists(), "{launch}: no vault folder after step 19");
+    assert!(
+        !settings.exists(),
+        "{launch}: no settings folder after step 19"
+    );
+    for dir in [&card_a, &card_b] {
+        assert_eq!(
+            std::fs::read_dir(dir).unwrap().count(),
+            0,
+            "{launch}: no card file after step 19"
+        );
+    }
+}
+
+/// Runs the CLI with the given creation flags, standard input on the null
+/// device and both outputs captured, for at most 60 s. A child still running
+/// then is waiting for an answer nobody can give: it is killed and the test
+/// fails with its standard error (which never holds a secret; standard input
+/// is empty).
+#[cfg(windows)]
+fn run_unattended(env: &Env, flags: u32, args: &[OsString], what: &str) -> Out {
+    use std::io::Read;
+    use std::os::windows::process::CommandExt;
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args(args)
+        .env(CHILD_ENV, "1")
+        .env("PVAULT_CONFIG_DIR", env.root().join("settings"))
+        .env_remove("PVAULT_TEST_NO_TERMINAL")
+        .env_remove("PVAULT_FAILPOINT")
+        .creation_flags(flags)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let collect = |mut pipe: Box<dyn Read + Send>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            let _ = tx.send(String::from_utf8_lossy(&bytes).into_owned());
+        });
+        rx
+    };
+    let stdout = collect(Box::new(child.stdout.take().unwrap()));
+    let stderr = collect(Box::new(child.stderr.take().unwrap()));
+    let text = |rx: std::sync::mpsc::Receiver<String>| {
+        rx.recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| "(not closed within 10 s)".to_owned())
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return Out {
+                code: status.code(),
+                stdout: text(stdout),
+                stderr: text(stderr),
+            };
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "{what}: still running after 60 s, waiting for an answer nobody can give\nstderr: {}",
+                text(stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 

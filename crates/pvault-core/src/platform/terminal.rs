@@ -10,6 +10,16 @@
 //!   console control handler, which Windows runs on its own thread, restores
 //!   the mode on Ctrl-C, Ctrl-Break and close events.
 //!
+//! **Terminal availability** (WIN-CONSOLE-1, approved 2026-10-12): on
+//! Windows a terminal is available only when `CONIN$` and `CONOUT$` open
+//! **and** `GetConsoleWindow` returns a window handle. A console host
+//! without a window (a process started with `CREATE_NO_WINDOW`) has open
+//! console handles but nobody who can answer, and is treated as no
+//! terminal. The classic console and pseudoconsole hosts such as Windows
+//! Terminal have a window handle; whether the window is visible is not
+//! tested. Not covered: a console with a window on a non-interactive window
+//! station (unresolved).
+//!
 //! **Not recoverable:** SIGKILL, `TerminateProcess`, or a crash before the
 //! guard runs. These can leave echo off; the remedy is `stty sane` or
 //! `reset`, or closing the console window.
@@ -92,7 +102,8 @@ pub fn show(text: &str) -> Result<(), InputError> {
     imp::show(text)
 }
 
-/// Whether a terminal device can be opened.
+/// Whether a terminal is available: on Unix, `/dev/tty` opens; on Windows,
+/// `CONIN$` and `CONOUT$` open and the console has a window (WIN-CONSOLE-1).
 pub fn has_terminal() -> bool {
     imp::has_terminal()
 }
@@ -455,8 +466,8 @@ mod imp {
     use windows_sys::Win32::System::Console::{
         CONSOLE_SCREEN_BUFFER_INFO, COORD, ENABLE_ECHO_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
         FillConsoleOutputAttribute, FillConsoleOutputCharacterW, FlushConsoleInputBuffer,
-        GetConsoleMode, GetConsoleScreenBufferInfo, ReadConsoleW, SetConsoleCtrlHandler,
-        SetConsoleCursorPosition, SetConsoleMode, WriteConsoleW,
+        GetConsoleMode, GetConsoleScreenBufferInfo, GetConsoleWindow, ReadConsoleW,
+        SetConsoleCtrlHandler, SetConsoleCursorPosition, SetConsoleMode, WriteConsoleW,
     };
     use windows_sys::core::BOOL;
     use zeroize::Zeroizing;
@@ -610,8 +621,19 @@ mod imp {
         }
     }
 
+    /// WIN-CONSOLE-1 (spec 7.6a): open console handles alone do not show
+    /// that a person can answer; the console must also have a window.
     pub(super) fn has_terminal() -> bool {
-        open("CONIN$").is_ok() && open("CONOUT$").is_ok()
+        open("CONIN$").is_ok() && open("CONOUT$").is_ok() && console_has_window()
+    }
+
+    /// `GetConsoleWindow` is used for this check only. A pseudoconsole
+    /// (Windows Terminal) returns a window handle "for message queue
+    /// purposes only", so it counts; window visibility is never tested.
+    fn console_has_window() -> bool {
+        // SAFETY: no arguments; the returned handle is only compared with
+        // null and never used.
+        !unsafe { GetConsoleWindow() }.is_null()
     }
 
     /// Writes `text` to a console output handle as UTF-16 (`WriteConsoleW`),

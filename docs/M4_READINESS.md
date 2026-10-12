@@ -918,6 +918,68 @@ now reported with separate warnings on standard error (approved
 erased. These do not explain the observation, which stays **open**; the
 Windows gate stays incomplete.
 
+**Measured at `af6a4ce` (2026-10-12; gate still incomplete).** After the
+earlier no-console attempt (a scheduled task, "Run whether user is logged on
+or not", "Do not store password", without highest privileges, whose
+PowerShell harness used `CreateNoWindow=true`: the PNG `init` ended with exit
+1, "Input ended before all secrets were read.", with the vault and settings
+folders created, and the task kept running until it was ended; those files
+are kept as evidence on the test machine and fingerprinted by the new run),
+the author ran the bounded harness `tools/windows/no-console-check.ps1`
+(60 s per launch) from the same kind of task. Windows 11 25H2, build
+26200.8875 (the registry's `ProductName` reads "Windows 10 Home Single
+Language"); Windows PowerShell 5.1.26100.8875; session 0; `pvault.exe`
+SHA-256 `3C582275…5F11EC6` (release build of `af6a4ce`, as reported).
+The evidence archive stays outside the repository.
+
+| | `NoWindow` (`CREATE_NO_WINDOW`; the earlier harness's launch) | `Detached` (`DETACHED_PROCESS`) |
+| --- | --- | --- |
+| Probe `CONIN$` / `CONOUT$` (opened as pvault opens them) | ok / ok | error 6 / error 6 (`ERROR_INVALID_HANDLE`) |
+| Probe `GetConsoleWindow`, console processes, `UserInteractive` | 0x0, 1, false | 0x0, none (error 6), false |
+| Step 14 (PNG `init`) | Exit 1 "Input ended before all secrets were read." after 0.6 s; vault folder (`vault.gate`, `vault.lock`) and settings folder (`cards.lock`) created | Exit 6, the expected message, after 0.06 s; nothing created |
+| Step 19 (digital `init`, no `--accept-risk`) | Risk text, then waited at the acknowledgment prompt on the windowless console (child `conhost.exe`) for the full 60 s; the harness stopped the console host and pvault then failed reading input (os error 233, exit 1); settings folder created, no vault, no card file | Exit 4, the expected message, after 0.06 s; nothing created |
+
+The harness itself (Windows PowerShell started directly by the task) had a
+console **with** a window (0x3200a2) in session 0, `UserInteractive` false.
+
+**Finding: unattended prompts.** Accessible console handles do not establish
+that a person can answer. Microsoft documents `CREATE_NO_WINDOW` as "the
+console handle for the application is not set"; measured, the console
+handles nevertheless open in such a process, and the console has no window.
+Steps 14 and 19 are **not recorded as passed**: the `Detached` results match
+the expected refusals, but the checklist does not yet define the no-console
+launch, the fix below has not run on Windows, and the gate needs a complete
+run.
+
+**WIN-CONSOLE-1 (approved 2026-10-12; implemented, uncommitted).** On
+Windows a terminal is available only when `CONIN$` and `CONOUT$` open **and**
+`GetConsoleWindow` returns a non-null handle (spec 7.6a amended for this
+check only; `docs/SPEC_ISSUES.md`). The windowless console of the
+`NoWindow` launch is then "no terminal", so steps 14 and 19 are refused
+before anything is created, as in the `Detached` launch. Kept: the classic
+console (it has a window, shown or not) and Windows Terminal (a
+pseudoconsole returns a window handle "for message queue purposes only");
+window visibility is not tested and no prompt timeout is added. The
+checklist run must confirm both terminals still prompt.
+
+**Unresolved (not decided):** (1) a console **with** a window on a
+non-interactive window station, as the harness had, still counts as a
+terminal, so a program a scheduled task starts directly can still prompt
+where nobody can answer; refusing it would need further API approval
+(window-station queries) and a decision; (2) SSH sessions are not verified
+(Microsoft notes that remoting via SSH "may not work as expected" with
+`GetConsoleWindow`). Rejected: testing window visibility (Windows Terminal's
+window is never shown) and prompt timeouts (a timing workaround).
+
+**Regression coverage (uncommitted; Windows only, native CI).**
+`detached_launch_is_refused_before_prompting` (`DETACHED_PROCESS`) and
+`windowless_console_is_refused_before_prompting` (`CREATE_NO_WINDOW`) in
+`tests/failure_scenarios.rs` run the step 14 and step 19 commands with
+standard input on the null device, at most 60 s per launch (a child still
+running is killed and the test fails), and check the exit code (6, 4), the
+exact message, and that no vault, settings or card file exists. Not yet
+executed on Windows: so far they are only cross-compiled and linted.
+
 ### 14a. Printed-card photo check (manual acceptance gate for paper cards; prepared, not performed)
 
 This gate covers paper cards only: it shows that printed cards scan from
